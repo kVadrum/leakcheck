@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# leakcheck — scan a repo's tracked files for workspace-internal references
+# (host paths, internal names) before publishing or promoting.
+#
+# Reads default patterns + an optional per-repo .leakcheckrc, then greps
+# every tracked file under the current working tree. Exits 0 if clean,
+# 1 if anything matched, 2 on usage error.
+#
+# Usage:
+#   leakcheck                # scan with defaults + .leakcheckrc
+#   leakcheck --strict       # treat warnings as errors (currently equivalent)
+#   leakcheck --json         # machine-readable output
+#   leakcheck --list-patterns
+#   leakcheck --help
+#
+# Config file (./.leakcheckrc) is line-oriented:
+#   pattern <regex>          # add a regex to the scan set
+#   allow   <regex>          # allowlist a match (regex matched against full hit line)
+#   skip    <glob>           # skip files matching glob (passed to git ls-files :!:)
+#   no-defaults              # disable the built-in default pattern set
+#
+# Blank lines and lines starting with '#' are ignored.
+#
+# Exit codes:
+#   0  clean
+#   1  one or more leaks found
+#   2  usage / config error
+
+set -euo pipefail
+
+VERSION="0.2.0"
+
+OUTPUT_MODE="text"
+STRICT=0
+LIST_ONLY=0
+CONFIG_FILE=".leakcheckrc"
+ROOT=""
+
+usage() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//; s/^#$//'
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)            OUTPUT_MODE="json"; shift ;;
+    --strict)          STRICT=1; shift ;;
+    --list-patterns)   LIST_ONLY=1; shift ;;
+    -c|--config)       CONFIG_FILE="$2"; shift 2 ;;
+    -C|--root)         ROOT="$2"; shift 2 ;;
+    -V|--version)      echo "leakcheck $VERSION"; exit 0 ;;
+    -h|--help)         usage 0 ;;
+    --)                shift; break ;;
+    -*)                echo "leakcheck: unknown flag: $1" >&2; usage 2 >&2 ;;
+    *)                 echo "leakcheck: unexpected arg: $1" >&2; usage 2 >&2 ;;
+  esac
+done
+
+if [[ -n "$ROOT" ]]; then
+  cd "$ROOT" || { echo "leakcheck: cannot cd to $ROOT" >&2; exit 2; }
+fi
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "leakcheck: not inside a git work tree" >&2
+  exit 2
+fi
+
+# Default patterns. Only the universally-bad shapes — absolute home paths
+# with a username, on each major OS. Tilde-prefixed paths (`~/...`,
+# `$HOME/...`) are intentionally NOT in the defaults: they're shape-only,
+# not leaks — Claude Code docs and tooling reference them as generic
+# locations. Per-repo `.leakcheckrc` adds workspace tells (hostnames,
+# internal project names, custom tilde paths if a project considers them
+# leaky).
+DEFAULTS=(
+  '/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/'
+  '/Users/[A-Za-z0-9_][A-Za-z0-9_.-]*/'
+  'C:\\Users\\[A-Za-z0-9_][A-Za-z0-9_.-]*\\'
+)
+
+PATTERNS=()
+ALLOWLIST=()
+SKIPS=()
+USE_DEFAULTS=1
+
+# Read config if present. Tolerates absence — defaults still apply.
+if [[ -f "$CONFIG_FILE" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Strip leading whitespace, drop blank + comment lines.
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    keyword="${line%%[[:space:]]*}"
+    rest="${line#"$keyword"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    case "$keyword" in
+      pattern)       PATTERNS+=("$rest") ;;
+      allow)         ALLOWLIST+=("$rest") ;;
+      skip)          SKIPS+=("$rest") ;;
+      no-defaults)   USE_DEFAULTS=0 ;;
+      *)
+        echo "leakcheck: $CONFIG_FILE: unknown directive: $keyword" >&2
+        exit 2
+        ;;
+    esac
+  done < "$CONFIG_FILE"
+fi
+
+if [[ "$USE_DEFAULTS" -eq 1 ]]; then
+  PATTERNS=("${DEFAULTS[@]}" "${PATTERNS[@]}")
+fi
+
+if [[ "$LIST_ONLY" -eq 1 ]]; then
+  for p in "${PATTERNS[@]}"; do
+    printf '%s\n' "$p"
+  done
+  exit 0
+fi
+
+if [[ "${#PATTERNS[@]}" -eq 0 ]]; then
+  echo "leakcheck: no patterns to scan (defaults disabled and config empty)" >&2
+  exit 2
+fi
+
+# Build the git ls-files command, applying skip globs. We implicitly skip
+# the leakcheck config file itself — its `pattern` directives will look
+# like leaks to itself, which is a self-referential papercut every
+# consumer would hit on day one.
+ls_args=(-z ":!:$CONFIG_FILE")
+for skip in "${SKIPS[@]}"; do
+  ls_args+=(":!:$skip")
+done
+
+# Two-pass scan: pass 1 grep's every pattern into a raw-hits file; pass 2
+# applies the allowlist. Keeping the grep loop tolerant (|| true) so an
+# empty match doesn't blow up under set -e + pipefail.
+HITS_FILE="$(mktemp -t leakcheck.XXXXXX)"
+RAW_FILE="$(mktemp -t leakcheck-raw.XXXXXX)"
+FILES_FILE="$(mktemp -t leakcheck-files.XXXXXX)"
+trap 'rm -f "$HITS_FILE" "$RAW_FILE" "$FILES_FILE"' EXIT
+
+# Materialize tracked-file list. NUL-delimited; convert to NL with tr so we
+# can feed grep directly. Filenames with newlines in them would break this;
+# git ls-files emits those quoted unless -z is passed — accept the trade
+# for simplicity. Tracked files with embedded newlines are vanishingly rare
+# in source repos.
+git ls-files "${ls_args[@]}" | tr '\0' '\n' > "$FILES_FILE"
+
+# Pass 1: per-pattern, per-file grep. Iterating per-file (rather than
+# feeding the whole list to one grep) keeps the filename outside the
+# match output, so we never have to guess which colon in
+# `file:line:text` separates the filename from the line number.
+# Filenames legally allowed to contain `:` on Linux/macOS would
+# otherwise break the JSON output (`"line": colon.md` is malformed).
+# Cost: ~N_files * N_patterns grep invocations instead of N_patterns.
+# Bounded; subsecond at typical repo scales.
+TRACKED_COUNT=$(wc -l < "$FILES_FILE" | tr -d ' ')
+if [[ "$TRACKED_COUNT" -gt 0 ]]; then
+  for p in "${PATTERNS[@]}"; do
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      # -EnI: ERE, line numbers, skip binary. No -H — we already have
+      # the filename in $f. `|| true` swallows grep's exit-1 on no
+      # match. IFS=: with two read vars splits on the first colon only,
+      # so text containing colons stays intact in $text.
+      while IFS=: read -r line text; do
+        [[ -z "$line" ]] && continue
+        printf '%s\t%s\t%s\t%s\n' "$p" "$f" "$line" "$text" >> "$RAW_FILE"
+      done < <(grep -EnI -- "$p" "$f" 2>/dev/null || true)
+    done < "$FILES_FILE"
+  done
+fi
+
+# Pass 2: apply allowlist. RAW_FILE shape is now pattern<TAB>file<TAB>line<TAB>text.
+# HITS_FILE shape stays file<TAB>line<TAB>pattern<TAB>text for downstream
+# emit loops.
+if [[ -s "$RAW_FILE" ]]; then
+  while IFS=$'\t' read -r p file_part line_part text_part; do
+    # Allowlist match runs against the reconstructed full line so users
+    # can pin allows like "README.md:42:".
+    full="$file_part:$line_part:$text_part"
+    skip_this=0
+    for allow in "${ALLOWLIST[@]}"; do
+      if printf '%s' "$full" | grep -Eq -- "$allow"; then
+        skip_this=1; break
+      fi
+    done
+    [[ "$skip_this" -eq 1 ]] && continue
+    printf '%s\t%s\t%s\t%s\n' "$file_part" "$line_part" "$p" "$text_part" >> "$HITS_FILE"
+  done < "$RAW_FILE"
+fi
+
+HIT_COUNT=$(wc -l < "$HITS_FILE" 2>/dev/null | tr -d ' ')
+HIT_COUNT="${HIT_COUNT:-0}"
+
+if [[ "$OUTPUT_MODE" == "json" ]]; then
+  # Emit a single JSON envelope. Pure-bash escaping for portability.
+  json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    # Strip remaining control chars (<0x20) — rare in tracked source.
+    s=$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\037')
+    printf '%s' "$s"
+  }
+  printf '{"version":"%s","clean":%s,"count":%d,"hits":[' \
+    "$VERSION" \
+    "$([[ "$HIT_COUNT" -eq 0 ]] && echo true || echo false)" \
+    "$HIT_COUNT"
+  first=1
+  while IFS=$'\t' read -r f l p t; do
+    [[ "$first" -eq 1 ]] || printf ','
+    first=0
+    printf '{"file":"%s","line":%s,"pattern":"%s","text":"%s"}' \
+      "$(json_escape "$f")" "$l" "$(json_escape "$p")" "$(json_escape "$t")"
+  done < "$HITS_FILE"
+  printf ']}\n'
+else
+  if [[ "$HIT_COUNT" -eq 0 ]]; then
+    echo "leakcheck: clean — 0 matches across $TRACKED_COUNT tracked files"
+  else
+    while IFS=$'\t' read -r f l p t; do
+      printf '%s:%s: [%s] %s\n' "$f" "$l" "$p" "$t"
+    done < "$HITS_FILE"
+    echo "leakcheck: $HIT_COUNT match(es)" >&2
+  fi
+fi
+
+if [[ "$HIT_COUNT" -gt 0 ]]; then
+  exit 1
+fi
+exit 0
