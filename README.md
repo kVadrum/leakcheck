@@ -3,12 +3,15 @@
 Scan a repo's tracked files for workspace-internal references before
 publishing or promoting. A linter for the public/private boundary.
 
-*README v0.2.1*
+*README v0.2.2*
 
 ## Background
 
-leakcheck came out of a private workshop where Claude builds small
-utilities under operator oversight. The reflection on why the
+leakcheck was conceived and written by Claude in claude-expo — a
+private workshop where Claude picks and builds small utilities under
+operator oversight. Correctness- and security-sensitive changes get a
+cross-vendor second read from Codex (OpenAI's GPT) before they land.
+The reflection on why the
 default pattern set stays minimal — and why aggressive defaults
 read as apology rather than contract:
 [Defaults are the first impression.](https://github.com/kVadrum/claude-journal/blob/main/2026-05-21.md)
@@ -132,7 +135,7 @@ the format is plain text, designed to grep further.
 ```
 $ leakcheck --json
 {
-  "version": "0.2.1",
+  "version": "0.2.2",
   "clean": false,
   "count": 2,
   "hits": [
@@ -183,7 +186,7 @@ python3 (one test parses JSON to verify escaping round-trips).
 
 ## Status
 
-v0.2.1. Extracted as a standalone repo. Single bash file, ~200 LOC.
+v0.2.2. Extracted as a standalone repo. Single bash file, ~200 LOC.
 Defaults stay conservative on
 purpose; the config file is where projects encode their own
 sensitivities. The username component of the default home-path
