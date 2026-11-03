@@ -2,39 +2,53 @@
 # leakcheck — scan a repo's tracked files for workspace-internal references
 # (host paths, internal names) before publishing or promoting.
 #
-# Reads default patterns + an optional per-repo .leakcheckrc, then greps
-# every tracked file under the current working tree. Exits 0 if clean,
-# 1 if anything matched, 2 on usage error.
+# Scans the whole repo from its top level, wherever it is run: the index
+# (what the next commit publishes) AND the worktree copy of every tracked
+# file, plus every tracked path name and symlink target. Reads default
+# patterns + an optional .leakcheckrc at the repo top level.
 #
 # Usage:
-#   leakcheck                # scan with defaults + .leakcheckrc
-#   leakcheck --strict       # treat warnings as errors (currently equivalent)
-#   leakcheck --json         # machine-readable output
-#   leakcheck --list-patterns
-#   leakcheck --help
+#   leakcheck                    # scan with defaults + .leakcheckrc
+#   leakcheck --strict           # also report every file whose content was
+#                                # not scanned (binary, submodule) as a match
+#   leakcheck --json             # machine-readable output
+#   leakcheck --list-patterns    # print the effective pattern set
+#   leakcheck -c, --config FILE  # config path, relative to the cwd (after --root)
+#   leakcheck -C, --root DIR     # run as if started in DIR
+#   leakcheck -V, --version
+#   leakcheck -h, --help
 #
-# Config file (./.leakcheckrc) is line-oriented:
-#   pattern <regex>          # add a regex to the scan set
-#   allow   <regex>          # allowlist a match (regex matched against full hit line)
-#   skip    <glob>           # skip files matching glob (passed to git ls-files :!:)
+# Config file (.leakcheckrc) is line-oriented:
+#   pattern <regex>          # add an ERE to the scan set
+#   allow   <regex>          # allowlist a hit (ERE matched against path:line:text)
+#   skip    <glob>           # skip paths matching glob (git pathspec, top-relative)
 #   no-defaults              # disable the built-in default pattern set
 #
-# Blank lines and lines starting with '#' are ignored.
+# Blank lines and lines starting with '#' are ignored. Name and symlink hits
+# report line 0.
 #
-# Exit codes:
+# Never scanned: git history, commit metadata, submodule contents, encoded
+# or compressed content. Binary files are skipped and counted.
+#
+# Exit codes (treat ANY non-zero as "do not publish"):
 #   0  clean
-#   1  one or more leaks found
-#   2  usage / config error
+#   1  one or more matches
+#   2  usage, config or scan error
 
-set -euo pipefail
+set -eEuo pipefail
+# An unexpected failure must never surface as exit 1, which means "matches
+# found" — map every abort onto the error code.
+trap 'echo "leakcheck: internal error at line $LINENO; nothing was reported" >&2; exit 2' ERR
 
-VERSION="0.2.2"
+VERSION="0.3.0"
 
 OUTPUT_MODE="text"
 STRICT=0
 LIST_ONLY=0
-CONFIG_FILE=".leakcheckrc"
+CONFIG_FILE=""
 ROOT=""
+
+die() { echo "leakcheck: $*" >&2; exit 2; }
 
 usage() {
   sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//; s/^#$//'
@@ -46,8 +60,15 @@ while [[ $# -gt 0 ]]; do
     --json)            OUTPUT_MODE="json"; shift ;;
     --strict)          STRICT=1; shift ;;
     --list-patterns)   LIST_ONLY=1; shift ;;
-    -c|--config)       CONFIG_FILE="$2"; shift 2 ;;
-    -C|--root)         ROOT="$2"; shift 2 ;;
+    -c|--config|-C|--root)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "leakcheck: $1 needs a value" >&2; usage 2 >&2
+      fi
+      case "$1" in
+        -c|--config) CONFIG_FILE="$2" ;;
+        *)           ROOT="$2" ;;
+      esac
+      shift 2 ;;
     -V|--version)      echo "leakcheck $VERSION"; exit 0 ;;
     -h|--help)         usage 0 ;;
     --)                shift; break ;;
@@ -57,12 +78,42 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "$ROOT" ]]; then
-  cd "$ROOT" || { echo "leakcheck: cannot cd to $ROOT" >&2; exit 2; }
+  cd -- "$ROOT" 2>/dev/null || die "cannot cd to $ROOT"
 fi
 
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "leakcheck: not inside a git work tree" >&2
-  exit 2
+# An explicit --config resolves against the cwd as it stands now: after
+# --root ("run as if started in DIR", as `git -C` means it) and before the
+# move to the top level below, so a relative path typed in a subdirectory
+# still means what it says. A named config that is missing is an error —
+# proceeding on defaults alone is a confident clean pass over a repo that
+# nothing the caller asked for actually checked.
+CONFIG_ABS=""
+if [[ -n "$CONFIG_FILE" ]]; then
+  [[ -f "$CONFIG_FILE" ]] || die "config not found: $CONFIG_FILE"
+  [[ -r "$CONFIG_FILE" ]] || die "config not readable: $CONFIG_FILE"
+  cfg_dir="$(cd -- "$(dirname -- "$CONFIG_FILE")" && pwd -P)" \
+    || die "cannot resolve config path: $CONFIG_FILE"
+  CONFIG_ABS="$cfg_dir/$(basename -- "$CONFIG_FILE")"
+fi
+
+# Always scan from the top level. `git ls-files` and `git grep` are
+# cwd-relative, so a run from a subdirectory used to scan that subtree,
+# miss the root .leakcheckrc, and report clean with a plausible count.
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git work tree"
+[[ -n "$top" ]] || die "not inside a git work tree"
+cd -- "$top" || die "cannot cd to $top"
+top="$(pwd -P)"
+
+if [[ -z "$CONFIG_ABS" ]]; then
+  CONFIG_FILE=".leakcheckrc"
+  if [[ -f "$top/.leakcheckrc" ]]; then
+    [[ -r "$top/.leakcheckrc" ]] || die "config not readable: $top/.leakcheckrc"
+    CONFIG_ABS="$top/.leakcheckrc"
+  elif [[ -e "$top/.leakcheckrc" || -L "$top/.leakcheckrc" ]]; then
+    # A dangling symlink or a directory is not "no config"; it is a config
+    # that cannot be read.
+    die "config is not a regular file: $top/.leakcheckrc"
+  fi
 fi
 
 # Default patterns. Only the universally-bad shapes — absolute home paths
@@ -84,8 +135,13 @@ SKIPS=()
 USE_DEFAULTS=1
 
 # Read config if present. Tolerates absence — defaults still apply.
-if [[ -f "$CONFIG_FILE" ]]; then
+if [[ -n "$CONFIG_ABS" ]]; then
+  lineno=0
   while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    # A CRLF config would otherwise end every regex in a CR that no line
+    # can match — a pattern that silently finds nothing.
+    line="${line%$'\r'}"
     # Strip leading whitespace, drop blank + comment lines.
     line="${line#"${line%%[![:space:]]*}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
@@ -93,16 +149,20 @@ if [[ -f "$CONFIG_FILE" ]]; then
     rest="${line#"$keyword"}"
     rest="${rest#"${rest%%[![:space:]]*}"}"
     case "$keyword" in
-      pattern)       PATTERNS+=("$rest") ;;
-      allow)         ALLOWLIST+=("$rest") ;;
-      skip)          SKIPS+=("$rest") ;;
-      no-defaults)   USE_DEFAULTS=0 ;;
-      *)
-        echo "leakcheck: $CONFIG_FILE: unknown directive: $keyword" >&2
-        exit 2
+      pattern|allow|skip)
+        # An empty `allow` matches every hit and an empty `pattern` every
+        # line: both are typos, and one of them turns a dirty repo clean.
+        [[ -n "$rest" ]] || die "$CONFIG_FILE:$lineno: empty $keyword directive"
+        case "$keyword" in
+          pattern) PATTERNS+=("$rest") ;;
+          allow)   ALLOWLIST+=("$rest") ;;
+          skip)    SKIPS+=("$rest") ;;
+        esac
         ;;
+      no-defaults)   USE_DEFAULTS=0 ;;
+      *)             die "$CONFIG_FILE: unknown directive: $keyword" ;;
     esac
-  done < "$CONFIG_FILE"
+  done < "$CONFIG_ABS"
 fi
 
 if [[ "$USE_DEFAULTS" -eq 1 ]]; then
@@ -121,79 +181,370 @@ if [[ "${#PATTERNS[@]}" -eq 0 ]]; then
   exit 2
 fi
 
-# Build the git ls-files command, applying skip globs. We implicitly skip
-# the leakcheck config file itself — its `pattern` directives will look
-# like leaks to itself, which is a self-referential papercut every
-# consumer would hit on day one.
-ls_args=(-z ":!:$CONFIG_FILE")
+# Pathspecs. `skip` removes a path from the scan entirely: content, name and
+# symlink target. The config file is narrower: only its CONTENT is skipped
+# (its `pattern` lines would otherwise read as leaks), and only when it lives
+# inside the repo — an exclude naming a path outside the repo is fatal to
+# git. Its name and stored symlink target are published like any other path,
+# so they are scanned: a tracked `.leakcheckrc -> /home/<user>/…` is a leak.
+skip_excludes=()
 for skip in "${SKIPS[@]}"; do
-  ls_args+=(":!:$skip")
+  skip_excludes+=(":!:$skip")
+done
+excludes=("${skip_excludes[@]}")
+CONFIG_REL=""
+case "$CONFIG_ABS" in
+  "$top"/*)
+    CONFIG_REL="${CONFIG_ABS#"$top"/}"
+    excludes+=(":(exclude,literal)$CONFIG_REL")
+    ;;
+esac
+
+TMPD="$(mktemp -d "${TMPDIR:-/tmp}/leakcheck.XXXXXX")" || die "cannot create a temp dir"
+trap 'rm -rf -- "$TMPD"' EXIT
+mkdir "$TMPD/subj"
+
+# Binary detection must depend on content alone. git grep -I otherwise
+# honours .gitattributes, and `*.svg binary` (a common line) would
+# silently drop text files — an Inkscape SVG carrying its author's home
+# path — that the published clone still contains. GIT_ATTR_SOURCE (git
+# >= 2.40; older git ignores it, and the skip is still counted) points
+# in-tree attributes at the empty tree; the other two lines cover the
+# global and system attribute files. $GIT_DIR/info/attributes cannot be
+# switched off and is counted like any other skip.
+EMPTY_TREE="$(git hash-object -t tree /dev/null)" || die "cannot compute the empty tree id"
+g() {
+  GIT_ATTR_SOURCE="$EMPTY_TREE" GIT_ATTR_NOSYSTEM=1 \
+    git -c core.attributesFile=/dev/null "$@"
+}
+
+# run_git <label> <out-file> <command...>: stdout to <out-file>. Exit 0 or
+# 1 is a result; any other status, or ANY stderr, is a scan error. git grep
+# reports an unreadable worktree file on stderr and still exits 1, which
+# would otherwise read as "no match" (measured, git 2.53).
+run_git() {
+  local label=$1 out=$2 rc=0
+  shift 2
+  "$@" > "$out" 2> "$TMPD/err" || rc=$?
+  if [[ $rc -gt 1 || -s "$TMPD/err" ]]; then
+    echo "leakcheck: scan error: $label (git exited $rc)" >&2
+    sed 's/^/  /' "$TMPD/err" >&2
+    exit 2
+  fi
+  return 0
+}
+
+GREP_FLAGS=(-z --no-color --no-column --no-textconv --no-recurse-submodules)
+
+# ─── what is tracked ──────────────────────────────────────────────────
+# Mode decides the kind: 100644/100755 regular, 120000 symlink (its blob is
+# the target string), 160000 a submodule gitlink. Unmerged paths appear once
+# per stage; the first row wins. Listed with `skip` excludes only — the
+# config's own entry stays, for its name and symlink target.
+run_git "ls-files" "$TMPD/ls" g ls-files -s -z -- . "${skip_excludes[@]}"
+mapfile -d '' -t LS_ROWS < "$TMPD/ls"
+declare -A SEEN_PATH=()
+declare -A MODE_OF=()
+PATHS=()
+LINK_PATHS=()
+LINK_OIDS=()
+GITLINKS=()
+for row in "${LS_ROWS[@]}"; do
+  meta="${row%%$'\t'*}"
+  path="${row#*$'\t'}"
+  mode="${meta%% *}"
+  oid="${meta#* }"
+  oid="${oid%% *}"
+  [[ -n "${SEEN_PATH["p$path"]+x}" ]] && continue
+  SEEN_PATH["p$path"]=1
+  MODE_OF["p$path"]=$mode
+  PATHS+=("$path")
+  case "$mode" in
+    120000) LINK_PATHS+=("$path"); LINK_OIDS+=("$oid") ;;
+    160000) GITLINKS+=("$path") ;;
+  esac
+done
+# The denominator counts files whose content is in scope; the config's own
+# content is not, and is reported under "skipped by config".
+TRACKED_COUNT=${#PATHS[@]}
+if [[ -n "$CONFIG_REL" && -n "${SEEN_PATH["p$CONFIG_REL"]+x}" ]]; then
+  TRACKED_COUNT=$((TRACKED_COUNT - 1))
+fi
+
+run_git "ls-files" "$TMPD/lsall" g ls-files -z -- .
+mapfile -d '' -t ALL_ROWS < "$TMPD/lsall"
+declare -A SEEN_ALL=()
+for path in "${ALL_ROWS[@]}"; do SEEN_ALL["p$path"]=1; done
+SKIPPED_COUNT=$(( ${#SEEN_ALL[@]} - TRACKED_COUNT ))
+[[ $SKIPPED_COUNT -ge 0 ]] || SKIPPED_COUNT=0
+
+# ─── binary detection ─────────────────────────────────────────────────
+# A path is binary exactly when this scan's -I skips it: listed by
+# `-l -e ''` (any content at all) and not by `-I -l -e ''`. Measuring with
+# the scan's own flags is what makes the count follow the scan — git sniffs
+# the first 8000 bytes, which is not GNU grep's rule.
+declare -A BINARY=()
+BINARY_PATHS=()
+mark_binary() { # path source
+  if [[ -z "${BINARY["p$1"]+x}" ]]; then
+    BINARY["p$1"]="$2"
+    BINARY_PATHS+=("$1")
+  elif [[ "${BINARY["p$1"]}" != "$2" ]]; then
+    BINARY["p$1"]="both"
+  fi
+}
+# Fills BINARY_ROWS with the names the last two sniffs ($TMPD/all, $TMPD/text)
+# disagree on: content present, but skipped by -I.
+binary_rows() {
+  local path
+  local -A text=()
+  BINARY_ROWS=()
+  mapfile -d '' -t _rows < "$TMPD/text"
+  for path in "${_rows[@]}"; do text["p$path"]=1; done
+  mapfile -d '' -t _rows < "$TMPD/all"
+  for path in "${_rows[@]}"; do
+    [[ -n "${text["p$path"]+x}" ]] || BINARY_ROWS+=("$path")
+  done
+  return 0
+}
+binary_pass() { # source [git grep args...]
+  local src=$1 path
+  shift
+  run_git "binary sniff ($src)" "$TMPD/all" g grep "$@" "${GREP_FLAGS[@]}" -l -e '' -- . "${excludes[@]}"
+  run_git "binary sniff ($src)" "$TMPD/text" g grep "$@" "${GREP_FLAGS[@]}" -I -l -e '' -- . "${excludes[@]}"
+  binary_rows
+  for path in "${BINARY_ROWS[@]}"; do mark_binary "$path" "$src"; done
+  return 0
+}
+binary_pass index --cached
+binary_pass worktree
+
+# ─── hits ─────────────────────────────────────────────────────────────
+# Parallel arrays, never a delimited temp file: a path may hold a tab, a
+# colon or a newline, and each of those broke one earlier shape. Hits found
+# in both the index and the worktree are reported once, as "both".
+H_PAT=()
+H_FILE=()
+H_LINE=()
+H_TEXT=()
+H_SRC=()
+declare -A HIT_AT=()
+add_hit() { # pattern file line text source
+  # Length-prefixed fields make the key injective whatever the fields hold.
+  local key="h${#1}:$1${#2}:$2${#3}:$3:$4" i
+  if [[ -n "${HIT_AT[$key]+x}" ]]; then
+    i=${HIT_AT[$key]}
+    if [[ "${H_SRC[$i]}" != "$5" ]]; then H_SRC[$i]="both"; fi
+    return 0
+  fi
+  HIT_AT[$key]=${#H_FILE[@]}
+  H_PAT+=("$1"); H_FILE+=("$2"); H_LINE+=("$3"); H_TEXT+=("$4"); H_SRC+=("$5")
+}
+
+# Content: git grep, one run per pattern so each hit knows its pattern.
+# -z gives `path\0line\0text\n`, so the filename never has to be split off
+# the match text — the reason the old per-file grep loop existed. Every
+# pattern is compiled by git: an invalid ERE exits 128 here, where GNU grep
+# behind `2>/dev/null || true` once made it match nothing, forever.
+# --no-column is load-bearing: grep.column=true in a user's gitconfig adds a
+# field and shifts the parse.
+content_pass() { # source [git grep args...]
+  local src=$1 p f l t
+  shift
+  for p in "${PATTERNS[@]}"; do
+    run_git "pattern '$p' ($src)" "$TMPD/hits" \
+      g grep "$@" "${GREP_FLAGS[@]}" -n -I -H --full-name -E -e "$p" -- . "${excludes[@]}"
+    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
+      add_hit "$p" "$f" "$l" "$t" "$src"
+    done < "$TMPD/hits"
+  done
+  return 0
+}
+# The index is what the next commit publishes; the worktree is what
+# `git commit -a` publishes, and holds the only copy of an intent-to-add
+# file. Each pass alone misses a case the other catches.
+content_pass index --cached
+content_pass worktree
+
+# Type changes the worktree pass cannot see: an index symlink or gitlink
+# replaced by a regular file. git grep follows the INDEX mode and skips the
+# path, but `git commit -a` stages the new file — and v0.2.2's per-file grep,
+# which read whatever was on disk, did scan it. Each one is copied under a
+# numbered name and scanned there, with the same flags and the same binary
+# rule, then mapped back to its real path.
+TC_PATHS=()
+for path in "${PATHS[@]}"; do
+  case "${MODE_OF["p$path"]}" in
+    120000|160000) ;;
+    *) continue ;;
+  esac
+  [[ "$path" == "$CONFIG_REL" ]] && continue
+  if [[ -f "$path" && ! -L "$path" ]]; then TC_PATHS+=("$path"); fi
+done
+if [[ ${#TC_PATHS[@]} -gt 0 ]]; then
+  mkdir "$TMPD/tc"
+  for k in "${!TC_PATHS[@]}"; do
+    if ! cp -- "${TC_PATHS[$k]}" "$TMPD/tc/$k" 2>"$TMPD/err"; then
+      echo "leakcheck: scan error: cannot read ${TC_PATHS[$k]}" >&2
+      sed 's/^/  /' "$TMPD/err" >&2
+      exit 2
+    fi
+  done
+  gni() { GIT_ATTR_NOSYSTEM=1 git -c core.attributesFile=/dev/null -C "$TMPD/tc" grep --no-index "$@"; }
+  run_git "binary sniff (type changes)" "$TMPD/all" gni -z -l -e '' -- .
+  run_git "binary sniff (type changes)" "$TMPD/text" gni -z -I -l -e '' -- .
+  binary_rows
+  for k in "${BINARY_ROWS[@]}"; do mark_binary "${TC_PATHS[$k]}" worktree; done
+  for p in "${PATTERNS[@]}"; do
+    run_git "pattern '$p' (type changes)" "$TMPD/hits" \
+      gni -z -n -I --no-color --no-column -E -e "$p" -- .
+    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
+      # An indexed subscript is arithmetic: a non-numeric name would quietly
+      # map to entry 0, so check the shape before the lookup.
+      [[ "$f" =~ ^[0-9]+$ && -n "${TC_PATHS[$f]+x}" ]] || die "internal error: type-change pass returned $f"
+      add_hit "$p" "${TC_PATHS[$f]}" "$l" "$t" worktree
+    done < "$TMPD/hits"
+  done
+fi
+BINARY_COUNT=${#BINARY_PATHS[@]}
+
+# Names and symlink targets: content too. A clone publishes every path name
+# and every stored link target, and git grep reads neither. Each subject is
+# one line of a scratch file (a name holding newlines spans several lines,
+# all mapped back to it), matched by the same git grep engine as content.
+S_PATH=()
+S_SUBJ=()
+S_TEXT=()
+S_SRC=()
+for path in "${PATHS[@]}"; do
+  S_PATH+=("$path"); S_SUBJ+=("$path"); S_TEXT+=("$path"); S_SRC+=("index")
+done
+for i in "${!LINK_PATHS[@]}"; do
+  if ! tgt="$(git cat-file blob "${LINK_OIDS[$i]}" 2>"$TMPD/err")"; then
+    echo "leakcheck: scan error: cannot read symlink ${LINK_PATHS[$i]}" >&2
+    sed 's/^/  /' "$TMPD/err" >&2
+    exit 2
+  fi
+  S_PATH+=("${LINK_PATHS[$i]}"); S_SUBJ+=("$tgt"); S_TEXT+=("-> $tgt"); S_SRC+=("index")
+done
+for path in "${PATHS[@]}"; do
+  [[ -L "$path" ]] || continue
+  tgt="$(readlink -- "$path")" || die "scan error: cannot read symlink $path"
+  S_PATH+=("$path"); S_SUBJ+=("$tgt"); S_TEXT+=("-> $tgt"); S_SRC+=("worktree")
 done
 
-# Two-pass scan: pass 1 grep's every pattern into a raw-hits file; pass 2
-# applies the allowlist. Keeping the grep loop tolerant (|| true) so an
-# empty match doesn't blow up under set -e + pipefail.
-HITS_FILE="$(mktemp -t leakcheck.XXXXXX)"
-RAW_FILE="$(mktemp -t leakcheck-raw.XXXXXX)"
-FILES_FILE="$(mktemp -t leakcheck-files.XXXXXX)"
-trap 'rm -f "$HITS_FILE" "$RAW_FILE" "$FILES_FILE"' EXIT
+SUBJ_OF_LINE=()
+n=0
+for i in "${!S_SUBJ[@]}"; do
+  nl="${S_SUBJ[$i]//[!$'\n']/}"
+  for (( k = 0; k <= ${#nl}; k++ )); do
+    n=$((n + 1))
+    SUBJ_OF_LINE[$n]=$i
+  done
+done
+if [[ ${#S_SUBJ[@]} -gt 0 ]]; then
+  printf '%s\n' "${S_SUBJ[@]}" > "$TMPD/subj/s"
+else
+  : > "$TMPD/subj/s"
+fi
 
-# Materialize tracked-file list. NUL-delimited; convert to NL with tr so we
-# can feed grep directly. Filenames with newlines in them would break this;
-# git ls-files emits those quoted unless -z is passed — accept the trade
-# for simplicity. Tracked files with embedded newlines are vanishingly rare
-# in source repos.
-git ls-files "${ls_args[@]}" | tr '\0' '\n' > "$FILES_FILE"
+for p in "${PATTERNS[@]}"; do
+  run_git "pattern '$p' (names)" "$TMPD/shits" \
+    git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "$p" -- s
+  while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
+    i="${SUBJ_OF_LINE[$l]:-}"
+    [[ -n "$i" ]] || die "internal error: names pass returned line $l"
+    add_hit "$p" "${S_PATH[$i]}" 0 "${S_TEXT[$i]}" "${S_SRC[$i]}"
+  done < "$TMPD/shits"
+done
 
-# Pass 1: per-pattern, per-file grep. Iterating per-file (rather than
-# feeding the whole list to one grep) keeps the filename outside the
-# match output, so we never have to guess which colon in
-# `file:line:text` separates the filename from the line number.
-# Filenames legally allowed to contain `:` on Linux/macOS would
-# otherwise break the JSON output (`"line": colon.md` is malformed).
-# Cost: ~N_files * N_patterns grep invocations instead of N_patterns.
-# Bounded; subsecond at typical repo scales.
-TRACKED_COUNT=$(wc -l < "$FILES_FILE" | tr -d ' ')
-if [[ "$TRACKED_COUNT" -gt 0 ]]; then
-  for p in "${PATTERNS[@]}"; do
-    while IFS= read -r f; do
-      [[ -z "$f" ]] && continue
-      # -EnI: ERE, line numbers, skip binary. No -H — we already have
-      # the filename in $f. `|| true` swallows grep's exit-1 on no
-      # match. IFS=: with two read vars splits on the first colon only,
-      # so text containing colons stays intact in $text.
-      while IFS=: read -r line text; do
-        [[ -z "$line" ]] && continue
-        printf '%s\t%s\t%s\t%s\n' "$p" "$f" "$line" "$text" >> "$RAW_FILE"
-      done < <(grep -EnI -- "$p" "$f" 2>/dev/null || true)
-    done < "$FILES_FILE"
+# Under --strict, what could not be scanned is itself a finding.
+if [[ "$STRICT" -eq 1 ]]; then
+  for path in "${BINARY_PATHS[@]}"; do
+    add_hit "unscanned:binary" "$path" 0 "(binary file; content not scanned)" "${BINARY["p$path"]}"
+  done
+  for path in "${GITLINKS[@]}"; do
+    add_hit "unscanned:submodule" "$path" 0 "(submodule; contents not scanned)" "index"
   done
 fi
 
-# Pass 2: apply allowlist. RAW_FILE shape is now pattern<TAB>file<TAB>line<TAB>text.
-# HITS_FILE shape stays file<TAB>line<TAB>pattern<TAB>text for downstream
-# emit loops.
-if [[ -s "$RAW_FILE" ]]; then
-  while IFS=$'\t' read -r p file_part line_part text_part; do
-    # Allowlist match runs against the reconstructed full line so users
-    # can pin allows like "README.md:42:".
-    full="$file_part:$line_part:$text_part"
-    skip_this=0
-    for allow in "${ALLOWLIST[@]}"; do
-      if printf '%s' "$full" | grep -Eq -- "$allow"; then
-        skip_this=1; break
-      fi
+# ─── allowlist ────────────────────────────────────────────────────────
+# Each rule runs once over every hit's `path:line:text`, through the same
+# engine as the patterns. Rules are compiled even when there is nothing to
+# allow, so a broken one fails on a clean repo too. The first matching rule
+# takes the credit, and every rule's count is reported: an over-broad allow
+# must not look identical to a clean repo.
+ALLOWED=()
+ALLOW_COUNTS=()
+for i in "${!H_FILE[@]}"; do ALLOWED[$i]=0; done
+if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
+  HIT_OF_LINE=()
+  n=0
+  : > "$TMPD/subj/a"
+  for i in "${!H_FILE[@]}"; do
+    full="${H_FILE[$i]}:${H_LINE[$i]}:${H_TEXT[$i]}"
+    printf '%s\n' "$full" >> "$TMPD/subj/a"
+    nl="${full//[!$'\n']/}"
+    for (( k = 0; k <= ${#nl}; k++ )); do
+      n=$((n + 1))
+      HIT_OF_LINE[$n]=$i
     done
-    [[ "$skip_this" -eq 1 ]] && continue
-    printf '%s\t%s\t%s\t%s\n' "$file_part" "$line_part" "$p" "$text_part" >> "$HITS_FILE"
-  done < "$RAW_FILE"
+  done
+  for r in "${!ALLOWLIST[@]}"; do
+    run_git "allow '${ALLOWLIST[$r]}'" "$TMPD/ahits" \
+      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "${ALLOWLIST[$r]}" -- a
+    c=0
+    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
+      i="${HIT_OF_LINE[$l]:-}"
+      [[ -n "$i" ]] || die "internal error: allow pass returned line $l"
+      if [[ "${ALLOWED[$i]}" -eq 0 ]]; then
+        ALLOWED[$i]=1
+        c=$((c + 1))
+      fi
+    done < "$TMPD/ahits"
+    ALLOW_COUNTS[$r]=$c
+  done
 fi
 
-HIT_COUNT=$(wc -l < "$HITS_FILE" 2>/dev/null | tr -d ' ')
-HIT_COUNT="${HIT_COUNT:-0}"
+KEEP=()
+ALLOWED_TOTAL=0
+for i in "${!H_FILE[@]}"; do
+  if [[ "${ALLOWED[$i]}" -eq 1 ]]; then
+    ALLOWED_TOTAL=$((ALLOWED_TOTAL + 1))
+  else
+    KEEP+=("$i")
+  fi
+done
+HIT_COUNT=${#KEEP[@]}
 
+SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodules not scanned, $SKIPPED_COUNT skipped by config, $ALLOWED_TOTAL allowed; history not scanned"
+
+# ─── output ───────────────────────────────────────────────────────────
 if [[ "$OUTPUT_MODE" == "json" ]]; then
-  # Emit a single JSON envelope. Pure-bash escaping for portability.
+  # One well-formed UTF-8 sequence, as bytes (matched under LC_ALL=C).
+  UTF8_SEQ=$'([\x01-\x7f]|[\xc2-\xdf][\x80-\xbf]|\xe0[\xa0-\xbf][\x80-\xbf]|[\xe1-\xec\xee\xef][\x80-\xbf][\x80-\xbf]|\xed[\x80-\x9f][\x80-\xbf]|\xf0[\x90-\xbf][\x80-\xbf][\x80-\xbf]|[\xf1-\xf3][\x80-\xbf][\x80-\xbf][\x80-\xbf]|\xf4[\x80-\x8f][\x80-\xbf][\x80-\xbf])'
+  # JSON must be UTF-8, and neither a path nor a line has to be (a legacy
+  # filename, a Latin-1 file): one such byte made the whole envelope
+  # unparseable. Well-formed input passes through on one regex test; in
+  # anything else each stray byte becomes U+FFFD.
+  utf8_clean() {
+    local LC_ALL=C s="$1" out=""
+    if [[ "$s" =~ ^${UTF8_SEQ}*$ ]]; then
+      printf '%s' "$s"
+      return 0
+    fi
+    while [[ -n "$s" ]]; do
+      if [[ "$s" =~ ^$UTF8_SEQ ]]; then
+        out+="${BASH_REMATCH[0]}"
+        s="${s:${#BASH_REMATCH[0]}}"
+      else
+        out+='�'
+        s="${s:1}"
+      fi
+    done
+    printf '%s' "$out"
+  }
+  # Pure-bash escaping for portability.
   json_escape() {
     local s="$1"
     s="${s//\\/\\\\}"
@@ -203,28 +554,58 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
     s="${s//$'\r'/\\r}"
     # Strip remaining control chars (<0x20) — rare in tracked source.
     s=$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\037')
-    printf '%s' "$s"
+    utf8_clean "$s"
   }
+  # version, clean, count and hits stay first and unchanged; new fields
+  # only ever append.
   printf '{"version":"%s","clean":%s,"count":%d,"hits":[' \
     "$VERSION" \
     "$([[ "$HIT_COUNT" -eq 0 ]] && echo true || echo false)" \
     "$HIT_COUNT"
   first=1
-  while IFS=$'\t' read -r f l p t; do
+  for i in "${KEEP[@]}"; do
     [[ "$first" -eq 1 ]] || printf ','
     first=0
-    printf '{"file":"%s","line":%s,"pattern":"%s","text":"%s"}' \
-      "$(json_escape "$f")" "$l" "$(json_escape "$p")" "$(json_escape "$t")"
-  done < "$HITS_FILE"
-  printf ']}\n'
+    printf '{"file":"%s","line":%s,"pattern":"%s","text":"%s","source":"%s"}' \
+      "$(json_escape "${H_FILE[$i]}")" "${H_LINE[$i]}" "$(json_escape "${H_PAT[$i]}")" \
+      "$(json_escape "${H_TEXT[$i]}")" "${H_SRC[$i]}"
+  done
+  printf '],"target":"index+worktree","tracked":%d,"skipped":{"binary":%d,"submodule":%d,"config":%d},"symlinks":%d,"allowed":[' \
+    "$TRACKED_COUNT" "$BINARY_COUNT" "${#GITLINKS[@]}" "$SKIPPED_COUNT" "${#LINK_PATHS[@]}"
+  first=1
+  for r in "${!ALLOWLIST[@]}"; do
+    [[ "$first" -eq 1 ]] || printf ','
+    first=0
+    printf '{"rule":"%s","count":%d}' "$(json_escape "${ALLOWLIST[$r]}")" "${ALLOW_COUNTS[$r]}"
+  done
+  printf '],"history_scanned":false}\n'
 else
+  # One hit, one line. A field holding a newline — only a path name or a
+  # symlink target can — is C-quoted the way git quotes such paths; every
+  # other field prints byte-for-byte, so the common case is unchanged.
+  line_safe() {
+    local s="$1"
+    case "$s" in
+      *$'\n'*)
+        s="${s//\\/\\\\}"
+        s="${s//\"/\\\"}"
+        s="${s//$'\n'/\\n}"
+        s="${s//$'\r'/\\r}"
+        s="${s//$'\t'/\\t}"
+        printf '"%s"' "$s"
+        ;;
+      *) printf '%s' "$s" ;;
+    esac
+  }
   if [[ "$HIT_COUNT" -eq 0 ]]; then
-    echo "leakcheck: clean — 0 matches across $TRACKED_COUNT tracked files"
+    echo "leakcheck: clean — 0 matches across $TRACKED_COUNT tracked files ($SCOPE)"
   else
-    while IFS=$'\t' read -r f l p t; do
-      printf '%s:%s: [%s] %s\n' "$f" "$l" "$p" "$t"
-    done < "$HITS_FILE"
+    for i in "${KEEP[@]}"; do
+      printf '%s:%s: [%s] %s\n' "$(line_safe "${H_FILE[$i]}")" "${H_LINE[$i]}" \
+        "${H_PAT[$i]}" "$(line_safe "${H_TEXT[$i]}")"
+    done
     echo "leakcheck: $HIT_COUNT match(es)" >&2
+    echo "leakcheck: scanned $TRACKED_COUNT tracked files ($SCOPE)" >&2
   fi
 fi
 
