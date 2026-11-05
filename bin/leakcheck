@@ -27,7 +27,9 @@
 #
 # Config file (.leakcheckrc) is line-oriented:
 #   pattern <regex>          # add an ERE to the scan set
-#   allow   <regex>          # allowlist a hit (ERE matched against path:line:text)
+#   allow   <regex>          # allowlist hits: an ERE matching all of
+#                            # path:line:text, or path:line:<match> for
+#                            # every match of the hit's own pattern there
 #   skip    <glob>           # skip paths matching glob (git pathspec, top-relative)
 #   no-defaults              # disable the built-in default pattern set
 #
@@ -72,7 +74,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -942,40 +944,139 @@ if [[ "$STRICT" -eq 1 ]]; then
 fi
 
 # ─── allowlist ────────────────────────────────────────────────────────
-# Each rule runs once over every hit's `path:line:text`, through the same
-# engine as the patterns. Rules are compiled even when there is nothing to
-# allow, so a broken one fails on a clean repo too. The first matching rule
-# takes the credit, and every rule's count is reported: an over-broad allow
-# must not look identical to a clean repo.
+# A rule allows a hit in one of two ways, each tested by the same engine as
+# the patterns:
+#   whole line  it matches all of `path:line:text`, so it names this exact
+#               line (`^f\.txt:1:/home/alice/x$`): matching is POSIX
+#               leftmost-longest, so such a rule's first -o match is the
+#               whole line, and git grep has no -x
+#   per match   it matches `path:line:M` for a match M of the hit's own
+#               pattern, and every such M on the line is excused by some
+#               rule (`/home/USERNAME/`, `\.example\.com`) — a location
+#               rule (`^fixtures/`) matches every M there
+# A rule that merely matches somewhere on the line allows nothing: matching
+# the whole line once let the placeholder in `allow /home/USERNAME/` hide a
+# MYHOST hit, and a real /home/alice/, that shared its line (measured,
+# v0.6.0) — and a minified file is one line.
+# Matches come from `git grep -o`, whose match TEXTS are right but whose
+# --column is right only for a line's first match (git 2.53 adds the
+# previous match's end instead: measured), so nothing here uses positions.
+# Rules are compiled even when there is nothing to allow, so a broken one
+# fails on a clean repo too. The lowest-numbered rule that took part takes
+# the credit, and every rule's count is reported: an over-broad allow must
+# not look identical to a clean repo.
 ALLOWED=()
 ALLOW_COUNTS=()
 for i in "${!H_FILE[@]}"; do ALLOWED[$i]=0; done
+for r in "${!ALLOWLIST[@]}"; do ALLOW_COUNTS[$r]=0; done
 if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
-  HIT_OF_LINE=()
-  n=0
-  : > "$TMPD/subj/a"
+  # lines_of <string>: how many lines a record takes in a subject file (a
+  # path or text may hold a newline).
+  lines_of() { local nl=${1//[!$'\n']/}; REPLY=$(( ${#nl} + 1 )); }
+
+  # Every match of each hit's own pattern, as text. A text the pattern finds
+  # no non-empty match in as displayed (an anchored pattern on a
+  # `-> target` symlink hit), or that no pattern produced (unscanned:binary
+  # and the other pseudo-patterns), counts as one match: the whole text.
+  declare -A IS_PAT=() BY_PAT=()
+  for p in "${PATTERNS[@]}"; do IS_PAT["l$p"]=1; done
+  MT_HIT=(); MT_TXT=(); MT_OF=()
   for i in "${!H_FILE[@]}"; do
-    full="${H_FILE[$i]}:${H_LINE[$i]}:${H_TEXT[$i]}"
-    printf '%s\n' "$full" >> "$TMPD/subj/a"
-    nl="${full//[!$'\n']/}"
-    for (( k = 0; k <= ${#nl}; k++ )); do
-      n=$((n + 1))
-      HIT_OF_LINE[$n]=$i
+    MT_OF[$i]=""
+    BY_PAT["l${H_PAT[$i]}"]+="$i "
+  done
+  for key in "${!BY_PAT[@]}"; do
+    [[ -n "${IS_PAT[$key]+x}" ]] || continue
+    p=${key#l}
+    T_HIT=(); n=0
+    exec 6>"$TMPD/subj/t"
+    for i in ${BY_PAT[$key]}; do
+      printf '%s\n' "${H_TEXT[$i]}" >&6
+      lines_of "${H_TEXT[$i]}"
+      for (( k = 0; k < REPLY; k++ )); do n=$((n + 1)); T_HIT[n]=$i; done
+    done
+    exec 6>&-
+    run_git "pattern '$p' (allow)" "$TMPD/tmatch" \
+      git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E -e "$p" -- t
+    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
+      i=${T_HIT[l]:-}
+      [[ -n "$i" ]] || die "internal error: allow match pass returned line $l"
+      MT_OF[$i]+="${#MT_HIT[@]} "
+      MT_HIT+=("$i"); MT_TXT+=("$m")
+    done < "$TMPD/tmatch"
+  done
+  for i in "${!H_FILE[@]}"; do
+    if [[ -z "${MT_OF[$i]}" ]]; then
+      MT_OF[$i]="${#MT_HIT[@]} "
+      MT_HIT+=("$i"); MT_TXT+=("${H_TEXT[$i]}")
+    fi
+  done
+
+  # Subjects: a holds each hit's whole line, m one line per match; each
+  # subject line maps back to its hit (or match).
+  A_OF=(); A_TXT=(); A_LINES=(); M_OF=()
+  na=0; nm=0
+  exec 7>"$TMPD/subj/a" 8>"$TMPD/subj/m"
+  for i in "${!H_FILE[@]}"; do
+    rec="${H_FILE[$i]}:${H_LINE[$i]}:${H_TEXT[$i]}"
+    printf '%s\n' "$rec" >&7
+    lines_of "$rec"; A_LINES[$i]=$REPLY
+    for (( k = 0; k < REPLY; k++ )); do
+      na=$((na + 1)); A_OF[na]=$i
+      A_TXT[na]=${rec%%$'\n'*}
+      rec=${rec#*$'\n'}
     done
   done
+  for j in "${!MT_HIT[@]}"; do
+    i=${MT_HIT[j]}
+    printf '%s\n' "${H_FILE[$i]}:${H_LINE[$i]}:${MT_TXT[j]}" >&8
+    lines_of "${H_FILE[$i]}:${H_LINE[$i]}:${MT_TXT[j]}"
+    for (( k = 0; k < REPLY; k++ )); do nm=$((nm + 1)); M_OF[nm]=$j; done
+  done
+  exec 7>&- 8>&-
+
+  WHOLE=(); EXC=()
+  for i in "${!H_FILE[@]}"; do WHOLE[$i]=""; done
+  for j in "${!MT_HIT[@]}"; do EXC[$j]=""; done
   for r in "${!ALLOWLIST[@]}"; do
-    run_git "allow '${ALLOWLIST[$r]}'" "$TMPD/ahits" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "${ALLOWLIST[$r]}" -- a
-    c=0
+    rule=${ALLOWLIST[$r]}
+    # Whole line: every line of the record matched entirely.
+    run_git "allow '$rule'" "$TMPD/awhole" \
+      git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E -e "$rule" -- a
+    declare -A WCOUNT=() WSEEN=()
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
-      i="${HIT_OF_LINE[$l]:-}"
+      i=${A_OF[l]:-}
       [[ -n "$i" ]] || die "internal error: allow pass returned line $l"
-      if [[ "${ALLOWED[$i]}" -eq 0 ]]; then
-        ALLOWED[$i]=1
-        c=$((c + 1))
-      fi
-    done < "$TMPD/ahits"
-    ALLOW_COUNTS[$r]=$c
+      [[ "$t" == "${A_TXT[l]}" && -z "${WSEEN[$l]+x}" ]] || continue
+      WSEEN[$l]=1
+      WCOUNT[$i]=$(( ${WCOUNT[$i]:-0} + 1 ))
+    done < "$TMPD/awhole"
+    for i in "${!WCOUNT[@]}"; do
+      if [[ ${WCOUNT[$i]} -eq ${A_LINES[$i]} && -z "${WHOLE[$i]}" ]]; then WHOLE[$i]=$r; fi
+    done
+    unset WCOUNT WSEEN
+    run_git "allow '$rule'" "$TMPD/amatch" \
+      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "$rule" -- m
+    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
+      j=${M_OF[l]:-}
+      [[ -n "$j" ]] || die "internal error: allow pass returned line $l"
+      [[ -n "${EXC[$j]}" ]] || EXC[$j]=$r
+    done < "$TMPD/amatch"
+  done
+
+  for i in "${!H_FILE[@]}"; do
+    credit=none
+    for j in ${MT_OF[$i]}; do
+      if [[ -z "${EXC[$j]}" ]]; then credit=""; break; fi
+      if [[ "$credit" == none || ${EXC[$j]} -lt $credit ]]; then credit=${EXC[$j]}; fi
+    done
+    [[ "$credit" != none ]] || credit=""
+    r=${WHOLE[$i]}
+    if [[ -n "$r" ]] && [[ -z "$credit" || $r -lt $credit ]]; then credit=$r; fi
+    if [[ -n "$credit" ]]; then
+      ALLOWED[$i]=1
+      ALLOW_COUNTS[$credit]=$(( ALLOW_COUNTS[credit] + 1 ))
+    fi
   done
 fi
 

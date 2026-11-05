@@ -6,7 +6,7 @@ Credential scanners such as gitleaks, trufflehog and git-secrets look for secret
 leakcheck looks for what they ignore: home paths that carry your username, the names of your machines, and the codenames only your team uses — references that pile up in a private repo and get noticed only after it goes public.
 It is one bash script, and git is its only real dependency.
 
-*README v0.6.0*
+*README v0.7.0*
 
 ## Install
 
@@ -207,7 +207,8 @@ Both files are line-oriented and take four directives; blank lines and `#` comme
 pattern MYHOST
 pattern internal-tool-name
 
-# Allow hits by regex, matched against each hit's "path:line:text".
+# Allow hits by regex: a rule names a hit's whole "path:line:text", or
+# each match on it as "path:line:match" (see How patterns behave, below).
 allow /home/USERNAME/
 allow ^fixtures/
 
@@ -231,7 +232,12 @@ How patterns behave — read this before you write one:
   Write `[[:alnum:]_.-]`.
 - `\w`, `\W`, `\s`, `\S`, `\b` and `\B` are accepted; they work where git uses GNU regex, as on Linux, but are not POSIX.
 - **Name and symlink hits carry line `0`**, so an allow rule for a file name reads `^docs/notes-from-MYHOST\.md:0:`.
+- **An allow rule excuses what it names, not every hit on its line.**
+  It allows a hit when it matches the hit's whole `path:line:text` (`^f\.txt:1:/home/alice/x$`), or when it matches `path:line:` followed by each match of the hit's own pattern on that line.
+  So `allow /home/USERNAME/` excuses the placeholder but not a `MYHOST`, or a real `/home/alice/`, further along the same line; `allow \.example\.com` still excuses the host name `x.example.com` it is part of; and a location rule such as `^fixtures/` allows everything under `fixtures/`.
+  A rule that names text around a match, short of the whole line (`^a\.txt:1:see`), excuses nothing.
 - **Every allow rule's suppressions are counted**, per rule in `--json`, so an over-broad rule shows up instead of passing as a clean repo.
+  When two rules excuse one hit, the first listed takes the count.
 
 leakcheck never scans the content of its own config file — otherwise every `pattern` line would match itself — and counts it under `skipped by config`.
 The config's name and symlink target are still scanned, because a clone publishes both.

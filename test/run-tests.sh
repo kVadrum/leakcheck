@@ -1559,6 +1559,122 @@ assert list(doc["history"])[-1] == "range", doc
 PY
 }
 
+# Allow rules excuse what they match, not their whole line (v0.7.0).
+
+t_allow_does_not_hide_another_patterns_hit() {
+  # The README's own placeholder rule hid a MYHOST hit sharing its line.
+  seed a.txt "paths look like /home/USERNAME/ and we deploy to MYHOST"
+  rc_file 'pattern MYHOST' 'allow /home/USERNAME/'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [MYHOST]" "$LC_OUT"
+  assert_not_contains "a.txt:1: [/home/" "$LC_OUT"
+  assert_contains "1 allowed" "$LC_ERR"
+}
+
+t_allow_does_not_hide_a_second_match() {
+  # One pattern, one hit per line: the allowed placeholder must not carry
+  # the real path beside it.
+  seed a.txt "/home/USERNAME/ and /home/alice/"
+  rc_file 'allow /home/USERNAME/'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [/home/" "$LC_OUT"
+  assert_contains "0 allowed" "$LC_ERR"
+}
+
+t_allow_overlap_excuses_a_match_it_is_part_of() {
+  # Guard (passes on v0.6.0 by design): a rule naming part of a match —
+  # the placeholder domain of a host name — still excuses that match.
+  seed a.txt "see x.example.com"
+  rc_file 'pattern [a-z]+\.example\.com' 'allow \.example\.com'
+  commit init
+  assert_exit 0 "$BIN"
+  assert_contains "1 allowed" "$LC_OUT"
+}
+
+t_allow_location_rule_allows_everything_there() {
+  # Guard (passes on v0.6.0 by design): a rule matching the location alone
+  # allows every pattern's hit there.
+  seed fixtures/a.md "/home/alice/ on MYHOST"
+  rc_file 'pattern MYHOST' 'allow ^fixtures/'
+  commit init
+  assert_exit 0 "$BIN"
+  assert_contains "2 allowed" "$LC_OUT"
+}
+
+t_allow_adjacent_match_behind_a_non_ascii_path() {
+  # Matches that touch, behind a multibyte path: each is excused on its own
+  # text, so no byte or character arithmetic can merge them.
+  seed zoë.txt "/home/USERNAME/MYHOST"
+  rc_file 'pattern MYHOST' 'allow /home/USERNAME/'
+  commit init
+  LC_ALL=C.UTF-8 assert_exit 1 "$BIN"
+  assert_contains "[MYHOST]" "$LC_OUT"
+  assert_contains "1 allowed" "$LC_ERR"
+}
+
+t_allow_in_a_name_with_a_newline() {
+  # A record split over two lines still maps each match back to its hit.
+  local name=$'xxxxxxxxxxxxxxxxxxxx\ny.txt'
+  printf '%s\n' "/home/USERNAME/MYHOST" > "$name"
+  git add -- "$name"
+  rc_file 'pattern MYHOST' 'allow /home/USERNAME/'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "[MYHOST]" "$LC_OUT"
+  assert_contains "1 allowed" "$LC_ERR"
+}
+
+t_allow_every_match_allowed_is_allowed() {
+  # Guard (passes on v0.6.0 by design): two allowed matches on one line.
+  # git 2.53's -o --column misplaces every match after a line's first, so
+  # a position-based check failed exactly this (measured).
+  seed ip.txt "x('10.0.0.1').toBe('10.0.0.1'); y('10.0.0.2')"
+  rc_file 'pattern \b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b' 'allow 10\.0\.0\.(1|2)\b'
+  commit init
+  assert_exit 0 "$BIN"
+  assert_contains "1 allowed" "$LC_OUT"
+}
+
+t_allow_partial_line_rule_excuses_nothing() {
+  # A rule naming context around a match must name the whole line.
+  seed a.txt "see /home/alice/"
+  rc_file 'allow ^a\.txt:1:see'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "0 allowed" "$LC_ERR"
+  rc_file 'allow ^a\.txt:1:see /home/alice/$'
+  assert_exit 0 "$BIN"
+  assert_contains "1 allowed" "$LC_OUT"
+}
+
+t_allow_whole_line_means_every_line() {
+  # A name holding a newline is a record of several lines; matching one of
+  # them entirely is not matching the line.
+  printf 'x\n' > $'notes\nMYHOST.md'
+  git add -- $'notes\nMYHOST.md'
+  rc_file 'pattern MYHOST' 'allow ^MYHOST\.md$'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "[MYHOST]" "$LC_OUT"
+}
+
+t_allow_credit_goes_to_the_lowest_rule() {
+  # Guard (passes on v0.6.0 by design): the first listed rule that took part
+  # takes the count — across the matches of one hit, and ahead of a later
+  # whole-line rule — and every rule's count is reported.
+  seed a.txt "/home/USERNAME/ and /home/alice/"
+  rc_file 'allow /home/USERNAME/' 'allow /home/alice/' 'allow ^a\.txt:1:.*$'
+  commit init
+  assert_exit 0 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert [a["count"] for a in doc["allowed"]] == [1, 0, 0], doc["allowed"]
+PY
+}
+
 # ─── runner ───────────────────────────────────────────────────────────
 
 echo "leakcheck self-tests"
@@ -1689,6 +1805,16 @@ lc_test "history range: in a shallow clone"           t_history_range_in_a_shall
 lc_test "history range: refusals"                     t_history_range_refusals
 lc_test "history range: an empty range is stated"     t_history_range_empty_is_stated
 lc_test "history range: JSON names the range"         t_history_range_json
+lc_test "allow: another pattern's hit survives"       t_allow_does_not_hide_another_patterns_hit
+lc_test "allow: a second match survives"              t_allow_does_not_hide_a_second_match
+lc_test "allow: overlap excuses a match"              t_allow_overlap_excuses_a_match_it_is_part_of
+lc_test "allow: a location rule allows all there"     t_allow_location_rule_allows_everything_there
+lc_test "allow: adjacent match, non-ASCII path"       t_allow_adjacent_match_behind_a_non_ascii_path
+lc_test "allow: in a name with a newline"             t_allow_in_a_name_with_a_newline
+lc_test "allow: every match allowed is allowed"       t_allow_every_match_allowed_is_allowed
+lc_test "allow: a partial-line rule excuses nothing"  t_allow_partial_line_rule_excuses_nothing
+lc_test "allow: whole line means every line"          t_allow_whole_line_means_every_line
+lc_test "allow: credit goes to the lowest rule"       t_allow_credit_goes_to_the_lowest_rule
 
 echo
 echo "  $PASS passed  ·  $FAIL failed"
