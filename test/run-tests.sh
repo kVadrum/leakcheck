@@ -379,12 +379,13 @@ EOF
 }
 
 t_unicode_in_content_does_not_crash() {
-  # Pins "does not crash", not a match on the non-ASCII name: the defaults'
-  # [A-Za-z] is ASCII under git's ERE in every locale. v0.2.2 matched
+  # Both lines hit, in every locale: the ASCII line through the canonical
+  # default, the non-ASCII one through its own (v0.4.0). v0.2.2 matched
   # /home/zoë/ only where GNU grep's ranges took in ë (en_US.UTF-8, not C).
   seed README.md $'/home/zoë/code\n/home/alice/code'
   commit init
-  assert_exit 1 "$BIN"
+  LC_ALL=C assert_exit 1 "$BIN"
+  assert_contains "README.md:1:" "$LC_OUT"
   assert_contains "README.md:2:" "$LC_OUT"
 }
 
@@ -888,6 +889,138 @@ t_newline_in_filename_text_is_one_line() {
   [[ "$n" -eq 1 ]] || { echo "    expected 1 line, got $n"; cat "$LC_OUT"; return 1; }
 }
 
+# ─── v0.4.0: wider defaults, .leakcheckrc.local ───────────────────────
+
+# Every default hits its own shape once — git grep reports one hit per
+# (line, pattern), so two overlapping defaults would double-count.
+t_defaults_each_shape_hits_exactly_once() {
+  cat > shapes.txt <<'EOF'
+/home/alice/x
+/Users/alice/x
+C:\Users\alice\x
+{"p":"\/home\/alice\/x"}
+{"w":"C:\\Users\\alice\\x"}
+c:\users\alice\x
+D:\Users\alice\x
+C:\USERS\alice\x
+/home/zoë/x
+C:\Users\José\AppData
+{"p":"\/home\/zoë\/x"}
+EOF
+  git add shapes.txt
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys, collections
+doc = json.loads(open(sys.argv[1], "rb").read().decode("utf-8"))
+lines = collections.Counter(h["line"] for h in doc["hits"])
+assert sorted(lines) == list(range(1, 12)), sorted(lines)
+assert set(lines.values()) == {1}, lines
+PY
+}
+
+t_defaults_same_in_c_locale() {
+  printf '%s\n' '/home/zoë/x' '{"p":"\/home\/alice\/x"}' 'c:\users\alice\x' > a.txt
+  git add a.txt
+  commit init
+  LC_ALL=C assert_exit 1 "$BIN" --json
+  assert_contains '"count":3,' "$LC_OUT"
+}
+
+t_default_placeholders_stay_clean() {
+  # Guard (passes on v0.3.0 too, by design): the elided placeholders,
+  # ASCII and typographic, stay clean in every shape the defaults gained.
+  printf '%s\n' '/home/…/foo' 'C:\Users\…\AppData' '{"p":"\/home\/...\/x"}' '{"p":"\/home\/…\/x"}' \
+    '{"w":"C:\\Users\\...\\x"}' 'c:\users\...\x' '/home/<user>/x' > a.txt
+  git add a.txt
+  commit init
+  assert_exit 0 "$BIN"
+  LC_ALL=C assert_exit 0 "$BIN"
+}
+
+t_no_trailing_slash_is_a_recipe_not_a_default() {
+  # Guard (passes on v0.3.0 too, by design): pins the measured ruling that
+  # this shape stays opt-in, and that the README recipe works when opted in.
+  printf '%s\n' '"cwd": "/home/alice"' > a.json
+  git add a.json
+  commit init
+  assert_exit 0 "$BIN"
+  # The README recipe, opted into, does fire.
+  printf '%s\n' 'pattern (^|[^A-Za-z0-9_./-])/(home|Users)/[A-Za-z0-9_][A-Za-z0-9_.-]*(["'"'"'`[:space:]]|$)' > .leakcheckrc
+  assert_exit 1 "$BIN"
+  assert_contains "a.json:1:" "$LC_OUT"
+}
+
+t_local_config_is_read() {
+  seed README.md "MYHOST"
+  commit init
+  printf 'pattern MYHOST\n' > .leakcheckrc.local
+  assert_exit 1 "$BIN"
+  assert_contains "README.md:1: [MYHOST]" "$LC_OUT"
+}
+
+t_local_config_adds_to_main_config() {
+  seed README.md $'MYHOST\nINTERNAL-XYZ'
+  rc_file 'pattern MYHOST'
+  commit init
+  printf 'pattern INTERNAL-XYZ\n' > .leakcheckrc.local
+  assert_exit 0 "$BIN" --list-patterns
+  assert_contains "MYHOST" "$LC_OUT"
+  assert_contains "INTERNAL-XYZ" "$LC_OUT"
+  assert_exit 1 "$BIN"
+  assert_contains "README.md:1: [MYHOST]" "$LC_OUT"
+  assert_contains "README.md:2: [INTERNAL-XYZ]" "$LC_OUT"
+}
+
+t_explicit_config_ignores_local() {
+  # Guard (passes on v0.3.0 too, which never read .local): --config stays
+  # the whole config once .local exists.
+  seed README.md "MYHOST"
+  commit init
+  printf 'pattern MYHOST\n' > .leakcheckrc.local
+  printf 'pattern NEVER-MATCHES-ABC123\n' > other.rc
+  assert_exit 0 "$BIN" --config other.rc
+}
+
+t_tracked_local_config_reports_itself() {
+  # Committing the .local config publishes the inventory of tells; unlike
+  # .leakcheckrc its content is not exempt, so its own lines report it.
+  seed README.md "clean"
+  seed .leakcheckrc.local "pattern MYHOST"
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains ".leakcheckrc.local:1: [MYHOST] pattern MYHOST" "$LC_OUT"
+}
+
+t_tracked_local_config_found_without_self_match() {
+  # A pattern need not match its own source line (`^SECRET-[0-9]+$` does
+  # not), so a committed .local is a finding of its own, --config or not.
+  seed README.md "clean"
+  seed .leakcheckrc.local $'no-defaults\npattern ^SECRET-[0-9]+$'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains ".leakcheckrc.local:0: [config:local-tracked]" "$LC_OUT"
+  printf 'pattern NEVER-MATCHES-ABC123\n' > other.rc
+  assert_exit 1 "$BIN" --config other.rc
+  assert_contains ".leakcheckrc.local:0: [config:local-tracked]" "$LC_OUT"
+}
+
+t_dangling_local_config_errors() {
+  seed README.md "hello"
+  commit init
+  ln -s does-not-exist .leakcheckrc.local
+  assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc.local" "$LC_ERR"
+}
+
+t_local_config_errors_name_their_file() {
+  seed README.md "hello"
+  commit init
+  printf 'pattern ok\nbogus x\n' > .leakcheckrc.local
+  assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc.local: unknown directive: bogus" "$LC_ERR"
+}
+
 # ─── runner ───────────────────────────────────────────────────────────
 
 echo "leakcheck self-tests"
@@ -969,6 +1102,17 @@ lc_test "config symlink target is scanned"            t_config_symlink_target_sc
 lc_test "non-UTF-8 bytes yield valid JSON"            t_non_utf8_bytes_yield_valid_json
 lc_test "valid UTF-8 passes through JSON intact"      t_valid_utf8_passes_through_json
 lc_test "newline in filename: one text-mode line"     t_newline_in_filename_text_is_one_line
+lc_test "every default shape hits exactly once"       t_defaults_each_shape_hits_exactly_once
+lc_test "new defaults behave the same in C locale"    t_defaults_same_in_c_locale
+lc_test "placeholders stay clean in every new shape"  t_default_placeholders_stay_clean
+lc_test "no-trailing-slash: recipe, not default"      t_no_trailing_slash_is_a_recipe_not_a_default
+lc_test ".leakcheckrc.local is read"                  t_local_config_is_read
+lc_test ".leakcheckrc.local adds to .leakcheckrc"     t_local_config_adds_to_main_config
+lc_test "--config ignores .leakcheckrc.local"         t_explicit_config_ignores_local
+lc_test "tracked .leakcheckrc.local reports itself"   t_tracked_local_config_reports_itself
+lc_test "tracked .local found without a self-match"   t_tracked_local_config_found_without_self_match
+lc_test "dangling .leakcheckrc.local errors"          t_dangling_local_config_errors
+lc_test ".local config errors name their file"        t_local_config_errors_name_their_file
 
 echo
 echo "  $PASS passed  ·  $FAIL failed"

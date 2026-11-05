@@ -3,7 +3,7 @@
 Scan a repo's tracked files for workspace-internal references before publishing or promoting.
 A linter for the public/private boundary.
 
-*README v0.3.0*
+*README v0.4.0*
 
 ## Background
 
@@ -21,11 +21,36 @@ Out of the box, leakcheck flags absolute home paths from the three major OSes:
 C:\Users\<user>\...
 ```
 
+and the same paths as they appear serialized or spelled differently:
+
+- JSON-escaped: `\/home\/<user>\/` and `C:\\Users\\<user>\\`, any drive letter, any case;
+- other Windows spellings: `c:\users\<user>\`, `D:\Users\<user>\`, `C:\USERS\<user>\`;
+- usernames holding a non-ASCII character, such as `zoë` or `José`, in the POSIX and Windows shapes.
+
 These are the universally-bad shapes — any one of them in a public repo is almost certainly a leak.
+The defaults never overlap, so one path is one hit, and they behave identically in a UTF-8 and a C locale.
+A username starting with ASCII punctuation, or holding no ASCII letter, digit or underscore at all, never matches — so the elided placeholders `/home/.../`, `/home/…/` and `/home/<user>/` stay clean (and a purely non-Latin username like `/home/日本/` is not caught; add a pattern if you need it).
 Tilde-prefixed paths (`~/...`, `$HOME/...`) are intentionally NOT default-flagged: they're shape-only locations Claude Code docs and tooling reference generically, and treating them as leaks produces too many false positives.
 Add them via the per-repo config if your project does want to scrub them.
 
 The real value-add is the per-repo `.leakcheckrc`, where you list the names, hostnames, and paths that mean "internal" inside your workspace — anything from a code-name to a server hostname to an acronym only your team uses.
+
+### Recipes — opt-in patterns that are not defaults on purpose
+
+Each was measured against a set of real repos and left out of the defaults because of a false-positive class you can judge for your own codebase.
+Add the line to your config to opt in.
+
+```
+# A home path with no trailing slash: "cwd": "/home/alice", HOME=/home/alice.
+# Anchored so `src/home/x.tsx` and `../home/x.js` stay clean; still fires on
+# route literals such as href="/home/feed".
+pattern (^|[^A-Za-z0-9_./-])/(home|Users)/[A-Za-z0-9_][A-Za-z0-9_.-]*(["'`[:space:]]|$)
+
+# Claude Code's encoding of a project path in ~/.claude/projects/
+# (-home-alice-dev-proj). Also matches hyphenated prose such as
+# "work-from-home-day-one".
+pattern -(home|Users)-[A-Za-z0-9_][A-Za-z0-9_.]*-
+```
 
 ## What it scans
 
@@ -98,7 +123,7 @@ Exit codes:
 **Treat any non-zero exit as "do not publish."**
 Never test for `1` and `2` alone.
 
-## Config: `.leakcheckrc`
+## Config: `.leakcheckrc` and `.leakcheckrc.local`
 
 Drop a `.leakcheckrc` at the repo top level.
 Line-oriented; blanks and `#` comments tolerated.
@@ -129,8 +154,10 @@ leakcheck implicitly skips its own config file when it lives inside the repo —
 Name and symlink hits carry line `0`, so an allow rule for one reads `^docs/notes-from-MYHOST\.md:0:`.
 An empty `pattern`, `allow` or `skip` is an error: an empty `allow` would otherwise allow everything.
 
-Your `.leakcheckrc` is an inventory of exactly what you are trying to hide.
-In a repo that is or will be public, keep it out of git and pass it with `--config` from outside the repo, or keep only shape-based patterns in it.
+Your config is an inventory of exactly what you are trying to hide.
+So leakcheck also reads **`.leakcheckrc.local`** from the repo top level, after `.leakcheckrc` and with the same directives: commit the shape-based patterns in `.leakcheckrc`, put the real hostnames and codenames in `.leakcheckrc.local`, and add `.leakcheckrc.local` to `.gitignore`.
+A *tracked* `.leakcheckrc.local` is reported as a finding of its own (`config:local-tracked`), whatever `--config` says — committing it publishes exactly what it exists to keep out of git — and unlike `.leakcheckrc` its content is scanned like any other file.
+An explicit `--config` replaces both files.
 
 ## Output
 
@@ -207,17 +234,17 @@ Or piped through `jq` for filtered enforcement:
 ./test/run-tests.sh
 ```
 
-76 cases covering the default patterns, config directives and their error paths, `--config` / `--root` resolution, index-versus-worktree coverage (including symlink and submodule type changes), filename and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist and its counts, `--strict`, `--json` shape and escaping (including non-UTF-8 bytes), and filenames holding spaces, colons and newlines.
+87 cases covering every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), config directives and `.leakcheckrc.local` and their error paths, `--config` / `--root` resolution, index-versus-worktree coverage (including symlink and submodule type changes), filename and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist and its counts, `--strict`, `--json` shape and escaping (including non-UTF-8 bytes), and filenames holding spaces, colons and newlines.
 Each test runs in its own throwaway repo with host git hooks disabled, and output files are per-run.
 Requires bash 4.4+, git and python3 — python3 for JSON round-trip checks, a dependency of the suite only.
 `LEAKCHECK_BIN=/path/to/leakcheck ./test/run-tests.sh` runs the suite against another build.
 
 ## Status
 
-v0.3.0.
+v0.4.0.
 Single bash file.
-Defaults stay conservative on purpose; the config file is where projects encode their own sensitivities.
-The username component of the default home-path regex requires a leading ASCII alphanumeric or underscore, so elided placeholders like `/home/.../foo.md` — the canonical way to show a home path *without* leaking a real username — don't trip the scanner.
+Defaults stay conservative on purpose — every one is an absolute home path, and every shape added since v0.3.0 was measured before it was promoted; the config file is where projects encode their own sensitivities.
+Elided placeholders like `/home/.../foo.md` — the canonical way to show a home path *without* leaking a real username — don't trip the scanner.
 
 ## License
 

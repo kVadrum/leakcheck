@@ -5,10 +5,11 @@
 # Scans the whole repo from its top level, wherever it is run: the index
 # (what the next commit publishes) AND the worktree copy of every tracked
 # file, plus every tracked path name and symlink target. Reads default
-# patterns + an optional .leakcheckrc at the repo top level.
+# patterns + the optional .leakcheckrc and .leakcheckrc.local at the repo
+# top level (keep the .local one gitignored); --config replaces both.
 #
 # Usage:
-#   leakcheck                    # scan with defaults + .leakcheckrc
+#   leakcheck                    # scan with defaults + .leakcheckrc(.local)
 #   leakcheck --strict           # also report every file whose content was
 #                                # not scanned (binary, submodule) as a match
 #   leakcheck --json             # machine-readable output
@@ -40,7 +41,7 @@ set -eEuo pipefail
 # found" — map every abort onto the error code.
 trap 'echo "leakcheck: internal error at line $LINENO; nothing was reported" >&2; exit 2' ERR
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -104,16 +105,31 @@ top="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git work
 cd -- "$top" || die "cannot cd to $top"
 top="$(pwd -P)"
 
-if [[ -z "$CONFIG_ABS" ]]; then
-  CONFIG_FILE=".leakcheckrc"
-  if [[ -f "$top/.leakcheckrc" ]]; then
-    [[ -r "$top/.leakcheckrc" ]] || die "config not readable: $top/.leakcheckrc"
-    CONFIG_ABS="$top/.leakcheckrc"
-  elif [[ -e "$top/.leakcheckrc" || -L "$top/.leakcheckrc" ]]; then
-    # A dangling symlink or a directory is not "no config"; it is a config
-    # that cannot be read.
-    die "config is not a regular file: $top/.leakcheckrc"
-  fi
+# Config files, read in order. An explicit --config is the whole config.
+# Without one: .leakcheckrc, then .leakcheckrc.local — the gitignored home
+# for the tells you would rather not commit, since a committed config is an
+# inventory of exactly what you are hiding. Either may be absent; one that
+# exists but is not a readable regular file (a dangling symlink, a
+# directory) is a config that cannot be read, not "no config".
+CONFIG_FILES=()
+CONFIG_NAMES=()
+if [[ -n "$CONFIG_ABS" ]]; then
+  CONFIG_FILES=("$CONFIG_ABS")
+  CONFIG_NAMES=("$CONFIG_FILE")
+else
+  for name in .leakcheckrc .leakcheckrc.local; do
+    if [[ -f "$top/$name" ]]; then
+      [[ -r "$top/$name" ]] || die "config not readable: $top/$name"
+      CONFIG_FILES+=("$top/$name")
+      CONFIG_NAMES+=("$name")
+    elif [[ -e "$top/$name" || -L "$top/$name" ]]; then
+      die "config is not a regular file: $top/$name"
+    fi
+  done
+  # Only the committable .leakcheckrc has its content exempt from the scan.
+  # A TRACKED .leakcheckrc.local is the inventory published: its own
+  # pattern lines are left to report it.
+  if [[ -f "$top/.leakcheckrc" ]]; then CONFIG_ABS="$top/.leakcheckrc"; fi
 fi
 
 # Default patterns. Only the universally-bad shapes — absolute home paths
@@ -123,10 +139,33 @@ fi
 # locations. Per-repo `.leakcheckrc` adds workspace tells (hostnames,
 # internal project names, custom tilde paths if a project considers them
 # leaky).
+#
+# The first three are the canonical forms; the rest catch the same paths as
+# serialized or spelled differently. Every default is DISJOINT from every
+# other by construction: git grep reports one hit per (line, pattern), so an
+# overlapping default would double-count every hit the canonical ones find.
+# Each later default was measured against a corpus of private repos before
+# promotion, with no false positives. A username needs an ASCII letter,
+# digit or underscore somewhere, so the elided `/home/.../` and `/home/…/`
+# placeholders stay clean, in every locale. NOT a default, by measurement:
+# `/home/<user>` with no trailing slash — `src/home/` trees and route
+# literals like "/home/feed" are false positives; the README offers it as an
+# opt-in recipe.
 DEFAULTS=(
   '/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/'
   '/Users/[A-Za-z0-9_][A-Za-z0-9_.-]*/'
   'C:\\Users\\[A-Za-z0-9_][A-Za-z0-9_.-]*\\'
+  # JSON-escaped slashes: {"path":"\/home\/<user>\/x"}; the only default for
+  # them, so its username takes the non-ASCII form too
+  '\\/(home|Users)\\/([A-Za-z0-9_]|[^ -~]+[A-Za-z0-9_])([A-Za-z0-9_.-]|[^ -~])*\\/'
+  # JSON-escaped backslashes, any drive, any case: "C:\\Users\\<user>\\"
+  '[A-Za-z]:\\\\[Uu][Ss][Ee][Rr][Ss]\\\\[A-Za-z0-9_][A-Za-z0-9_.-]*\\\\'
+  # Single backslashes, any spelling except the canonical C:\Users\ above
+  '([A-BD-Za-z]:\\[Uu][Ss][Ee][Rr][Ss]|C:\\(u[Ss][Ee][Rr][Ss]|U(S[Ee][Rr][Ss]|s(E[Rr][Ss]|e(R[Ss]|rS)))))\\[A-Za-z0-9_][A-Za-z0-9_.-]*\\'
+  # Usernames holding a non-ASCII character (zoë, José); [^ -~] is "not
+  # printable ASCII" in both a UTF-8 and a C locale
+  '/(home|Users)/([A-Za-z0-9_][A-Za-z0-9_.-]*[^ -~]|[^ -~]+[A-Za-z0-9_])([A-Za-z0-9_.-]|[^ -~])*/'
+  '[A-Za-z]:(\\\\|\\)[Uu][Ss][Ee][Rr][Ss](\\\\|\\)([A-Za-z0-9_][A-Za-z0-9_.-]*[^ -~]|[^ -~]+[A-Za-z0-9_])([A-Za-z0-9_.-]|[^ -~])*(\\\\|\\)'
 )
 
 PATTERNS=()
@@ -134,9 +173,9 @@ ALLOWLIST=()
 SKIPS=()
 USE_DEFAULTS=1
 
-# Read config if present. Tolerates absence — defaults still apply.
-if [[ -n "$CONFIG_ABS" ]]; then
-  lineno=0
+# Read each config in order. Absence is fine — defaults still apply.
+parse_config() { # path name-for-messages
+  local file=$1 name=$2 lineno=0 line keyword rest
   while IFS= read -r line || [[ -n "$line" ]]; do
     lineno=$((lineno + 1))
     # A CRLF config would otherwise end every regex in a CR that no line
@@ -152,7 +191,7 @@ if [[ -n "$CONFIG_ABS" ]]; then
       pattern|allow|skip)
         # An empty `allow` matches every hit and an empty `pattern` every
         # line: both are typos, and one of them turns a dirty repo clean.
-        [[ -n "$rest" ]] || die "$CONFIG_FILE:$lineno: empty $keyword directive"
+        [[ -n "$rest" ]] || die "$name:$lineno: empty $keyword directive"
         case "$keyword" in
           pattern) PATTERNS+=("$rest") ;;
           allow)   ALLOWLIST+=("$rest") ;;
@@ -160,10 +199,13 @@ if [[ -n "$CONFIG_ABS" ]]; then
         esac
         ;;
       no-defaults)   USE_DEFAULTS=0 ;;
-      *)             die "$CONFIG_FILE: unknown directive: $keyword" ;;
+      *)             die "$name: unknown directive: $keyword" ;;
     esac
-  done < "$CONFIG_ABS"
-fi
+  done < "$file"
+}
+for i in "${!CONFIG_FILES[@]}"; do
+  parse_config "${CONFIG_FILES[$i]}" "${CONFIG_NAMES[$i]}"
+done
 
 if [[ "$USE_DEFAULTS" -eq 1 ]]; then
   PATTERNS=("${DEFAULTS[@]}" "${PATTERNS[@]}")
@@ -457,6 +499,16 @@ for p in "${PATTERNS[@]}"; do
     add_hit "$p" "${S_PATH[$i]}" 0 "${S_TEXT[$i]}" "${S_SRC[$i]}"
   done < "$TMPD/shits"
 done
+
+# A committed .leakcheckrc.local publishes the inventory of tells it exists
+# to keep out of git. Reported as a finding of its own, in every mode and
+# whatever --config says: its patterns need not match their own source text
+# (`pattern ^SECRET-[0-9]+$` does not), so "its lines will report it" is not
+# a guarantee.
+if [[ -n "${SEEN_PATH["p.leakcheckrc.local"]+x}" ]]; then
+  add_hit "config:local-tracked" ".leakcheckrc.local" 0 \
+    "(a committed .leakcheckrc.local publishes the tells it holds; gitignore it)" "index"
+fi
 
 # Under --strict, what could not be scanned is itself a finding.
 if [[ "$STRICT" -eq 1 ]]; then
