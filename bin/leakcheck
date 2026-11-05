@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # leakcheck — scan a repo's tracked files for workspace-internal references
-# (host paths, internal names) before publishing or promoting.
+# (host paths, internal names) before the repo goes public.
 #
 # Scans the whole repo from its top level, wherever it is run: the index
 # (what the next commit publishes) AND the worktree copy of every tracked
@@ -36,12 +36,36 @@
 #   1  one or more matches
 #   2  usage, config or scan error
 
+# Older bash dies at its first empty-array expansion under `set -u` with exit
+# 1, "matches found", having printed nothing (measured on bash 3.2, macOS's
+# /bin/bash). Refuse it before anything else runs.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] ||
+   { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
+  echo "leakcheck: needs bash 4.4 or newer (this is bash ${BASH_VERSION:-unknown})" >&2
+  exit 2
+fi
+
 set -eEuo pipefail
 # An unexpected failure must never surface as exit 1, which means "matches
 # found" — map every abort onto the error code.
 trap 'echo "leakcheck: internal error at line $LINENO; nothing was reported" >&2; exit 2' ERR
+# The ERR trap does not see a `set -u` abort (an unbound variable): bash exits
+# 1 without running it (measured, bash 5.3). So the one deliberate exit 1 sets
+# EXIT_HITS first, and every other exit 1 is mapped onto 2 here.
+EXIT_HITS=""
+TMPD=""
+on_exit() {
+  local rc=$?
+  if [[ -n "$TMPD" ]]; then rm -rf -- "$TMPD"; fi
+  if [[ $rc -eq 1 && -z "$EXIT_HITS" ]]; then
+    echo "leakcheck: internal error (aborted); nothing was reported" >&2
+    rc=2
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -173,6 +197,59 @@ ALLOWLIST=()
 SKIPS=()
 USE_DEFAULTS=1
 
+# POSIX ERE has no \d, \t or \x: git's regex reads `\` before an ordinary
+# letter as that letter, so `SECRET-\d+` and a single-backslash
+# `C:\Users\<user>` silently match nothing real, and inside brackets a
+# backslash is literal, so `[\w.-]` misses every letter (all measured, git
+# 2.53). Only \w \W \s \S \b \B mean something; refuse every other `\` +
+# letter, and `\0`. The bracket walk follows POSIX: `]` right after `[` or
+# `[^` is literal, and [:class:] / [=x=] / [.x.] nest.
+check_escapes() { # regex where
+  local re=$1 where=$2 n=${#1} i=0 c x in_br=0 open=0 d rest tail
+  local letters='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  while (( i < n )); do
+    c=${re:i:1}
+    if (( in_br )); then
+      if [[ $c == '[' ]] && (( i + 1 < n )); then
+        d=${re:i+1:1}
+        if [[ $d == ':' || $d == '=' || $d == '.' ]]; then
+          rest=${re:i+2}
+          tail=${rest#*"$d]"}
+          if [[ $tail == "$rest" ]]; then return 0; fi # unterminated: git rejects it
+          i=$(( n - ${#tail} ))
+          continue
+        fi
+      fi
+      if [[ $c == ']' ]] && (( i > open )); then
+        in_br=0
+      elif [[ $c == '\' ]] && (( i + 1 < n )); then
+        x=${re:i+1:1}
+        if [[ $letters == *"$x"* ]]; then
+          die "$where: inside [...] a backslash is literal, so '\\$x' means a backslash or a '$x', not a class; write [0-9] for a digit, [[:alnum:]_] for a word character"
+        fi
+      fi
+      i=$(( i + 1 ))
+      continue
+    fi
+    if [[ $c == '\' ]]; then
+      x=${re:i+1:1}
+      if [[ -n $x && ( $letters == *"$x"* || $x == 0 ) && $x != [bBsSwW] ]]; then
+        die "$where: '\\$x' is a plain '$x' in POSIX ERE, not an escape, so this can never match what it looks like; write '\\\\' for a literal backslash, [0-9] for a digit"
+      fi
+      i=$(( i + 2 ))
+      continue
+    fi
+    if [[ $c == '[' ]]; then
+      in_br=1
+      i=$(( i + 1 ))
+      if [[ ${re:i:1} == '^' ]]; then i=$(( i + 1 )); fi
+      open=$i
+      continue
+    fi
+    i=$(( i + 1 ))
+  done
+}
+
 # Read each config in order. Absence is fine — defaults still apply.
 parse_config() { # path name-for-messages
   local file=$1 name=$2 lineno=0 line keyword rest
@@ -192,6 +269,9 @@ parse_config() { # path name-for-messages
         # An empty `allow` matches every hit and an empty `pattern` every
         # line: both are typos, and one of them turns a dirty repo clean.
         [[ -n "$rest" ]] || die "$name:$lineno: empty $keyword directive"
+        if [[ $keyword != skip ]]; then
+          check_escapes "$rest" "$name:$lineno: $keyword '$rest'"
+        fi
         case "$keyword" in
           pattern) PATTERNS+=("$rest") ;;
           allow)   ALLOWLIST+=("$rest") ;;
@@ -243,7 +323,6 @@ case "$CONFIG_ABS" in
 esac
 
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/leakcheck.XXXXXX")" || die "cannot create a temp dir"
-trap 'rm -rf -- "$TMPD"' EXIT
 mkdir "$TMPD/subj"
 
 # Binary detection must depend on content alone. git grep -I otherwise
@@ -662,6 +741,7 @@ else
 fi
 
 if [[ "$HIT_COUNT" -gt 0 ]]; then
+  EXIT_HITS=1
   exit 1
 fi
 exit 0

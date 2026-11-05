@@ -6,7 +6,7 @@ Credential scanners such as gitleaks, trufflehog and git-secrets look for secret
 leakcheck looks for what they ignore: home paths that carry your username, the names of your machines, and the codenames only your team uses — references that pile up in a private repo and get noticed only after it goes public.
 It is one bash script, and git is its only real dependency.
 
-*README v0.4.0*
+*README v0.4.1*
 
 ## Install
 
@@ -17,7 +17,7 @@ cp leakcheck/bin/leakcheck ~/.local/bin/    # or any other directory on $PATH
 
 Or run `bin/leakcheck` straight from the checkout.
 
-Requirements: bash 4.4 or newer (macOS's system bash is 3.2), git 2.19 or newer, and `sed`, `tr`, `mktemp`, `readlink`, `dirname` and `basename`.
+Requirements: bash 4.4 or newer (macOS's system bash is 3.2, which leakcheck refuses with exit `2`), git 2.19 or newer, and `sed`, `tr`, `mktemp`, `readlink`, `dirname` and `basename`.
 It is developed and tested on bash 5.3 and git 2.53; the two version floors follow from the features the script uses and are not themselves tested.
 
 ## Quick start
@@ -146,22 +146,24 @@ skip tests/fixtures/*
 # no-defaults
 ```
 
-How patterns behave — two of these fail silently, so read them before you write one:
+How patterns behave — read this before you write one:
 
 - Patterns are **POSIX extended regexes**, evaluated by `git grep -E` one line at a time.
-- **Matching is case-sensitive**: `pattern MYHOST` does not match `myhost.example`.
+- **Matching is case-sensitive**, and nothing warns you: `pattern MYHOST` does not match `myhost.example`.
   Spell out the variants: `pattern [Mm][Yy][Hh][Oo][Ss][Tt]`.
-- **`\d` is not a digit class here.**
-  It matches the letter `d`, so `pattern SECRET-\d+` matches nothing and the run reports clean.
-  Write `[0-9]` or `[[:digit:]]`.
-  `\w`, `\s` and `\b` do work where git uses GNU regex, as on Linux, but they are not POSIX.
+- **There is no `\d`, `\t` or `\x`.**
+  POSIX regex reads a backslash before an ordinary letter as just that letter, so `SECRET-\d+` would match nothing and a single-backslash `C:\Users\…` would never match a real path.
+  leakcheck refuses both with exit `2`: write `[0-9]` for a digit and `\\` for a literal backslash.
+- **Inside brackets a backslash is literal**, so `[\w.-]` would mean a backslash, a `w`, a dot or a hyphen; it is refused too.
+  Write `[[:alnum:]_.-]`.
+- `\w`, `\W`, `\s`, `\S`, `\b` and `\B` are accepted; they work where git uses GNU regex, as on Linux, but are not POSIX.
 - **Name and symlink hits carry line `0`**, so an allow rule for a file name reads `^docs/notes-from-MYHOST\.md:0:`.
 - **Every allow rule's suppressions are counted**, per rule in `--json`, so an over-broad rule shows up instead of passing as a clean repo.
 
 leakcheck never scans the content of its own config file — otherwise every `pattern` line would match itself — and counts it under `skipped by config`.
 The config's name and symlink target are still scanned, because a clone publishes both.
 
-Mistakes in the config stop the run with exit `2` rather than narrowing the scan: an empty `pattern`, `allow` or `skip` (an empty `allow` would allow everything), an unknown directive, an invalid regex, or a config file that is missing or unreadable.
+Mistakes in the config stop the run with exit `2` rather than narrowing the scan: an empty `pattern`, `allow` or `skip` (an empty `allow` would allow everything), an unknown directive, an invalid regex, a backslash escape POSIX does not have, or a config file that is missing or unreadable.
 
 ## Usage
 
@@ -183,7 +185,7 @@ Exit codes:
 
 - `0` — clean;
 - `1` — one or more matches;
-- `2` — usage, config or scan error (an invalid regex, an unreadable file, a missing config, not a git repository).
+- `2` — usage, config or scan error (an invalid regex, an unreadable file, a missing config, not a git repository, a bash older than 4.4), and any internal abort.
 
 **Treat any non-zero exit as "do not publish"** — never test for `1` alone.
 `0`, `1` and `2` cover everything the script itself decides; a signal still exits as 128+n, and that is non-zero too.
@@ -266,7 +268,7 @@ The step still fails on any match (`1`) and on any error (`2`, which prints no J
 ./test/run-tests.sh
 ```
 
-The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths, `.leakcheckrc.local`, `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist and its counts, `--strict`, the JSON shape and its escaping, and file names holding spaces, colons and newlines.
+The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist and its counts, `--strict`, the JSON shape and its escaping, and file names holding spaces, colons and newlines.
 Each test runs in its own throwaway repo with your git hooks disabled.
 It needs bash 4.4+, git and python3 (for JSON round-trip checks; leakcheck itself never uses python3).
 `LEAKCHECK_BIN=/path/to/leakcheck ./test/run-tests.sh` runs the suite against another build.

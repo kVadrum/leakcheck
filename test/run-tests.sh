@@ -1021,6 +1021,86 @@ t_local_config_errors_name_their_file() {
   assert_contains ".leakcheckrc.local: unknown directive: bogus" "$LC_ERR"
 }
 
+# ─── v0.4.1: silent-clean escapes, unbound aborts, the bash floor ──────
+
+t_escape_letter_is_refused() {
+  # git's regex reads `\d` as a plain `d`: v0.4.0 ran this and said clean.
+  seed README.md "SECRET-123"
+  rc_file 'no-defaults' 'pattern SECRET-\d+'
+  commit init
+  assert_exit 2 "$BIN"
+  assert_contains "'\\d' is a plain 'd'" "$LC_ERR"
+  assert_not_contains "clean" "$LC_OUT"
+}
+
+t_single_backslash_windows_pattern_is_refused() {
+  # `C:\Users\dave` reads as C:Usersdave, so it never matches the path it
+  # spells. Defaults off, so nothing else catches the line.
+  seed notes.md 'C:\Users\dave\x'
+  rc_file 'no-defaults' 'pattern C:\Users\dave'
+  commit init
+  assert_exit 2 "$BIN"
+  assert_contains "'\\U' is a plain 'U'" "$LC_ERR"
+}
+
+t_bracket_escape_is_refused() {
+  # Inside brackets a backslash is literal: `[\w.-]` misses every letter.
+  seed README.md "db.internal"
+  rc_file 'no-defaults' 'pattern [\w.-]+\.internal'
+  commit init
+  assert_exit 2 "$BIN"
+  assert_contains "inside [...] a backslash is literal" "$LC_ERR"
+}
+
+t_allow_escape_is_refused() {
+  # An allow rule holding `\d` suppresses nothing it means to; same refusal.
+  seed docs/2.md "/home/alice/x"
+  rc_file 'allow ^docs/\d'
+  commit init
+  assert_exit 2 "$BIN"
+  assert_contains "allow '^docs/\\d'" "$LC_ERR"
+}
+
+t_meaningful_escapes_still_accepted() {
+  # Guard (passes on v0.4.0 by design): every escape and bracket shape that
+  # means something stays legal, the README recipes included.
+  seed README.md 'host.internal C:\Users\dave\x a word'
+  rc_file 'no-defaults' \
+    'pattern \.internal' 'pattern C:\\Users\\dave' 'pattern \bword\b' \
+    'pattern \w+\s' 'pattern [[:digit:]]?host' 'pattern []a]' 'pattern [^]a]x' \
+    'pattern [\\/]Users' 'pattern \<word\>' \
+    "pattern (^|[^A-Za-z0-9_./-])/(home|Users)/[A-Za-z0-9_][A-Za-z0-9_.-]*([\"'\`[:space:]]|\$)" \
+    'pattern -(home|Users)-[A-Za-z0-9_][A-Za-z0-9_.]*-'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "[\\.internal]" "$LC_OUT"
+}
+
+t_unbound_variable_abort_exits_2() {
+  # bash exits 1 on a `set -u` abort WITHOUT running the ERR trap, and 1
+  # means "matches found". Plant one in a copy, before the final `exit 0`:
+  # a clean repo must then report an error, never matches.
+  seed README.md "hello"
+  commit init
+  sed '$s/^exit 0$/: "$LEAKCHECK_UNBOUND_PROBE"; exit 0/' "$BIN" > mutated.sh
+  grep -q 'LEAKCHECK_UNBOUND_PROBE' mutated.sh
+  assert_exit 2 bash mutated.sh
+  assert_contains "internal error" "$LC_ERR"
+}
+
+t_old_bash_is_refused() {
+  # No bash < 4.4 here, so fake the version in a copy; the guard must stop
+  # the run with exit 2 before anything is scanned. Measured for real on bash
+  # 3.2: v0.4.0 exited 1 ("matches found") having printed nothing.
+  seed README.md "/home/alice/x"
+  commit init
+  sed 's/"\${BASH_VERSINFO\[0\]:-0}"/"3"/' "$BIN" > mutated.sh
+  grep -q '"3" -lt 4' mutated.sh
+  assert_exit 2 bash mutated.sh
+  assert_contains "needs bash 4.4 or newer" "$LC_ERR"
+  assert_not_contains "/home/alice/" "$LC_OUT"
+}
+
 # ─── runner ───────────────────────────────────────────────────────────
 
 echo "leakcheck self-tests"
@@ -1113,6 +1193,13 @@ lc_test "tracked .leakcheckrc.local reports itself"   t_tracked_local_config_rep
 lc_test "tracked .local found without a self-match"   t_tracked_local_config_found_without_self_match
 lc_test "dangling .leakcheckrc.local errors"          t_dangling_local_config_errors
 lc_test ".local config errors name their file"        t_local_config_errors_name_their_file
+lc_test "escape \\d in a pattern is refused"           t_escape_letter_is_refused
+lc_test "single-backslash Windows pattern refused"    t_single_backslash_windows_pattern_is_refused
+lc_test "escape inside brackets is refused"           t_bracket_escape_is_refused
+lc_test "escape in an allow rule is refused"          t_allow_escape_is_refused
+lc_test "meaningful escapes still accepted"           t_meaningful_escapes_still_accepted
+lc_test "unbound-variable abort exits 2, not 1"       t_unbound_variable_abort_exits_2
+lc_test "bash older than 4.4 is refused"              t_old_bash_is_refused
 
 echo
 echo "  $PASS passed  ·  $FAIL failed"
