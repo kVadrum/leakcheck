@@ -27,7 +27,8 @@
 #   leakcheck -h, --help
 #
 # Config file (.leakcheckrc) is line-oriented:
-#   pattern <regex>          # add an ERE to the scan set
+#   pattern <regex>          # add an ERE to the scan set; a leading (?i)
+#                            # makes it (or an allow rule) ignore case
 #   allow   <regex>          # allowlist hits: an ERE matching all of
 #                            # path:line:text, or path:line:<match> for
 #                            # every match of the hit's own pattern there
@@ -75,7 +76,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.8.0"
+VERSION="0.9.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -297,6 +298,9 @@ parse_config() { # path name-for-messages
         # An empty `allow` matches every hit and an empty `pattern` every
         # line: both are typos, and one of them turns a dirty repo clean.
         [[ -n "$rest" ]] || die "$name:$lineno: empty $keyword directive"
+        if [[ $keyword != skip && "$rest" == '(?i)' ]]; then
+          die "$name:$lineno: empty $keyword directive after (?i)"
+        fi
         if [[ $keyword != skip ]]; then
           check_escapes "$rest" "$name:$lineno: $keyword '$rest'"
         fi
@@ -392,6 +396,15 @@ run_git() {
 }
 
 GREP_FLAGS=(-z --no-color --no-column --no-textconv --no-recurse-submodules)
+
+# re_args <pattern or allow rule>: its git grep arguments, in RE_ARGS. A
+# leading (?i) makes it case-insensitive — git's ERE refuses `(?i)` (exit
+# 128, measured), so the prefix had no meaning before — and the text as
+# written stays its label. Every site that hands a pattern or rule to git
+# goes through here.
+re_args() {
+  if [[ "$1" == '(?i)'* ]]; then RE_ARGS=(-i -E -e "${1:4}"); else RE_ARGS=(-E -e "$1"); fi
+}
 
 # ─── what is tracked ──────────────────────────────────────────────────
 # Mode decides the kind: 100644/100755 regular, 120000 symlink (its blob is
@@ -514,8 +527,9 @@ content_pass() { # source [git grep args...]
   local src=$1 p f l t
   shift
   for p in "${PATTERNS[@]}"; do
+    re_args "$p"
     run_git "pattern '$p' ($src)" "$TMPD/hits" \
-      g grep "$@" "${GREP_FLAGS[@]}" -n -I -H --full-name -E -e "$p" -- . "${excludes[@]}"
+      g grep "$@" "${GREP_FLAGS[@]}" -n -I -H --full-name "${RE_ARGS[@]}" -- . "${excludes[@]}"
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       add_hit "$p" "$f" "$l" "$t" "$src"
     done < "$TMPD/hits"
@@ -558,8 +572,9 @@ if [[ ${#TC_PATHS[@]} -gt 0 ]]; then
   binary_rows
   for k in "${BINARY_ROWS[@]}"; do mark_binary "${TC_PATHS[$k]}" worktree; done
   for p in "${PATTERNS[@]}"; do
+    re_args "$p"
     run_git "pattern '$p' (type changes)" "$TMPD/hits" \
-      gni -z -n -I --no-color --no-column -E -e "$p" -- .
+      gni -z -n -I --no-color --no-column "${RE_ARGS[@]}" -- .
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       # An indexed subscript is arithmetic: a non-numeric name would quietly
       # map to entry 0, so check the shape before the lookup.
@@ -611,8 +626,9 @@ else
 fi
 
 for p in "${PATTERNS[@]}"; do
+  re_args "$p"
   run_git "pattern '$p' (names)" "$TMPD/shits" \
-    git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "$p" -- s
+    git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- s
   while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
     i="${SUBJ_OF_LINE[$l]:-}"
     [[ -n "$i" ]] || die "internal error: names pass returned line $l"
@@ -804,8 +820,9 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
   }
 
   for p in "${PATTERNS[@]}"; do
+    re_args "$p"
     run_git "pattern '$p' (history)" "$TMPD/hhits" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "$p" -- h
+      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- h
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       m="${HMETA[l - 1]-}"
       [[ -n "$m" ]] || die "internal error: history pass returned line $l"
@@ -839,8 +856,9 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
   done
   exec 5>&-
   for p in "${PATTERNS[@]}"; do
+    re_args "$p"
     run_git "pattern '$p' (history names)" "$TMPD/hhits" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "$p" -- hn
+      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- hn
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       e="${HN_OF_LINE[l]-}"
       [[ -n "$e" ]] || die "internal error: history names pass returned line $l"
@@ -1019,8 +1037,9 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
   done
   exec 5>&-
   for p in "${PATTERNS[@]}"; do
+    re_args "$p"
     run_git "pattern '$p' (history metadata)" "$TMPD/hhits" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "$p" -- hm
+      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- hm
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       i=$((l - 1))
       [[ -n "${M_SHA[i]-}" ]] || die "internal error: history metadata pass returned line $l"
@@ -1112,8 +1131,9 @@ if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
       for (( k = 0; k < REPLY; k++ )); do n=$((n + 1)); T_HIT[n]=$i; done
     done
     exec 6>&-
+    re_args "$p"
     run_git "pattern '$p' (allow)" "$TMPD/tmatch" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E -e "$p" -- t
+      git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column "${RE_ARGS[@]}" -- t
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
       i=${T_HIT[l]:-}
       [[ -n "$i" ]] || die "internal error: allow match pass returned line $l"
@@ -1156,9 +1176,10 @@ if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
   for j in "${!MT_HIT[@]}"; do EXC[$j]=""; done
   for r in "${!ALLOWLIST[@]}"; do
     rule=${ALLOWLIST[$r]}
+    re_args "$rule"
     # Whole line: every line of the record matched entirely.
     run_git "allow '$rule'" "$TMPD/awhole" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E -e "$rule" -- a
+      git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column "${RE_ARGS[@]}" -- a
     declare -A WCOUNT=() WSEEN=()
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       i=${A_OF[l]:-}
@@ -1172,7 +1193,7 @@ if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
     done
     unset WCOUNT WSEEN
     run_git "allow '$rule'" "$TMPD/amatch" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "$rule" -- m
+      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- m
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       j=${M_OF[l]:-}
       [[ -n "$j" ]] || die "internal error: allow pass returned line $l"

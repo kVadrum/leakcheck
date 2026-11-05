@@ -6,7 +6,7 @@ Credential scanners such as gitleaks, trufflehog and git-secrets look for secret
 leakcheck looks for what they ignore: home paths that carry your username, the names of your machines, and the codenames only your team uses — references that pile up in a private repo and get noticed only after it goes public.
 It is one bash script, and git is its only real dependency.
 
-*README v0.8.0*
+*README v0.9.0*
 
 ## Install
 
@@ -209,6 +209,8 @@ Both files are line-oriented and take four directives; blank lines and `#` comme
 # Add a pattern to the scan set.
 pattern MYHOST
 pattern internal-tool-name
+# A leading (?i) ignores case: this one matches MyBox, MYBOX and mybox.
+pattern (?i)mybox
 
 # Allow hits by regex: a rule names a hit's whole "path:line:text", or
 # each match on it as "path:line:match" (see How patterns behave, below).
@@ -226,8 +228,9 @@ skip tests/fixtures/*
 How patterns behave — read this before you write one:
 
 - Patterns are **POSIX extended regexes**, evaluated by `git grep -E` one line at a time.
-- **Matching is case-sensitive**, and nothing warns you: `pattern MYHOST` does not match `myhost.example`.
-  Spell out the variants: `pattern [Mm][Yy][Hh][Oo][Ss][Tt]`.
+- **Matching is case-sensitive unless the pattern starts with `(?i)`**: `pattern MYHOST` does not match `myhost.example`, and `pattern (?i)myhost` does.
+  Host names are case-insensitive, so `(?i)` is usually what a host name wants.
+  The prefix is leakcheck's, not POSIX's: it works at the very start of a `pattern` or `allow` rule, and anywhere else git refuses it with exit `2`.
 - **There is no `\d`, `\t` or `\x`.**
   POSIX regex reads a backslash before an ordinary letter as just that letter, so `SECRET-\d+` would match nothing and a single-backslash `C:\Users\…` would never match a real path.
   leakcheck refuses both with exit `2`: write `[0-9]` for a digit and `\\` for a literal backslash.
@@ -379,7 +382,7 @@ To scan only what a pull request adds, pass its range; the shas go through `env`
 ./test/run-tests.sh
 ```
 
-The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist and its counts, `--strict`, the JSON shape and its escaping, file names holding spaces, colons and newlines, and `--history` — merges, a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, and once-per-finding reporting — and `--history-range`, in every pass and in a shallow clone.
+The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist — a rule excuses only what it names — and its counts, `(?i)` at every site a pattern reaches git, `--strict`, the JSON shape and its escaping, file names holding spaces, colons and newlines, and `--history` — merges, a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, once-per-finding reporting, ref names and annotated tags (nested, and holding NUL bytes) — and `--history-range`, in every pass and in a shallow clone.
 Each test runs in its own throwaway repo with your git hooks disabled.
 It needs bash 4.4+, git and python3 (for JSON round-trip checks; leakcheck itself never uses python3).
 `LEAKCHECK_BIN=/path/to/leakcheck ./test/run-tests.sh` runs the suite against another build.

@@ -1769,6 +1769,75 @@ t_history_tag_holding_nul_bytes() {
   assert_contains "$t2:(tag message):1: [MYHOST] MYHOST two" "$LC_OUT"
 }
 
+# A leading (?i) makes a pattern or an allow rule ignore case (v0.9.0).
+
+t_ignorecase_pattern_in_the_tree() {
+  rc_file 'pattern (?i)myhost'
+  seed a.txt "deploy to MyHost"
+  seed notes-from-MYHOST.md "x"
+  ln -s /srv/MyHost/data link
+  ln -s clean-target swapped
+  git add link swapped
+  commit init
+  # A symlink replaced by a file: the type-change pass.
+  rm swapped
+  printf 'on myHOST too\n' > swapped
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [(?i)myhost] deploy to MyHost" "$LC_OUT"
+  assert_contains "notes-from-MYHOST.md:0: [(?i)myhost]" "$LC_OUT"
+  assert_contains "link:0: [(?i)myhost] -> /srv/MyHost/data" "$LC_OUT"
+  assert_contains "swapped:1: [(?i)myhost] on myHOST too" "$LC_OUT"
+}
+
+t_ignorecase_pattern_in_history() {
+  rc_file 'pattern (?i)myhost'
+  commit rc
+  seed f.txt "on MyHost"
+  commit "deployed to MYHOST"
+  local added; added=$(sha_of)
+  git mv f.txt myhost-notes.txt
+  commit rename
+  git rm -q myhost-notes.txt
+  commit scrub
+  assert_exit 0 "$BIN"
+  assert_exit 1 "$BIN" --history
+  assert_contains "$added:f.txt:1: [(?i)myhost] on MyHost" "$LC_OUT"
+  assert_contains "$added:(message):1: [(?i)myhost] deployed to MYHOST" "$LC_OUT"
+  assert_contains ":myhost-notes.txt:0: [(?i)myhost]" "$LC_OUT"
+}
+
+t_ignorecase_allow() {
+  seed a.txt "see X.EXAMPLE.COM"
+  rc_file 'pattern (?i)[a-z]+\.example\.com' 'allow (?i)\.example\.com'
+  commit init
+  assert_exit 0 "$BIN"
+  assert_contains "1 allowed" "$LC_OUT"
+  # And as a whole-line rule.
+  rc_file 'pattern (?i)[a-z]+\.example\.com' 'allow (?i)^A\.TXT:1:SEE x\.example\.com$'
+  assert_exit 0 "$BIN"
+  assert_contains "1 allowed" "$LC_OUT"
+}
+
+t_ignorecase_alone_is_refused() {
+  # `(?i)` with nothing after it matches every line, like an empty pattern.
+  rc_file 'pattern (?i)'
+  assert_exit 2 "$BIN"
+  assert_contains "empty pattern directive after (?i)" "$LC_ERR"
+  rc_file 'allow (?i)'
+  assert_exit 2 "$BIN"
+  assert_contains "empty allow directive after (?i)" "$LC_ERR"
+}
+
+t_ignorecase_only_at_the_start() {
+  # Guard (exits 2 on v0.8.0 too, by design): anywhere but the start, (?i)
+  # is the invalid ERE git refuses.
+  seed a.txt "x"
+  rc_file 'pattern my(?i)host'
+  commit init
+  assert_exit 2 "$BIN"
+  assert_contains "Invalid preceding regular expression" "$LC_ERR"
+}
+
 # ─── runner ───────────────────────────────────────────────────────────
 
 echo "leakcheck self-tests"
@@ -1915,6 +1984,11 @@ lc_test "history: nested tag"                         t_history_nested_tag
 lc_test "history: tagged blob counted, --strict"      t_history_tagged_blob_counted_and_strict
 lc_test "history range: refs in the range only"       t_history_range_refs_in_range_only
 lc_test "history: tag holding NUL bytes"             t_history_tag_holding_nul_bytes
+lc_test "(?i): pattern in the tree"                   t_ignorecase_pattern_in_the_tree
+lc_test "(?i): pattern in history"                    t_ignorecase_pattern_in_history
+lc_test "(?i): allow rules"                           t_ignorecase_allow
+lc_test "(?i): alone is refused"                      t_ignorecase_alone_is_refused
+lc_test "(?i): only at the start"                     t_ignorecase_only_at_the_start
 
 echo
 echo "  $PASS passed  ·  $FAIL failed"
