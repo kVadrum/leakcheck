@@ -6,7 +6,7 @@ Credential scanners such as gitleaks, trufflehog and git-secrets look for secret
 leakcheck looks for what they ignore: home paths that carry your username, the names of your machines, and the codenames only your team uses — references that pile up in a private repo and get noticed only after it goes public.
 It is one bash script, and git is its only real dependency.
 
-*README v0.7.0*
+*README v0.8.0*
 
 ## Install
 
@@ -125,17 +125,19 @@ What it does not scan, and says so on every run:
 
 - **every added line** of every commit, at its line number in that commit's version of the file, merge commits included;
 - **every path** that ever existed, so a file renamed away from `notes-from-MYHOST.md` is still found;
-- **author, committer and message** of every commit.
+- **author, committer and message** of every commit;
+- **every ref name** — `feature/MYHOST-fix` leaks in its name — **and every annotated tag**: its name, tagger and message, a tag of a tag included.
 
 ```text
 $ leakcheck --history
 4ff38873059fcdf429cd403f41ec4ce5173a9f91:f.txt:2: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] See /home/alice/code
 28a6c84b00ef284368a6ef9d3f7305eb3a3a5d8f:(message):1: [MYHOST] scrubbed, was on MYHOST
 leakcheck: 2 match(es)
-leakcheck: scanned 1 tracked files (index + worktree; 0 binary skipped, 0 submodules not scanned, 1 skipped by config, 0 allowed; history scanned: 4 commits, 0 binary files skipped, 0 skipped by config, 1 current-config lines exempt)
+leakcheck: scanned 1 tracked files (index + worktree; 0 binary skipped, 0 submodules not scanned, 1 skipped by config, 0 allowed; history scanned: 4 commits, 0 binary files skipped, 0 skipped by config, 1 current-config lines exempt, 1 refs, 0 annotated tags, 0 tagged trees or blobs not scanned)
 ```
 
 A history hit leads with the full commit id, then `path:line:`; commit metadata uses `(author)`, `(committer)` or `(message)` in place of the path, with the message's line number.
+Ref and tag hits use `(ref)`, `(tag)`, `(tagger)` or `(tag message)`, and lead with the object they name: the commit a branch points at, or the tag object.
 
 - **Each finding is reported once, at the earliest commit that has it.**
   A line that stayed put through fifty edits is one hit, and so is one email address in five hundred commits.
@@ -149,6 +151,7 @@ A history hit leads with the full commit id, then `path:line:`; commit metadata 
 - **Grafts and replace refs are ignored**, so the scan sees the history a push publishes, not a locally rewritten one.
 - **A `.leakcheckrc.local` committed at any point is a finding** (`config:local-in-history`), even if it was removed later.
 - **Binary files in history are skipped and counted**; `--strict` reports each.
+- **A ref that ends at a tree or a blob** instead of a commit publishes content no diff shows: counted as `tagged trees or blobs not scanned`, and reported under `--strict`.
 - **A shallow clone is refused** with exit `2`: its history is incomplete, and a clean verdict over part of it would be a lie.
   In GitHub Actions, check out with `fetch-depth: 0`.
 - **Commits no ref reaches** — reflog-only and dangling objects — are not scanned, because a push does not publish them.
@@ -161,12 +164,12 @@ A history hit leads with the full commit id, then `path:line:`; commit metadata 
 $ leakcheck --history-range origin/main..HEAD
 0a2a94c80d26e6f9f0c6465f619b5ffb5e0d9be5:notes.md:1: [MYHOST] Deploys to MYHOST nightly.
 leakcheck: 1 match(es)
-leakcheck: scanned 3 tracked files (index + worktree; 0 binary skipped, 0 submodules not scanned, 1 skipped by config, 0 allowed; history scanned: 2 commits in range origin/main..HEAD only, 0 binary files skipped, 0 skipped by config, 0 current-config lines exempt)
+leakcheck: scanned 3 tracked files (index + worktree; 0 binary skipped, 0 submodules not scanned, 1 skipped by config, 0 allowed; history scanned: 2 commits in range origin/main..HEAD only, 0 binary files skipped, 0 skipped by config, 0 current-config lines exempt, 1 refs, 0 annotated tags, 0 tagged trees or blobs not scanned)
 ```
 
 The host name was edited out again before the push, so the tree is clean, but the commit that added it is still part of the push.
 
-- **Everything above applies inside the range**: every added line, path name and commit's metadata, once per finding at its earliest commit in the range.
+- **Everything above applies inside the range**: every added line, path name and commit's metadata, once per finding at its earliest commit in the range, and the refs and annotated tags that point into it — the ones the push carries.
 - **A finding older than the range is not reported** — that is the point — so a range scan vouches only for its range, and the summary and the JSON (`history.range`) say which range it was.
 - `RANGE` is one revision argument as `git log` takes it: `A..B`, `A...B`, or a single commit for everything it reaches.
   An option-shaped value such as `--all` is refused, and so is a second `--history-range`.
@@ -282,6 +285,7 @@ The summary's count is matches, not lines: two patterns matching one line are tw
 Some hits are not regex matches, and they use these names in the pattern slot:
 
 - `unscanned:binary` and `unscanned:submodule` — with `--strict`, one per file whose content was not scanned;
+- `unscanned:tagged-tree` and `unscanned:tagged-blob` — with `--history --strict`, one per ref that ends at a tree or a blob;
 - `config:local-tracked` — a committed `.leakcheckrc.local`;
 - `config:local-in-history` — with `--history` or `--history-range`, a `.leakcheckrc.local` committed at any point it scanned.
 
@@ -312,8 +316,8 @@ Here is the Quick start run, formatted for reading:
 ```
 
 - `version` is the leakcheck version that ran.
-- `source` says where a hit was found: `index`, `worktree` or `both` — or `history`, and then the hit also carries `commit`, the full commit id, after `source`.
-- With `--history`, `history_scanned` is `true` and a final `history` object follows: `{"commits": 4, "binary": 0, "skipped": 0, "config_lines_exempt": 1, "range": null}`.
+- `source` says where a hit was found: `index`, `worktree` or `both` — or `history`, and then the hit also carries `commit` after `source`: the full commit id, or for a ref or tag hit the id of the object it names.
+- With `--history`, `history_scanned` is `true` and a final `history` object follows: `{"commits": 4, "binary": 0, "skipped": 0, "config_lines_exempt": 1, "range": null, "refs": 1, "tags": 0, "tagged_unscanned": 0}`.
   `range` is the `--history-range` value, or `null` when every ref was scanned.
 - `allowed` lists what each allow rule suppressed.
 - Strings are JSON-escaped, and bytes that are not valid UTF-8 become U+FFFD.

@@ -1403,7 +1403,7 @@ t_history_json_shape() {
 import json, sys
 doc = json.load(open(sys.argv[1]))
 assert doc["history_scanned"] is True, doc
-assert doc["history"] == {"commits": 2, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": None}, doc
+assert doc["history"] == {"commits": 2, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": None, "refs": 1, "tags": 0, "tagged_unscanned": 0}, doc
 (hit,) = doc["hits"]
 assert hit["source"] == "history" and hit["commit"] == sys.argv[2], hit
 assert list(hit)[-1] == "commit" and list(doc)[-1] == "history", doc
@@ -1554,8 +1554,8 @@ t_history_range_json() {
 import json, sys
 doc = json.load(open(sys.argv[1]))
 assert doc["clean"] is True, doc
-assert doc["history"] == {"commits": 1, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": "HEAD~1..HEAD"}, doc
-assert list(doc["history"])[-1] == "range", doc
+assert doc["history"] == {"commits": 1, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": "HEAD~1..HEAD", "refs": 1, "tags": 0, "tagged_unscanned": 0}, doc
+assert list(doc["history"])[4] == "range", doc
 PY
 }
 
@@ -1673,6 +1673,100 @@ import json, sys
 doc = json.load(open(sys.argv[1]))
 assert [a["count"] for a in doc["allowed"]] == [1, 0, 0], doc["allowed"]
 PY
+}
+
+# Ref names and annotated tags (v0.8.0): published by a push, part of no commit.
+
+t_history_ref_names() {
+  seed f.txt "x"
+  commit one
+  git branch feature/MYHOST-fix
+  rc_file 'pattern MYHOST'
+  commit two
+  assert_exit 0 "$BIN"
+  assert_exit 1 "$BIN" --history
+  assert_contains "$(sha_of feature/MYHOST-fix):(ref):0: [MYHOST] refs/heads/feature/MYHOST-fix" "$LC_OUT"
+}
+
+t_history_annotated_tag() {
+  rc_file 'pattern MYHOST'
+  seed f.txt "x"
+  commit one
+  GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=ops@MYHOST.example \
+    git tag -a -m $'release\n\nbuilt on MYHOST' rel-MYHOST
+  local tag; tag=$(git rev-parse rel-MYHOST)
+  assert_exit 1 "$BIN" --history
+  assert_contains "$tag:(ref):0: [MYHOST] refs/tags/rel-MYHOST" "$LC_OUT"
+  assert_contains "$tag:(tag):0: [MYHOST] rel-MYHOST" "$LC_OUT"
+  assert_contains "$tag:(tag message):3: [MYHOST] built on MYHOST" "$LC_OUT"
+  # The ident without its timestamp, as (author) shows a commit's.
+  grep -qxF "$tag:(tagger):0: [MYHOST] t <ops@MYHOST.example>" "$LC_OUT"
+  assert_contains "1 annotated tags" "$LC_ERR"
+}
+
+t_history_nested_tag() {
+  # A tag of a tag: the inner object is published by pushing the outer one,
+  # though no ref names it.
+  seed f.txt "x"
+  commit one
+  git tag -a -m "inner, on MYHOST" inner
+  local inner; inner=$(git rev-parse inner)
+  git tag -a -m "outer" outer inner 2>/dev/null
+  git tag -d inner >/dev/null
+  rc_file 'pattern MYHOST'
+  commit two
+  assert_exit 1 "$BIN" --history
+  assert_contains "$inner:(tag message):1: [MYHOST] inner, on MYHOST" "$LC_OUT"
+  assert_contains "2 annotated tags" "$LC_ERR"
+}
+
+t_history_tagged_blob_counted_and_strict() {
+  seed f.txt "/home/alice/x"
+  commit one
+  git tag blobtag "$(git rev-parse HEAD:f.txt)"
+  seed f.txt "clean"
+  commit two
+  assert_exit 1 "$BIN" --history
+  assert_contains "1 tagged trees or blobs not scanned" "$LC_ERR"
+  assert_exit 1 "$BIN" --history --strict
+  assert_contains "(ref):0: [unscanned:tagged-blob] refs/tags/blobtag" "$LC_OUT"
+}
+
+t_history_range_refs_in_range_only() {
+  seed f.txt "x"
+  commit one
+  local base; base=$(sha_of)
+  git branch old-MYHOST
+  seed f.txt "y"
+  commit two
+  git branch new-MYHOST
+  git tag -a -m "tagged in range, on MYHOST" t-new
+  rc_file 'pattern MYHOST'
+  commit three
+  assert_exit 1 "$BIN" --history
+  assert_contains "refs/heads/old-MYHOST" "$LC_OUT"
+  assert_exit 1 "$BIN" --history-range "$base..HEAD"
+  assert_contains "refs/heads/new-MYHOST" "$LC_OUT"
+  assert_contains "(tag message):1: [MYHOST] tagged in range" "$LC_OUT"
+  assert_not_contains "old-MYHOST" "$LC_OUT"
+}
+
+t_history_tag_holding_nul_bytes() {
+  # Bash drops a NUL, which shifted the framing of every later tag object.
+  seed f.txt "x"
+  commit one
+  local c t1 t2; c=$(sha_of)
+  t1=$(printf 'object %s\ntype commit\ntag a\ntagger t <t@t> 0 +0000\n\nx\0\0MYHOST one\n' "$c" |
+    git hash-object -t tag -w --stdin --literally)
+  t2=$(printf 'object %s\ntype commit\ntag b\ntagger t <t@t> 0 +0000\n\nMYHOST two\n' "$c" |
+    git hash-object -t tag -w --stdin --literally)
+  git update-ref refs/tags/a "$t1"
+  git update-ref refs/tags/b "$t2"
+  rc_file 'pattern MYHOST'
+  commit two
+  assert_exit 1 "$BIN" --history
+  assert_contains "$t1:(tag message):1: [MYHOST]" "$LC_OUT"
+  assert_contains "$t2:(tag message):1: [MYHOST] MYHOST two" "$LC_OUT"
 }
 
 # ─── runner ───────────────────────────────────────────────────────────
@@ -1815,6 +1909,12 @@ lc_test "allow: every match allowed is allowed"       t_allow_every_match_allowe
 lc_test "allow: a partial-line rule excuses nothing"  t_allow_partial_line_rule_excuses_nothing
 lc_test "allow: whole line means every line"          t_allow_whole_line_means_every_line
 lc_test "allow: credit goes to the lowest rule"       t_allow_credit_goes_to_the_lowest_rule
+lc_test "history: ref names"                          t_history_ref_names
+lc_test "history: annotated tag"                      t_history_annotated_tag
+lc_test "history: nested tag"                         t_history_nested_tag
+lc_test "history: tagged blob counted, --strict"      t_history_tagged_blob_counted_and_strict
+lc_test "history range: refs in the range only"       t_history_range_refs_in_range_only
+lc_test "history: tag holding NUL bytes"             t_history_tag_holding_nul_bytes
 
 echo
 echo "  $PASS passed  ·  $FAIL failed"

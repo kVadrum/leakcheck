@@ -14,7 +14,8 @@
 #                                # not scanned (binary, submodule) as a match
 #   leakcheck --history          # also scan every commit reachable from any
 #                                # ref: added lines, path names, author,
-#                                # committer and message (needs full history)
+#                                # committer and message; every ref name and
+#                                # annotated tag (needs full history)
 #   leakcheck --history-range RANGE
 #                                # --history over the commits in one git
 #                                # revision range only (origin/main..HEAD)
@@ -74,7 +75,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.7.0"
+VERSION="0.8.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -645,6 +646,9 @@ done
 HIST_COMMITS=0
 HIST_BINARY=0
 HIST_SKIPPED=0
+HIST_REFS=0
+HIST_TAGS=0
+HIST_TAGGED=0
 declare -A CFG_EXEMPT=()
 HREVS=(--all)
 if [[ -n "$HIST_RANGE" ]]; then HREVS=("$HIST_RANGE"); fi
@@ -901,6 +905,118 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
       hm_add "$sha" "(message)" "$k" "$ml"
     done
   done
+
+  # Ref names and annotated tags. A push of --all, --tags or --follow-tags
+  # publishes them, and neither is part of any commit: a branch named
+  # feature/MYHOST-fix and a tag message "built on MYHOST" were both clean
+  # through v0.7.0 (measured). Every ref is scanned by name, `(ref)`; every
+  # annotated tag object a ref reaches, nested ones included, by name, tagger
+  # and message, `(tag)`, `(tagger)`, `(tag message)`. With --history-range,
+  # only the refs and tags that point into the range — those its push
+  # carries. A ref that ends at a tree or a blob, not a commit, publishes
+  # content no diff shows: counted, and reported under --strict.
+  if [[ -n "$HIST_RANGE" ]]; then
+    run_git "rev-list" "$TMPD/hrange" g rev-list "${HREVS[@]}" --
+    declare -A IN_RANGE=()
+    while IFS= read -r c; do IN_RANGE["c$c"]=1; done < "$TMPD/hrange"
+  fi
+  # Ref names hold no space or control character (git check-ref-format).
+  run_git "for-each-ref" "$TMPD/hrefs" g for-each-ref --format='%(objectname) %(objecttype) %(refname)'
+  REF_OBJ=(); REF_TYPE=(); REF_NAME=()
+  while read -r o t n; do REF_OBJ+=("$o"); REF_TYPE+=("$t"); REF_NAME+=("$n"); done < "$TMPD/hrefs"
+
+  declare -A TAG_OBJ=() TAG_OTYPE=() TAG_NAME=() TAG_TAGGER=() TAG_MSG=()
+  # parse_tags <cat-file --batch output>: each tag's headers and message.
+  # Sizes are bytes. Bash cannot hold a NUL, and `read -N` drops one and
+  # reads a byte further, which misframes every object after it (measured),
+  # so NULs reach here as \x01: same size, nothing dropped. A read that still
+  # comes up short is a scan error, never a silently shorter tag.
+  parse_tags() {
+    local LC_ALL=C hdr sha size body nl head line obj ot name tagger
+    while IFS= read -r hdr; do
+      [[ "$hdr" =~ ^([0-9a-f]+)\ tag\ ([0-9]+)$ ]] ||
+        die "scan error: unexpected tag object from git cat-file: $hdr"
+      sha=${BASH_REMATCH[1]}; size=${BASH_REMATCH[2]}
+      body=""
+      if (( size > 0 )); then IFS= read -r -N "$size" body || true; fi
+      (( ${#body} == size )) || die "scan error: tag object $sha could not be read whole"
+      IFS= read -r nl || true
+      [[ -z "$nl" ]] || die "scan error: unexpected tag object framing from git cat-file"
+      head=${body%%$'\n\n'*}
+      TAG_MSG[$sha]=""
+      if [[ "$body" == *$'\n\n'* ]]; then TAG_MSG[$sha]=${body#*$'\n\n'}; fi
+      obj=""; ot=""; name=""; tagger=""
+      while [[ -n "$head" ]]; do
+        line=${head%%$'\n'*}
+        if [[ "$head" == *$'\n'* ]]; then head=${head#*$'\n'}; else head=""; fi
+        case "$line" in
+          "object "*) obj=${line#object } ;;
+          "type "*)   ot=${line#type } ;;
+          "tag "*)    name=${line#tag } ;;
+          "tagger "*) tagger=${line#tagger } ;;
+        esac
+      done
+      [[ -n "$obj" && -n "$ot" ]] || die "scan error: tag object $sha names no object"
+      # The ident without its timestamp, as (author) shows a commit's.
+      if [[ "$tagger" =~ ^(.*)\ [0-9]+\ [-+][0-9]{4}$ ]]; then tagger=${BASH_REMATCH[1]}; fi
+      TAG_OBJ[$sha]=$obj; TAG_OTYPE[$sha]=$ot; TAG_NAME[$sha]=$name; TAG_TAGGER[$sha]=$tagger
+    done < "$1"
+  }
+  queue=()
+  declare -A QUEUED=()
+  for k in "${!REF_OBJ[@]}"; do
+    if [[ "${REF_TYPE[k]}" == tag && -z "${QUEUED[${REF_OBJ[k]}]+x}" ]]; then
+      QUEUED[${REF_OBJ[k]}]=1; queue+=("${REF_OBJ[k]}")
+    fi
+  done
+  while [[ ${#queue[@]} -gt 0 ]]; do
+    printf '%s\n' "${queue[@]}" > "$TMPD/tagq"
+    run_git "cat-file (tags)" "$TMPD/tags0" g cat-file --batch < "$TMPD/tagq"
+    LC_ALL=C tr '\000' '\001' < "$TMPD/tags0" > "$TMPD/tags"
+    parse_tags "$TMPD/tags"
+    next=()
+    for t in "${queue[@]}"; do
+      o=${TAG_OBJ[$t]}
+      if [[ "${TAG_OTYPE[$t]}" == tag && -z "${QUEUED[$o]+x}" ]]; then QUEUED[$o]=1; next+=("$o"); fi
+    done
+    queue=("${next[@]}")
+  done
+
+  HIST_REFS=0
+  HIST_TAGS=0
+  HIST_TAGGED=0
+  declare -A TAG_DONE=()
+  for k in "${!REF_OBJ[@]}"; do
+    # Peel through any chain of tags to the object the ref ends at.
+    o=${REF_OBJ[k]}; t=${REF_TYPE[k]}; chain=()
+    while [[ "$t" == tag ]]; do chain+=("$o"); t=${TAG_OTYPE[$o]}; o=${TAG_OBJ[$o]}; done
+    if [[ -n "$HIST_RANGE" ]]; then
+      [[ "$t" == commit && -n "${IN_RANGE["c$o"]+x}" ]] || continue
+    fi
+    HIST_REFS=$((HIST_REFS + 1))
+    hm_add "${REF_OBJ[k]}" "(ref)" 0 "${REF_NAME[k]}"
+    if [[ "$t" != commit ]]; then
+      HIST_TAGGED=$((HIST_TAGGED + 1))
+      if [[ "$STRICT" -eq 1 ]]; then
+        add_hit "unscanned:tagged-$t" "(ref)" 0 "${REF_NAME[k]} (points at a $t; its content is not scanned)" history "$o"
+      fi
+    fi
+    for tg in "${chain[@]}"; do
+      [[ -z "${TAG_DONE[$tg]+x}" ]] || continue
+      TAG_DONE[$tg]=1
+      HIST_TAGS=$((HIST_TAGS + 1))
+      hm_add "$tg" "(tag)" 0 "${TAG_NAME[$tg]}"
+      hm_add "$tg" "(tagger)" 0 "${TAG_TAGGER[$tg]}"
+      rest=${TAG_MSG[$tg]}
+      kk=0
+      while [[ -n "$rest" ]]; do
+        kk=$((kk + 1))
+        ml=${rest%%$'\n'*}
+        if [[ "$rest" == *$'\n'* ]]; then rest=${rest#*$'\n'}; else rest=""; fi
+        hm_add "$tg" "(tag message)" "$kk" "$ml"
+      done
+    done
+  done
   exec 5>&-
   for p in "${PATTERNS[@]}"; do
     run_git "pattern '$p' (history metadata)" "$TMPD/hhits" \
@@ -1094,7 +1210,7 @@ HIT_COUNT=${#KEEP[@]}
 if [[ "$HISTORY" -eq 1 ]]; then
   HRANGE=""
   if [[ -n "$HIST_RANGE" ]]; then HRANGE=" in range $HIST_RANGE only"; fi
-  HSCOPE="history scanned: $HIST_COMMITS commits$HRANGE, $HIST_BINARY binary files skipped, $HIST_SKIPPED skipped by config, ${#CFG_EXEMPT[@]} current-config lines exempt"
+  HSCOPE="history scanned: $HIST_COMMITS commits$HRANGE, $HIST_BINARY binary files skipped, $HIST_SKIPPED skipped by config, ${#CFG_EXEMPT[@]} current-config lines exempt, $HIST_REFS refs, $HIST_TAGS annotated tags, $HIST_TAGGED tagged trees or blobs not scanned"
 else
   HSCOPE="history not scanned"
 fi
@@ -1165,8 +1281,8 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
   if [[ "$HISTORY" -eq 1 ]]; then
     hr=null
     if [[ -n "$HIST_RANGE" ]]; then hr="\"$(json_escape "$HIST_RANGE")\""; fi
-    printf '],"history_scanned":true,"history":{"commits":%d,"binary":%d,"skipped":%d,"config_lines_exempt":%d,"range":%s}}\n' \
-      "$HIST_COMMITS" "$HIST_BINARY" "$HIST_SKIPPED" "${#CFG_EXEMPT[@]}" "$hr"
+    printf '],"history_scanned":true,"history":{"commits":%d,"binary":%d,"skipped":%d,"config_lines_exempt":%d,"range":%s,"refs":%d,"tags":%d,"tagged_unscanned":%d}}\n' \
+      "$HIST_COMMITS" "$HIST_BINARY" "$HIST_SKIPPED" "${#CFG_EXEMPT[@]}" "$hr" "$HIST_REFS" "$HIST_TAGS" "$HIST_TAGGED"
   else
     printf '],"history_scanned":false}\n'
   fi
