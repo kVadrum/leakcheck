@@ -793,7 +793,7 @@ t_help_lists_every_flag() {
   # The script header is --help: a flag missing there is undiscoverable.
   assert_exit 0 "$BIN" --help
   local f
-  for f in --strict --json --list-patterns --config --root --version --help; do
+  for f in --strict --history --json --list-patterns --config --root --version --help; do
     assert_contains "$f" "$LC_OUT"
   done
 }
@@ -1101,6 +1101,339 @@ t_old_bash_is_refused() {
   assert_not_contains "/home/alice/" "$LC_OUT"
 }
 
+# ─── v0.5.0: --history ────────────────────────────────────────────────
+# Each load-bearing flag in the history pass has a test here that fails
+# when the flag is removed (checked by mutating a copy; SPEC.md § v0.5.0).
+
+sha_of() { git rev-parse "${1:-HEAD}"; }
+
+t_history_finds_scrubbed_leak() {
+  seed f.txt $'a\nb\nc'
+  commit one
+  seed f.txt $'a\nSee /home/alice/code\nc'
+  commit two
+  local added; added=$(sha_of)
+  seed f.txt $'a\nb\nc'
+  commit three
+  assert_exit 0 "$BIN"
+  assert_contains "history not scanned" "$LC_OUT"
+  assert_exit 1 "$BIN" --history
+  assert_contains "$added:f.txt:2: [/home/" "$LC_OUT"
+  assert_contains "history scanned: 3 commits" "$LC_ERR"
+}
+
+t_history_line_numbers_follow_hunks() {
+  seed f.txt $'1\n2\n3\n4\n5\n6\n7\n8\n9'
+  commit one
+  # The leak is the SECOND line of a two-line hunk (+7,2), so the per-line
+  # counter is what places it, not the hunk header.
+  seed f.txt $'1\nTWO\n3\n4\n5\n6\nSEVEN\n/home/alice/x\n9\n10'
+  commit two
+  assert_exit 1 "$BIN" --history
+  assert_contains "$(sha_of):f.txt:8: [" "$LC_OUT"
+}
+
+t_history_reports_once_at_earliest_commit() {
+  # -U0 never re-adds an unchanged line, but -m does: the merge, diffed
+  # against the side parent, adds the leak line again. One hit, the first.
+  seed g.txt "base"
+  commit root
+  git branch side
+  seed f.txt $'/home/alice/x\none'
+  commit one
+  local first; first=$(sha_of)
+  seed f.txt $'/home/alice/x\ntwo'
+  commit two
+  git checkout -q side
+  seed h.txt "side"
+  commit side
+  git checkout -q dev
+  git -c core.hooksPath=/dev/null merge -q --no-edit side >/dev/null
+  assert_exit 1 "$BIN" --history --json
+  python3 - "$LC_OUT" "$first" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+hist = [h for h in doc["hits"] if h["source"] == "history"]
+assert len(hist) == 1 and hist[0]["commit"] == sys.argv[2], hist
+PY
+}
+
+t_history_side_branch_behind_ours_merge() {
+  # A pathspec makes git log simplify history: an `-s ours` merge then hides
+  # its whole side branch. The content pass's -m happens to stop that too
+  # (measured); the .leakcheckrc.local pass has no -m, so it is the one that
+  # needs --full-history — and the one this test would catch.
+  seed README.md "hello"
+  commit root
+  git checkout -q -b side
+  seed side.txt "/home/alice/side"
+  printf 'pattern ^SECRET-[0-9]+$\n' > .leakcheckrc.local
+  git add .leakcheckrc.local
+  commit side
+  local side; side=$(sha_of)
+  git checkout -q dev
+  git -c core.hooksPath=/dev/null merge -q -s ours --no-edit side
+  git branch -q -D side
+  assert_exit 1 "$BIN" --history
+  assert_contains "$side:side.txt:1: [" "$LC_OUT"
+  assert_contains "$side:.leakcheckrc.local:0: [config:local-in-history]" "$LC_OUT"
+}
+
+t_history_evil_merge_line() {
+  # A line only the merge commit introduces is in neither parent's diff.
+  seed a.txt "a"
+  commit root
+  git checkout -q -b side
+  seed b.txt "b"
+  commit side
+  git checkout -q dev
+  seed c.txt "c"
+  commit main-side
+  git -c core.hooksPath=/dev/null merge -q --no-commit side >/dev/null 2>&1
+  seed evil.txt "/home/alice/evil"
+  git -c core.hooksPath=/dev/null commit -q -m merge
+  assert_exit 1 "$BIN" --history
+  assert_contains "$(sha_of):evil.txt:1: [" "$LC_OUT"
+}
+
+t_history_root_commit_despite_showroot_false() {
+  git config log.showRoot false
+  seed f.txt "/home/alice/root"
+  commit root
+  local root; root=$(sha_of)
+  seed f.txt "clean"
+  commit clean
+  assert_exit 1 "$BIN" --history
+  assert_contains "$root:f.txt:1: [" "$LC_OUT"
+}
+
+t_history_added_line_shaped_like_a_header() {
+  # An added "++ x" arrives in the diff as "+++ x", the shape of a header.
+  seed f.txt "start"
+  commit one
+  seed f.txt $'start\n++ /home/alice/x'
+  commit two
+  seed f.txt "start"
+  commit three
+  assert_exit 1 "$BIN" --history
+  assert_contains "f.txt:2: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] ++ /home/alice/x" "$LC_OUT"
+}
+
+t_history_names() {
+  seed notes-from-MYHOST.md "hello"
+  printf 'pattern MYHOST\n' > .leakcheckrc
+  git add .leakcheckrc
+  commit one
+  local named; named=$(sha_of)
+  git mv notes-from-MYHOST.md notes.md
+  commit renamed
+  assert_exit 0 "$BIN"
+  assert_exit 1 "$BIN" --history
+  assert_contains "$named:notes-from-MYHOST.md:0: [MYHOST] notes-from-MYHOST.md" "$LC_OUT"
+}
+
+t_history_quoted_path_is_exact() {
+  local f=$'odd"name\tx.md'
+  printf '/home/alice/x\n' > "$f"
+  git add -- "$f"
+  commit one
+  git rm -q -- "$f"
+  commit two
+  assert_exit 1 "$BIN" --history --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+files = {h["file"] for h in doc["hits"] if h["source"] == "history"}
+assert files == {'odd"name\tx.md'}, files
+PY
+}
+
+t_history_metadata_once_per_text() {
+  seed f.txt "one"
+  git -c core.hooksPath=/dev/null -c user.email=alice@MYHOST.lan commit -q -m one
+  local first; first=$(sha_of)
+  seed f.txt "two"
+  git -c core.hooksPath=/dev/null -c user.email=alice@MYHOST.lan commit -q -m $'two\n\nbuilt on MYHOST'
+  local second; second=$(sha_of)
+  rc_file 'no-defaults' 'pattern MYHOST'
+  commit rc
+  assert_exit 1 "$BIN" --history
+  assert_contains "$first:(author):0: [MYHOST] t <alice@MYHOST.lan>" "$LC_OUT"
+  assert_contains "$second:(message):3: [MYHOST] built on MYHOST" "$LC_OUT"
+  [[ $(grep -c '(author)' "$LC_OUT") -eq 1 ]]
+}
+
+t_history_config_content_not_reported() {
+  # Lines still in today's tracked config are exempt in history, and counted.
+  rc_file 'pattern MYHOST'
+  commit one
+  rc_file 'pattern MYHOST' 'pattern OTHERHOST'
+  commit two
+  assert_exit 0 "$BIN" --history
+  assert_contains "2 current-config lines exempt" "$LC_OUT"
+}
+
+t_history_old_config_line_is_reported() {
+  # A hostname that sat in .leakcheckrc before it moved to .leakcheckrc.local
+  # is still in every commit that held it. The first draft excluded the
+  # config's history wholesale and missed it.
+  rc_file 'pattern MYHOST'
+  commit one
+  local old; old=$(sha_of)
+  rc_file 'pattern OTHERHOST'
+  printf 'pattern MYHOST\n' > .leakcheckrc.local
+  commit two
+  assert_exit 1 "$BIN" --history
+  assert_contains "$old:.leakcheckrc:1: [MYHOST] pattern MYHOST" "$LC_OUT"
+  assert_contains "1 current-config lines exempt" "$LC_ERR"
+}
+
+t_history_removed_config_lines_reported() {
+  # Guard for a ruling (passes on the first draft too): a removed config's
+  # old lines are published content, so a real-looking path in one is
+  # reported, not exempted (/cxr proposed exempting it; that is a false
+  # negative for the migration case above).
+  rc_file 'allow /home/alice/'
+  commit one
+  git rm -q .leakcheckrc
+  commit two
+  assert_exit 1 "$BIN" --history
+  assert_contains ".leakcheckrc:1: [/home/" "$LC_OUT"
+}
+
+t_history_config_name_scanned() {
+  rc_file 'pattern leakcheck'
+  commit one
+  assert_exit 1 "$BIN" --history
+  assert_contains "$(sha_of):.leakcheckrc:0: [leakcheck] .leakcheckrc" "$LC_OUT"
+}
+
+t_history_graft_does_not_hide() {
+  # A local graft making HEAD a root hid its real parent, exit 0, once the
+  # deprecation hint was turned off (found by /cxr, reproduced).
+  seed f.txt "/home/alice/x"
+  commit leak
+  local leak; leak=$(sha_of)
+  seed f.txt "clean"
+  commit clean
+  git rev-parse HEAD > .git/info/grafts
+  git config advice.graftFileDeprecated false
+  assert_exit 1 "$BIN" --history
+  assert_contains "$leak:f.txt:1: [" "$LC_OUT"
+  assert_contains "history scanned: 2 commits" "$LC_ERR"
+}
+
+t_history_replace_ref_does_not_hide() {
+  # A replace ref swapping HEAD for a parentless copy hides the real parent
+  # from anything that honours replacements; the count must agree too.
+  seed f.txt "/home/alice/x"
+  commit leak
+  local leak; leak=$(sha_of)
+  seed f.txt "clean"
+  commit clean
+  local fake; fake=$(git commit-tree "$(git rev-parse 'HEAD^{tree}')" -m fake)
+  git replace HEAD "$fake"
+  assert_exit 1 "$BIN" --history
+  assert_contains "$leak:f.txt:1: [" "$LC_OUT"
+  assert_contains "history scanned: 3 commits" "$LC_ERR"
+}
+
+t_history_local_config_ever_committed() {
+  seed README.md "hello"
+  printf 'pattern ^SECRET-[0-9]+$\n' > .leakcheckrc.local
+  git add .leakcheckrc.local
+  commit oops
+  local oops; oops=$(sha_of)
+  git rm -q --cached .leakcheckrc.local
+  commit fixed
+  assert_exit 1 "$BIN" --history
+  assert_contains "$oops:.leakcheckrc.local:0: [config:local-in-history]" "$LC_OUT"
+}
+
+t_history_shallow_clone_refused() {
+  seed f.txt "one"
+  commit one
+  seed f.txt "two"
+  commit two
+  git clone -q --depth 1 "file://$PWD" shallow
+  ( cd shallow && assert_exit 2 "$BIN" --history )
+  assert_contains "shallow clone" "$LC_ERR"
+}
+
+t_history_binary_counted_and_strict() {
+  printf '/home/alice/x\0bin' > blob.bin
+  git add blob.bin
+  commit one
+  local bin; bin=$(sha_of)
+  git rm -q blob.bin
+  commit two
+  assert_exit 0 "$BIN" --history
+  assert_contains "1 binary files skipped" "$LC_OUT"
+  assert_exit 1 "$BIN" --history --strict
+  assert_contains "$bin:blob.bin:0: [unscanned:binary]" "$LC_OUT"
+}
+
+t_history_skip_applies() {
+  seed tests/fixtures/leak.md "/home/alice/x"
+  rc_file 'skip tests/fixtures/*'
+  commit one
+  git rm -q tests/fixtures/leak.md
+  commit two
+  assert_exit 0 "$BIN" --history
+  assert_contains "history scanned: 2 commits, 0 binary files skipped, 1 skipped by config" "$LC_OUT"
+}
+
+t_history_allow_applies() {
+  seed f.txt "/home/alice/x"
+  rc_file 'allow ^f\.txt:1:/home/alice/x$'
+  commit one
+  seed f.txt "clean"
+  commit two
+  assert_exit 0 "$BIN" --history
+  assert_contains "1 allowed" "$LC_OUT"
+}
+
+t_history_json_shape() {
+  seed f.txt "/home/alice/x"
+  commit one
+  seed f.txt "clean"
+  commit two
+  assert_exit 1 "$BIN" --history --json
+  python3 - "$LC_OUT" "$(sha_of HEAD~1)" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["history_scanned"] is True, doc
+assert doc["history"] == {"commits": 2, "binary": 0, "skipped": 0, "config_lines_exempt": 0}, doc
+(hit,) = doc["hits"]
+assert hit["source"] == "history" and hit["commit"] == sys.argv[2], hit
+assert list(hit)[-1] == "commit" and list(doc)[-1] == "history", doc
+PY
+}
+
+t_history_default_json_unchanged() {
+  # Guard (passes on v0.4.1 by design): without --history no hit carries a
+  # commit and the envelope still ends at history_scanned:false.
+  seed f.txt "/home/alice/x"
+  commit one
+  assert_exit 1 "$BIN" --json
+  assert_not_contains '"commit"' "$LC_OUT"
+  assert_contains '"history_scanned":false}' "$LC_OUT"
+}
+
+t_history_empty_repo() {
+  assert_exit 0 "$BIN" --history
+  assert_contains "history scanned: 0 commits" "$LC_OUT"
+}
+
+t_history_leak_still_present_is_reported_twice() {
+  seed f.txt "/home/alice/x"
+  commit one
+  assert_exit 1 "$BIN" --history
+  assert_contains "f.txt:1: [" "$LC_OUT"
+  [[ $(grep -c 'f.txt:1: \[' "$LC_OUT") -eq 2 ]]
+  grep -qE '^[0-9a-f]{40}:f\.txt:1: \[' "$LC_OUT"
+}
+
 # ─── runner ───────────────────────────────────────────────────────────
 
 echo "leakcheck self-tests"
@@ -1200,6 +1533,31 @@ lc_test "escape in an allow rule is refused"          t_allow_escape_is_refused
 lc_test "meaningful escapes still accepted"           t_meaningful_escapes_still_accepted
 lc_test "unbound-variable abort exits 2, not 1"       t_unbound_variable_abort_exits_2
 lc_test "bash older than 4.4 is refused"              t_old_bash_is_refused
+lc_test "history: finds a scrubbed leak"              t_history_finds_scrubbed_leak
+lc_test "history: line numbers follow hunks"          t_history_line_numbers_follow_hunks
+lc_test "history: once, at the earliest commit"       t_history_reports_once_at_earliest_commit
+lc_test "history: side branch behind -s ours merge"   t_history_side_branch_behind_ours_merge
+lc_test "history: a line only the merge adds"         t_history_evil_merge_line
+lc_test "history: root commit despite showRoot=false" t_history_root_commit_despite_showroot_false
+lc_test "history: added line shaped like a header"    t_history_added_line_shaped_like_a_header
+lc_test "history: names, including renamed-away"      t_history_names
+lc_test "history: quoted path name is exact"          t_history_quoted_path_is_exact
+lc_test "history: metadata, once per text"            t_history_metadata_once_per_text
+lc_test "history: config content not reported"        t_history_config_content_not_reported
+lc_test "history: old config line reported"           t_history_old_config_line_is_reported
+lc_test "history: removed config lines reported"      t_history_removed_config_lines_reported
+lc_test "history: config path name scanned"           t_history_config_name_scanned
+lc_test "history: a graft does not hide parents"      t_history_graft_does_not_hide
+lc_test "history: a replace ref does not hide"        t_history_replace_ref_does_not_hide
+lc_test "history: .leakcheckrc.local ever committed"  t_history_local_config_ever_committed
+lc_test "history: shallow clone refused"              t_history_shallow_clone_refused
+lc_test "history: binary counted, --strict reports"   t_history_binary_counted_and_strict
+lc_test "history: skip applies"                       t_history_skip_applies
+lc_test "history: allow applies"                      t_history_allow_applies
+lc_test "history: JSON shape"                         t_history_json_shape
+lc_test "history: default JSON unchanged"             t_history_default_json_unchanged
+lc_test "history: empty repo"                         t_history_empty_repo
+lc_test "history: leak still present, reported twice" t_history_leak_still_present_is_reported_twice
 
 echo
 echo "  $PASS passed  ·  $FAIL failed"

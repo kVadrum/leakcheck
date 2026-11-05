@@ -6,7 +6,7 @@ Credential scanners such as gitleaks, trufflehog and git-secrets look for secret
 leakcheck looks for what they ignore: home paths that carry your username, the names of your machines, and the codenames only your team uses — references that pile up in a private repo and get noticed only after it goes public.
 It is one bash script, and git is its only real dependency.
 
-*README v0.4.1*
+*README v0.5.0*
 
 ## Install
 
@@ -45,6 +45,9 @@ leakcheck: clean — 0 matches across 4 tracked files (index + worktree; 1 binar
 ```
 
 **Treat any non-zero exit as "do not publish".**
+
+A clean tree is not a clean history: a leak you deleted last month is still in every commit that held it.
+Before a private repo goes public, also run `leakcheck --history` ([Scanning history](#scanning-history)).
 
 ## What it catches
 
@@ -111,10 +114,44 @@ What it does not scan, and says so on every run:
 - **Binary files** are skipped and counted, and `--strict` reports each one.
   Detection is by content alone, so a `.gitattributes` line such as `*.svg binary` does not hide a text file.
 - **Submodule contents** belong to another repository: counted, and reported under `--strict`.
-- **Git history and commit metadata.**
-  A leak scrubbed today is still public in every old commit that holds it, so every verdict says `history not scanned`.
+- **Git history and commit metadata**, unless you pass `--history`.
+  A leak scrubbed today is still public in every old commit that holds it, so without the flag every verdict says `history not scanned`.
 - **Encoded or compressed content** (base64, gzip, archives) is never decoded.
 - **Untracked and gitignored files**, which a push does not publish.
+
+## Scanning history
+
+`leakcheck --history` also scans every commit reachable from any ref — branches, tags, remote-tracking branches, stashes and notes — with the same patterns:
+
+- **every added line** of every commit, at its line number in that commit's version of the file, merge commits included;
+- **every path** that ever existed, so a file renamed away from `notes-from-MYHOST.md` is still found;
+- **author, committer and message** of every commit.
+
+```text
+$ leakcheck --history
+4ff38873059fcdf429cd403f41ec4ce5173a9f91:f.txt:2: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] See /home/alice/code
+28a6c84b00ef284368a6ef9d3f7305eb3a3a5d8f:(message):1: [MYHOST] scrubbed, was on MYHOST
+leakcheck: 2 match(es)
+leakcheck: scanned 1 tracked files (index + worktree; 0 binary skipped, 0 submodules not scanned, 1 skipped by config, 0 allowed; history scanned: 4 commits, 0 binary files skipped, 0 skipped by config, 1 current-config lines exempt)
+```
+
+A history hit leads with the full commit id, then `path:line:`; commit metadata uses `(author)`, `(committer)` or `(message)` in place of the path, with the message's line number.
+
+- **Each finding is reported once, at the earliest commit that has it.**
+  A line that stayed put through fifty edits is one hit, and so is one email address in five hundred commits.
+- **A leak that is still in the tree is reported twice** — once as it is now, once at the commit that introduced it — because each needs its own fix: an edit for the tree, a history rewrite (for example with `git filter-repo`) for the past.
+- **`skip` and `allow` apply to history too.**
+  An allow rule sees a history hit as `path:line:text`, without the commit, so the rules you already have keep working.
+  Your own commit email will match a pattern for your own domain; allow it with a line such as `allow ^\(author\):0:Alice <alice@example\.com>$`.
+- **Old versions of your config are scanned.**
+  A line still in your current, committed `.leakcheckrc` is exempt, as it is in the tree, and counted as `current-config lines exempt`.
+  A line you have since removed is not: a hostname that sat in `.leakcheckrc` before you moved it to `.leakcheckrc.local` is still in every commit that held it, and is reported.
+- **Grafts and replace refs are ignored**, so the scan sees the history a push publishes, not a locally rewritten one.
+- **A `.leakcheckrc.local` committed at any point is a finding** (`config:local-in-history`), even if it was removed later.
+- **Binary files in history are skipped and counted**; `--strict` reports each.
+- **A shallow clone is refused** with exit `2`: its history is incomplete, and a clean verdict over part of it would be a lie.
+  In GitHub Actions, check out with `fetch-depth: 0`.
+- **Commits no ref reaches** — reflog-only and dangling objects — are not scanned, because a push does not publish them.
 
 ## Configuration
 
@@ -170,6 +207,7 @@ Mistakes in the config stop the run with exit `2` rather than narrowing the scan
 ```text
 leakcheck                     scan with the defaults plus .leakcheckrc / .leakcheckrc.local
 leakcheck --strict            also report every file whose content was not scanned
+leakcheck --history           also scan every commit reachable from any ref
 leakcheck --json              machine-readable output
 leakcheck --list-patterns     print the effective pattern set
 leakcheck -c, --config FILE   use FILE instead of .leakcheckrc / .leakcheckrc.local
@@ -201,7 +239,8 @@ The summary's count is matches, not lines: two patterns matching one line are tw
 Some hits are not regex matches, and they use these names in the pattern slot:
 
 - `unscanned:binary` and `unscanned:submodule` — with `--strict`, one per file whose content was not scanned;
-- `config:local-tracked` — a committed `.leakcheckrc.local`.
+- `config:local-tracked` — a committed `.leakcheckrc.local`;
+- `config:local-in-history` — with `--history`, a `.leakcheckrc.local` committed at any point.
 
 A path or symlink target holding a newline is printed C-quoted (`"two\nlines.md":1: …`), so every hit stays on one line.
 
@@ -230,7 +269,8 @@ Here is the Quick start run, formatted for reading:
 ```
 
 - `version` is the leakcheck version that ran.
-- `source` says where a hit was found: `index`, `worktree` or `both`.
+- `source` says where a hit was found: `index`, `worktree` or `both` — or `history`, and then the hit also carries `commit`, the full commit id, after `source`.
+- With `--history`, `history_scanned` is `true` and a final `history` object follows: `{"commits": 4, "binary": 0, "skipped": 0, "config_lines_exempt": 1}`.
 - `allowed` lists what each allow rule suppressed.
 - Strings are JSON-escaped, and bytes that are not valid UTF-8 become U+FFFD.
 - The schema is a contract, and new fields are only ever appended.
@@ -262,13 +302,23 @@ To also see each hit as an annotation on the pull request, keep leakcheck's exit
 
 The step still fails on any match (`1`) and on any error (`2`, which prints no JSON).
 
+To scan history in CI, check out the full history — the default checkout is shallow, and leakcheck refuses it:
+
+```yaml
+- uses: actions/checkout@v5
+  with:
+    fetch-depth: 0
+- name: leakcheck (history)
+  run: ./vendor/leakcheck --history
+```
+
 ## Tests
 
 ```sh
 ./test/run-tests.sh
 ```
 
-The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist and its counts, `--strict`, the JSON shape and its escaping, and file names holding spaces, colons and newlines.
+The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist and its counts, `--strict`, the JSON shape and its escaping, file names holding spaces, colons and newlines, and `--history` — merges, a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, and once-per-finding reporting.
 Each test runs in its own throwaway repo with your git hooks disabled.
 It needs bash 4.4+, git and python3 (for JSON round-trip checks; leakcheck itself never uses python3).
 `LEAKCHECK_BIN=/path/to/leakcheck ./test/run-tests.sh` runs the suite against another build.

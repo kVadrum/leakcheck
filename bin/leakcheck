@@ -12,6 +12,9 @@
 #   leakcheck                    # scan with defaults + .leakcheckrc(.local)
 #   leakcheck --strict           # also report every file whose content was
 #                                # not scanned (binary, submodule) as a match
+#   leakcheck --history          # also scan every commit reachable from any
+#                                # ref: added lines, path names, author,
+#                                # committer and message (needs full history)
 #   leakcheck --json             # machine-readable output
 #   leakcheck --list-patterns    # print the effective pattern set
 #   leakcheck -c, --config FILE  # config path, relative to the cwd (after --root)
@@ -28,8 +31,9 @@
 # Blank lines and lines starting with '#' are ignored. Name and symlink hits
 # report line 0.
 #
-# Never scanned: git history, commit metadata, submodule contents, encoded
-# or compressed content. Binary files are skipped and counted.
+# Git history and commit metadata are scanned only with --history. Never
+# scanned: submodule contents, encoded or compressed content. Binary files
+# are skipped and counted.
 #
 # Exit codes (treat ANY non-zero as "do not publish"):
 #   0  clean
@@ -65,10 +69,11 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.4.1"
+VERSION="0.5.0"
 
 OUTPUT_MODE="text"
 STRICT=0
+HISTORY=0
 LIST_ONLY=0
 CONFIG_FILE=""
 ROOT=""
@@ -84,6 +89,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --json)            OUTPUT_MODE="json"; shift ;;
     --strict)          STRICT=1; shift ;;
+    --history)         HISTORY=1; shift ;;
     --list-patterns)   LIST_ONLY=1; shift ;;
     -c|--config|-C|--root)
       if [[ $# -lt 2 || -z "$2" ]]; then
@@ -323,6 +329,14 @@ case "$CONFIG_ABS" in
 esac
 
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/leakcheck.XXXXXX")" || die "cannot create a temp dir"
+# Scan the objects a push publishes, in every git call from here on: replace
+# refs and a local info/grafts file both rewrite what git shows, and a graft
+# that makes HEAD a root hid a leak from --history, exit 0 (found by /cxr,
+# reproduced). A graft file that does not exist turns grafts off with no
+# output; GIT_GRAFT_FILE=/dev/null also does, but prints the deprecation hint
+# in every repo, which run_git rightly reads as a scan error (both measured).
+export GIT_NO_REPLACE_OBJECTS=1
+export GIT_GRAFT_FILE="$TMPD/no-grafts"
 mkdir "$TMPD/subj"
 
 # Binary detection must depend on content alone. git grep -I otherwise
@@ -449,10 +463,14 @@ H_FILE=()
 H_LINE=()
 H_TEXT=()
 H_SRC=()
+H_COMMIT=()
 declare -A HIT_AT=()
-add_hit() { # pattern file line text source
+add_hit() { # pattern file line text source [commit]
   # Length-prefixed fields make the key injective whatever the fields hold.
-  local key="h${#1}:$1${#2}:$2${#3}:$3:$4" i
+  # The commit is part of the key, so a history hit never merges into the
+  # same line found in the tree today: they need different remedies.
+  local c="${6-}"
+  local key="h${#1}:$1${#2}:$2${#3}:$3${#c}:$c:$4" i
   if [[ -n "${HIT_AT[$key]+x}" ]]; then
     i=${HIT_AT[$key]}
     if [[ "${H_SRC[$i]}" != "$5" ]]; then H_SRC[$i]="both"; fi
@@ -460,6 +478,7 @@ add_hit() { # pattern file line text source
   fi
   HIT_AT[$key]=${#H_FILE[@]}
   H_PAT+=("$1"); H_FILE+=("$2"); H_LINE+=("$3"); H_TEXT+=("$4"); H_SRC+=("$5")
+  H_COMMIT+=("$c")
 }
 
 # Content: git grep, one run per pattern so each hit knows its pattern.
@@ -579,6 +598,292 @@ for p in "${PATTERNS[@]}"; do
   done < "$TMPD/shits"
 done
 
+# ─── history (--history) ──────────────────────────────────────────────
+# Every commit reachable from any ref (--all: branches, tags, remote-tracking
+# refs, stash, notes), scanned for: every ADDED line of every diff, at its
+# line number in that commit's version of the file; every path that ever
+# appeared in a diff; and author, committer and message. Each finding is
+# reported once, at its earliest commit — a line that sat unchanged through
+# fifty edits is one hit, and a leak still in the tree today is reported
+# twice, once here and once as it is now, because each needs its own fix.
+# Load-bearing flags:
+#   --full-history  a pathspec otherwise simplifies history, and an `-s ours`
+#                   merge then hides its whole side branch (measured). -m
+#                   happens to stop that in the content pass; the
+#                   .leakcheckrc.local pass has no -m and depends on this
+#   -m              lines a merge itself introduces appear in neither
+#                   parent's diff; -m diffs each merge against each parent
+#   --no-renames    a rename is a delete plus an add, so every `diff --git`
+#                   header names one path twice — the parser relies on that
+#   log.showRoot    `false` in a user's config hides the root commit's diff
+#   replace refs, grafts   ignored for every git call (exported above), so
+#                   the objects scanned are the objects a push publishes
+HIST_COMMITS=0
+HIST_BINARY=0
+HIST_SKIPPED=0
+declare -A CFG_EXEMPT=()
+if [[ "$HISTORY" -eq 1 ]]; then
+  run_git "rev-parse" "$TMPD/shallow" g rev-parse --is-shallow-repository
+  if [[ "$(<"$TMPD/shallow")" != "false" ]]; then
+    die "shallow clone: its history is incomplete, so --history cannot vouch for it (git fetch --unshallow; in GitHub Actions, fetch-depth: 0)"
+  fi
+  run_git "rev-list" "$TMPD/hcount" g rev-list --all --count
+  HIST_COMMITS=$(<"$TMPD/hcount")
+  [[ "$HIST_COMMITS" =~ ^[0-9]+$ ]] || die "scan error: unexpected commit count: $HIST_COMMITS"
+fi
+
+if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
+  HLOG=(-c log.showRoot=true -c core.quotePath=false
+        log --all --full-history --date-order --reverse --no-show-signature)
+
+  # Old versions of the config ARE scanned: a hostname that sat in
+  # .leakcheckrc before .leakcheckrc.local existed is still in every commit
+  # that held it, and excluding the config's history (the first draft) hid
+  # exactly that. Only a line identical to one in today's TRACKED config —
+  # published on purpose, and exempt in the tree for the same reason — is
+  # not reported, and each such line is counted.
+  declare -A CUR_CFG=()
+  if [[ -n "$CONFIG_REL" && -n "${SEEN_PATH["p$CONFIG_REL"]+x}" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do CUR_CFG["l$line"]=1; done < "$CONFIG_ABS"
+  fi
+
+  # git C-quotes a path holding ", \ or a control character even with
+  # core.quotePath=false: \" \\ \a \b \t \n \v \f \r and \NNN octal. Never
+  # eval it: a filename is attacker-controlled input.
+  c_unquote() { # quoted-body -> REPLY
+    local s=$1 out="" c o
+    while [[ -n "$s" ]]; do
+      c=${s:0:1}
+      if [[ "$c" != '\' ]]; then out+=$c; s=${s:1}; continue; fi
+      c=${s:1:1}
+      case "$c" in
+        '"'|'\') out+=$c ;;
+        a) out+=$'\a' ;;
+        b) out+=$'\b' ;;
+        t) out+=$'\t' ;;
+        n) out+=$'\n' ;;
+        v) out+=$'\v' ;;
+        f) out+=$'\f' ;;
+        r) out+=$'\r' ;;
+        [0-7])
+          o=${s:1:3}
+          [[ "$o" =~ ^[0-7]{3}$ ]] || die "scan error: cannot unquote history path: $1"
+          printf -v c "\\$o"
+          out+=$c
+          s=${s:4}
+          continue ;;
+        *) die "scan error: cannot unquote history path: $1" ;;
+      esac
+      s=${s:2}
+    done
+    REPLY=$out
+  }
+
+  # With --no-renames both halves of "a/P b/P" name the same P, so the
+  # header splits at its exact middle — the only split that survives a path
+  # holding " b/". Anything else is a header this parser does not know.
+  hist_path() { # header-remainder -> REPLY
+    local rest=$1 n h a b
+    n=${#rest}
+    (( n % 2 == 1 )) || die "scan error: unexpected diff header: diff --git $rest"
+    h=$(( (n - 1) / 2 ))
+    a=${rest:0:h}
+    b=${rest:h+1}
+    [[ "${rest:h:1}" == " " ]] || die "scan error: unexpected diff header: diff --git $rest"
+    if [[ "$a" == '"a/'*'"' && "$b" == '"b/'*'"' ]]; then
+      a=${a:3:${#a}-4}
+      b=${b:3:${#b}-4}
+      [[ "$a" == "$b" ]] || die "scan error: unexpected diff header: diff --git $rest"
+      c_unquote "$b"
+    elif [[ "$a" == a/* && "$b" == b/* && "${a:2}" == "${b:2}" ]]; then
+      REPLY=${b:2}
+    else
+      die "scan error: unexpected diff header: diff --git $rest"
+    fi
+  }
+
+  # Content: every added line, written to one subject file for git grep,
+  # with "<file-change> <line>" in the same row of a parallel meta file.
+  # Inside a hunk every line is prefixed (+, -, space, \), so a header-shaped
+  # line there is content: an added "++ x" arrives as "+++ x".
+  FC_SHA=()
+  FC_PATH=()
+  HB_FC=()
+  hist_parse() {
+    local LC_ALL=C line sha="" fc=-1 ln=0 in_hunk=0 h
+    exec 3>"$TMPD/subj/h" 4>"$TMPD/hmeta"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if (( in_hunk )); then
+        case "$line" in
+          '+'*)
+            printf '%s\n' "${line:1}" >&3
+            printf '%s %s\n' "$fc" "$ln" >&4
+            ln=$((ln + 1))
+            continue ;;
+          ' '*) ln=$((ln + 1)); continue ;;
+          '-'*|'\'*) continue ;;
+          '@@ '*) ;;
+          *) in_hunk=0 ;;
+        esac
+      fi
+      case "$line" in
+        $'\x01'*) sha=${line:1}; in_hunk=0 ;;
+        'diff --git '*)
+          hist_path "${line#diff --git }"
+          fc=$((fc + 1))
+          FC_SHA[fc]=$sha
+          FC_PATH[fc]=$REPLY
+          in_hunk=0 ;;
+        'Binary files '*' differ') HB_FC+=("$fc") ;;
+        '@@ '*)
+          h=${line#@@ -* +}
+          h=${h%% @@*}
+          ln=${h%%,*}
+          [[ "$ln" =~ ^[0-9]+$ ]] || die "scan error: unexpected hunk header: $line"
+          in_hunk=1 ;;
+      esac
+    done < "$TMPD/hlog"
+    exec 3>&- 4>&-
+  }
+
+  run_git "log (history)" "$TMPD/hlog" g "${HLOG[@]}" -m --no-renames -p -U0 \
+    --inter-hunk-context=0 --no-color --no-ext-diff --no-textconv \
+    --src-prefix=a/ --dst-prefix=b/ --format=%x01%H -- . "${skip_excludes[@]}"
+  hist_parse
+  mapfile -t HMETA < "$TMPD/hmeta"
+
+  declare -A HIST_SEEN=()
+  hist_hit() { # kind pattern file line text commit — once per (kind, pattern, file, text)
+    local key="$1${#2}:$2${#3}:$3:$5"
+    [[ -z "${HIST_SEEN[$key]+x}" ]] || return 0
+    HIST_SEEN[$key]=1
+    add_hit "$2" "$3" "$4" "$5" history "$6"
+  }
+
+  for p in "${PATTERNS[@]}"; do
+    run_git "pattern '$p' (history)" "$TMPD/hhits" \
+      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "$p" -- h
+    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
+      m="${HMETA[l - 1]-}"
+      [[ -n "$m" ]] || die "internal error: history pass returned line $l"
+      fc=${m%% *}
+      if [[ -n "$CONFIG_REL" && "${FC_PATH[fc]}" == "$CONFIG_REL" && -n "${CUR_CFG["l$t"]+x}" ]]; then
+        CFG_EXEMPT["l$t"]=1
+        continue
+      fi
+      hist_hit c "$p" "${FC_PATH[fc]}" "${m#* }" "$t" "${FC_SHA[fc]}"
+    done < "$TMPD/hhits"
+  done
+
+  # Names: every path that ever appeared in a diff header, at its first commit.
+  HN_FC=()
+  HN_OF_LINE=()
+  declare -A HN_SEEN=()
+  n=0
+  exec 5>"$TMPD/subj/hn"
+  for fc in "${!FC_PATH[@]}"; do
+    path=${FC_PATH[fc]}
+    [[ -z "${HN_SEEN["p$path"]+x}" ]] || continue
+    HN_SEEN["p$path"]=1
+    e=${#HN_FC[@]}
+    HN_FC+=("$fc")
+    printf '%s\n' "$path" >&5
+    nl="${path//[!$'\n']/}"
+    for (( k = 0; k <= ${#nl}; k++ )); do
+      n=$((n + 1))
+      HN_OF_LINE[n]=$e
+    done
+  done
+  exec 5>&-
+  for p in "${PATTERNS[@]}"; do
+    run_git "pattern '$p' (history names)" "$TMPD/hhits" \
+      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "$p" -- hn
+    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
+      e="${HN_OF_LINE[l]-}"
+      [[ -n "$e" ]] || die "internal error: history names pass returned line $l"
+      fc=${HN_FC[e]}
+      hist_hit n "$p" "${FC_PATH[fc]}" 0 "${FC_PATH[fc]}" "${FC_SHA[fc]}"
+    done < "$TMPD/hhits"
+  done
+
+  # Binary files in history: skipped and counted, once per path.
+  declare -A HB_SEEN=()
+  for fc in "${HB_FC[@]}"; do
+    path=${FC_PATH[fc]}
+    [[ -z "${HB_SEEN["p$path"]+x}" ]] || continue
+    HB_SEEN["p$path"]=1
+    HIST_BINARY=$((HIST_BINARY + 1))
+    if [[ "$STRICT" -eq 1 ]]; then
+      add_hit "unscanned:binary" "$path" 0 "(binary file; content not scanned)" history "${FC_SHA[fc]}"
+    fi
+  done
+
+  # What `skip` kept out of the history scan, in distinct paths.
+  if [[ ${#SKIPS[@]} -gt 0 ]]; then
+    sp=("${SKIPS[@]}")
+    run_git "log (skipped)" "$TMPD/hskip" g "${HLOG[@]}" -m --no-renames \
+      --format= --name-only -z -- "${sp[@]}"
+    mapfile -d '' -t HSK < "$TMPD/hskip"
+    declare -A HSK_SEEN=()
+    for path in "${HSK[@]}"; do HSK_SEEN["p$path"]=1; done
+    HIST_SKIPPED=${#HSK_SEEN[@]}
+  fi
+
+  # Author, committer and message — published by every push. Each distinct
+  # (field, text) is scanned once, at its first commit: one leaked email in
+  # five hundred commits is one hit.
+  run_git "log (metadata)" "$TMPD/hmlog" g "${HLOG[@]}" -z \
+    --format='%H%x00%an <%ae>%x00%cn <%ce>%x00%B'
+  mapfile -d '' -t HM < "$TMPD/hmlog"
+  (( ${#HM[@]} % 4 == 0 )) || die "scan error: unexpected commit metadata from git log"
+  M_SHA=()
+  M_FIELD=()
+  M_LINE=()
+  M_TEXT=()
+  declare -A M_SEEN=()
+  hm_add() { # commit field line text
+    local key="${#2}:$2:$4"
+    [[ -n "$4" && -z "${M_SEEN[$key]+x}" ]] || return 0
+    M_SEEN[$key]=1
+    M_SHA+=("$1"); M_FIELD+=("$2"); M_LINE+=("$3"); M_TEXT+=("$4")
+    printf '%s\n' "$4" >&5
+  }
+  exec 5>"$TMPD/subj/hm"
+  for (( i = 0; i < ${#HM[@]}; i += 4 )); do
+    sha=${HM[i]}
+    hm_add "$sha" "(author)" 0 "${HM[i + 1]}"
+    hm_add "$sha" "(committer)" 0 "${HM[i + 2]}"
+    rest=${HM[i + 3]}
+    k=0
+    while [[ -n "$rest" ]]; do
+      k=$((k + 1))
+      ml=${rest%%$'\n'*}
+      if [[ "$rest" == *$'\n'* ]]; then rest=${rest#*$'\n'}; else rest=""; fi
+      hm_add "$sha" "(message)" "$k" "$ml"
+    done
+  done
+  exec 5>&-
+  for p in "${PATTERNS[@]}"; do
+    run_git "pattern '$p' (history metadata)" "$TMPD/hhits" \
+      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column -E -e "$p" -- hm
+    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
+      i=$((l - 1))
+      [[ -n "${M_SHA[i]-}" ]] || die "internal error: history metadata pass returned line $l"
+      add_hit "$p" "${M_FIELD[i]}" "${M_LINE[i]}" "${M_TEXT[i]}" history "${M_SHA[i]}"
+    done < "$TMPD/hhits"
+  done
+
+  # A .leakcheckrc.local committed at ANY point published its tells, even if
+  # it is gone today: the same rule as for the tree, and for the same reason.
+  run_git "log (.leakcheckrc.local)" "$TMPD/hlocal" g "${HLOG[@]}" --format=%H \
+    -- ':(literal).leakcheckrc.local'
+  if [[ -s "$TMPD/hlocal" ]]; then
+    IFS= read -r sha < "$TMPD/hlocal"
+    add_hit "config:local-in-history" ".leakcheckrc.local" 0 \
+      "(a .leakcheckrc.local committed in history publishes the tells it held; remove it from history)" history "$sha"
+  fi
+fi
+
 # A committed .leakcheckrc.local publishes the inventory of tells it exists
 # to keep out of git. Reported as a finding of its own, in every mode and
 # whatever --config says: its patterns need not match their own source text
@@ -648,7 +953,12 @@ for i in "${!H_FILE[@]}"; do
 done
 HIT_COUNT=${#KEEP[@]}
 
-SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodules not scanned, $SKIPPED_COUNT skipped by config, $ALLOWED_TOTAL allowed; history not scanned"
+if [[ "$HISTORY" -eq 1 ]]; then
+  HSCOPE="history scanned: $HIST_COMMITS commits, $HIST_BINARY binary files skipped, $HIST_SKIPPED skipped by config, ${#CFG_EXEMPT[@]} current-config lines exempt"
+else
+  HSCOPE="history not scanned"
+fi
+SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodules not scanned, $SKIPPED_COUNT skipped by config, $ALLOWED_TOTAL allowed; $HSCOPE"
 
 # ─── output ───────────────────────────────────────────────────────────
 if [[ "$OUTPUT_MODE" == "json" ]]; then
@@ -697,9 +1007,12 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
   for i in "${KEEP[@]}"; do
     [[ "$first" -eq 1 ]] || printf ','
     first=0
-    printf '{"file":"%s","line":%s,"pattern":"%s","text":"%s","source":"%s"}' \
+    printf '{"file":"%s","line":%s,"pattern":"%s","text":"%s","source":"%s"' \
       "$(json_escape "${H_FILE[$i]}")" "${H_LINE[$i]}" "$(json_escape "${H_PAT[$i]}")" \
       "$(json_escape "${H_TEXT[$i]}")" "${H_SRC[$i]}"
+    # Only history hits carry a commit; every other hit keeps its v0.3.0 shape.
+    if [[ -n "${H_COMMIT[$i]}" ]]; then printf ',"commit":"%s"' "${H_COMMIT[$i]}"; fi
+    printf '}'
   done
   printf '],"target":"index+worktree","tracked":%d,"skipped":{"binary":%d,"submodule":%d,"config":%d},"symlinks":%d,"allowed":[' \
     "$TRACKED_COUNT" "$BINARY_COUNT" "${#GITLINKS[@]}" "$SKIPPED_COUNT" "${#LINK_PATHS[@]}"
@@ -709,7 +1022,12 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
     first=0
     printf '{"rule":"%s","count":%d}' "$(json_escape "${ALLOWLIST[$r]}")" "${ALLOW_COUNTS[$r]}"
   done
-  printf '],"history_scanned":false}\n'
+  if [[ "$HISTORY" -eq 1 ]]; then
+    printf '],"history_scanned":true,"history":{"commits":%d,"binary":%d,"skipped":%d,"config_lines_exempt":%d}}\n' \
+      "$HIST_COMMITS" "$HIST_BINARY" "$HIST_SKIPPED" "${#CFG_EXEMPT[@]}"
+  else
+    printf '],"history_scanned":false}\n'
+  fi
 else
   # One hit, one line. A field holding a newline — only a path name or a
   # symlink target can — is C-quoted the way git quotes such paths; every
@@ -732,6 +1050,8 @@ else
     echo "leakcheck: clean — 0 matches across $TRACKED_COUNT tracked files ($SCOPE)"
   else
     for i in "${KEEP[@]}"; do
+      # A history hit leads with its commit: <sha>:path:line: [pattern] text.
+      if [[ -n "${H_COMMIT[$i]}" ]]; then printf '%s:' "${H_COMMIT[$i]}"; fi
       printf '%s:%s: [%s] %s\n' "$(line_safe "${H_FILE[$i]}")" "${H_LINE[$i]}" \
         "${H_PAT[$i]}" "$(line_safe "${H_TEXT[$i]}")"
     done
