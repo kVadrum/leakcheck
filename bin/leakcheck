@@ -15,6 +15,9 @@
 #   leakcheck --history          # also scan every commit reachable from any
 #                                # ref: added lines, path names, author,
 #                                # committer and message (needs full history)
+#   leakcheck --history-range RANGE
+#                                # --history over the commits in one git
+#                                # revision range only (origin/main..HEAD)
 #   leakcheck --json             # machine-readable output
 #   leakcheck --list-patterns    # print the effective pattern set
 #   leakcheck -c, --config FILE  # config path, relative to the cwd (after --root)
@@ -31,9 +34,9 @@
 # Blank lines and lines starting with '#' are ignored. Name and symlink hits
 # report line 0.
 #
-# Git history and commit metadata are scanned only with --history. Never
-# scanned: submodule contents, encoded or compressed content. Binary files
-# are skipped and counted.
+# Git history and commit metadata are scanned only with --history or
+# --history-range. Never scanned: submodule contents, encoded or compressed
+# content. Binary files are skipped and counted.
 #
 # Exit codes (treat ANY non-zero as "do not publish"):
 #   0  clean
@@ -69,11 +72,12 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 
 OUTPUT_MODE="text"
 STRICT=0
 HISTORY=0
+HIST_RANGE=""
 LIST_ONLY=0
 CONFIG_FILE=""
 ROOT=""
@@ -90,6 +94,14 @@ while [[ $# -gt 0 ]]; do
     --json)            OUTPUT_MODE="json"; shift ;;
     --strict)          STRICT=1; shift ;;
     --history)         HISTORY=1; shift ;;
+    --history-range)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "leakcheck: $1 needs a value" >&2; usage 2 >&2
+      fi
+      # One range, never last-wins: a second value silently replacing the
+      # first changes what was scanned without saying so.
+      [[ -z "$HIST_RANGE" ]] || die "--history-range given twice; pass one revision range"
+      HIST_RANGE="$2"; HISTORY=1; shift 2 ;;
     --list-patterns)   LIST_ONLY=1; shift ;;
     -c|--config|-C|--root)
       if [[ $# -lt 2 || -z "$2" ]]; then
@@ -107,6 +119,13 @@ while [[ $# -gt 0 ]]; do
     *)                 echo "leakcheck: unexpected arg: $1" >&2; usage 2 >&2 ;;
   esac
 done
+
+# The range reaches git as a revision argument, so an option-shaped value
+# (`--all`, `--since=…`, `--first-parent`) would change what the walk means
+# instead of naming commits.
+case "$HIST_RANGE" in
+  -*) die "--history-range takes a revision range, not an option: $HIST_RANGE" ;;
+esac
 
 if [[ -n "$ROOT" ]]; then
   cd -- "$ROOT" 2>/dev/null || die "cannot cd to $ROOT"
@@ -606,6 +625,9 @@ done
 # reported once, at its earliest commit — a line that sat unchanged through
 # fifty edits is one hit, and a leak still in the tree today is reported
 # twice, once here and once as it is now, because each needs its own fix.
+# --history-range RANGE puts one revision range in place of --all in every
+# pass below; the summary and JSON name the range, so a partial scan never
+# reads as a full one.
 # Load-bearing flags:
 #   --full-history  a pathspec otherwise simplifies history, and an `-s ours`
 #                   merge then hides its whole side branch (measured). -m
@@ -622,19 +644,34 @@ HIST_COMMITS=0
 HIST_BINARY=0
 HIST_SKIPPED=0
 declare -A CFG_EXEMPT=()
+HREVS=(--all)
+if [[ -n "$HIST_RANGE" ]]; then HREVS=("$HIST_RANGE"); fi
 if [[ "$HISTORY" -eq 1 ]]; then
   run_git "rev-parse" "$TMPD/shallow" g rev-parse --is-shallow-repository
   if [[ "$(<"$TMPD/shallow")" != "false" ]]; then
-    die "shallow clone: its history is incomplete, so --history cannot vouch for it (git fetch --unshallow; in GitHub Actions, fetch-depth: 0)"
+    [[ -n "$HIST_RANGE" ]] ||
+      die "shallow clone: its history is incomplete, so --history cannot vouch for it (git fetch --unshallow; in GitHub Actions, fetch-depth: 0)"
+    # A range can still be complete in a shallow clone: what goes missing is
+    # the parents of the boundary commits git lists in $GIT_DIR/shallow, so
+    # the walk is exact unless one of those commits is IN the range — then
+    # whatever lay behind it is silently absent (measured, git 2.53).
+    run_git "rev-parse" "$TMPD/shpath" g rev-parse --git-path shallow
+    run_git "rev-list" "$TMPD/hrevs" g rev-list "${HREVS[@]}" --
+    declare -A SHALLOW=()
+    while IFS= read -r c; do SHALLOW["c$c"]=1; done < "$(<"$TMPD/shpath")"
+    while IFS= read -r c; do
+      [[ -z "${SHALLOW["c$c"]+x}" ]] ||
+        die "shallow clone: $HIST_RANGE reaches commit $c, whose parents this clone does not have, so the range cannot be scanned in full (fetch deeper, or git fetch --unshallow)"
+    done < "$TMPD/hrevs"
   fi
-  run_git "rev-list" "$TMPD/hcount" g rev-list --all --count
+  run_git "rev-list" "$TMPD/hcount" g rev-list "${HREVS[@]}" --count --
   HIST_COMMITS=$(<"$TMPD/hcount")
   [[ "$HIST_COMMITS" =~ ^[0-9]+$ ]] || die "scan error: unexpected commit count: $HIST_COMMITS"
 fi
 
 if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
   HLOG=(-c log.showRoot=true -c core.quotePath=false
-        log --all --full-history --date-order --reverse --no-show-signature)
+        log "${HREVS[@]}" --full-history --date-order --reverse --no-show-signature)
 
   # Old versions of the config ARE scanned: a hostname that sat in
   # .leakcheckrc before .leakcheckrc.local existed is still in every commit
@@ -954,7 +991,9 @@ done
 HIT_COUNT=${#KEEP[@]}
 
 if [[ "$HISTORY" -eq 1 ]]; then
-  HSCOPE="history scanned: $HIST_COMMITS commits, $HIST_BINARY binary files skipped, $HIST_SKIPPED skipped by config, ${#CFG_EXEMPT[@]} current-config lines exempt"
+  HRANGE=""
+  if [[ -n "$HIST_RANGE" ]]; then HRANGE=" in range $HIST_RANGE only"; fi
+  HSCOPE="history scanned: $HIST_COMMITS commits$HRANGE, $HIST_BINARY binary files skipped, $HIST_SKIPPED skipped by config, ${#CFG_EXEMPT[@]} current-config lines exempt"
 else
   HSCOPE="history not scanned"
 fi
@@ -1023,8 +1062,10 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
     printf '{"rule":"%s","count":%d}' "$(json_escape "${ALLOWLIST[$r]}")" "${ALLOW_COUNTS[$r]}"
   done
   if [[ "$HISTORY" -eq 1 ]]; then
-    printf '],"history_scanned":true,"history":{"commits":%d,"binary":%d,"skipped":%d,"config_lines_exempt":%d}}\n' \
-      "$HIST_COMMITS" "$HIST_BINARY" "$HIST_SKIPPED" "${#CFG_EXEMPT[@]}"
+    hr=null
+    if [[ -n "$HIST_RANGE" ]]; then hr="\"$(json_escape "$HIST_RANGE")\""; fi
+    printf '],"history_scanned":true,"history":{"commits":%d,"binary":%d,"skipped":%d,"config_lines_exempt":%d,"range":%s}}\n' \
+      "$HIST_COMMITS" "$HIST_BINARY" "$HIST_SKIPPED" "${#CFG_EXEMPT[@]}" "$hr"
   else
     printf '],"history_scanned":false}\n'
   fi

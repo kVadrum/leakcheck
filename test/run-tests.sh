@@ -793,7 +793,7 @@ t_help_lists_every_flag() {
   # The script header is --help: a flag missing there is undiscoverable.
   assert_exit 0 "$BIN" --help
   local f
-  for f in --strict --history --json --list-patterns --config --root --version --help; do
+  for f in --strict --history --history-range --json --list-patterns --config --root --version --help; do
     assert_contains "$f" "$LC_OUT"
   done
 }
@@ -1403,7 +1403,7 @@ t_history_json_shape() {
 import json, sys
 doc = json.load(open(sys.argv[1]))
 assert doc["history_scanned"] is True, doc
-assert doc["history"] == {"commits": 2, "binary": 0, "skipped": 0, "config_lines_exempt": 0}, doc
+assert doc["history"] == {"commits": 2, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": None}, doc
 (hit,) = doc["hits"]
 assert hit["source"] == "history" and hit["commit"] == sys.argv[2], hit
 assert list(hit)[-1] == "commit" and list(doc)[-1] == "history", doc
@@ -1432,6 +1432,131 @@ t_history_leak_still_present_is_reported_twice() {
   assert_contains "f.txt:1: [" "$LC_OUT"
   [[ $(grep -c 'f.txt:1: \[' "$LC_OUT") -eq 2 ]]
   grep -qE '^[0-9a-f]{40}:f\.txt:1: \[' "$LC_OUT"
+}
+
+# --history-range puts one revision range in place of --all in every pass.
+
+t_history_range_scans_only_the_range() {
+  seed f.txt "/home/alice/old"
+  commit old
+  seed f.txt "clean"
+  commit scrub
+  local base; base=$(sha_of)
+  seed g.txt "/home/alice/new"
+  commit new
+  local added; added=$(sha_of)
+  seed g.txt "clean"
+  commit scrub-new
+  # A branch the range does not name: --all alongside the range would reach
+  # it, and with one branch the two walks are the same set.
+  git checkout -q -b side "$base"
+  seed h.txt "/home/alice/side"
+  commit side
+  git checkout -q -
+  # Control: both are findable at all.
+  assert_exit 1 "$BIN" --history
+  assert_contains "/home/alice/old" "$LC_OUT"
+  assert_contains "/home/alice/side" "$LC_OUT"
+  assert_exit 1 "$BIN" --history-range "$base..HEAD"
+  assert_contains "$added:g.txt:1: [/home/" "$LC_OUT"
+  assert_not_contains "/home/alice/old" "$LC_OUT"
+  assert_not_contains "/home/alice/side" "$LC_OUT"
+  assert_contains "history scanned: 2 commits in range $base..HEAD only" "$LC_ERR"
+}
+
+t_history_range_applies_to_every_pass() {
+  rc_file 'pattern MYHOST'
+  seed old-MYHOST.md "x"
+  commit "before the range, on MYHOST"
+  git rm -q old-MYHOST.md
+  commit "drop old"
+  local base; base=$(sha_of)
+  seed notes-from-MYHOST.md "x"
+  commit "in the range, on MYHOST"
+  local named; named=$(sha_of)
+  git mv notes-from-MYHOST.md notes.md
+  printf 'pattern ^SECRET-[0-9]+$\n' > .leakcheckrc.local
+  git add .leakcheckrc.local
+  commit rename
+  local oops; oops=$(sha_of)
+  git rm -q --cached .leakcheckrc.local
+  commit untrack
+  git checkout -q -b side "$base"
+  seed side-MYHOST.md "x"
+  commit "on a side branch, on MYHOST"
+  git checkout -q -
+  # Control: what lies outside the range is findable at all.
+  assert_exit 1 "$BIN" --history
+  assert_contains "old-MYHOST.md:0: [MYHOST]" "$LC_OUT"
+  assert_contains "(message):1: [MYHOST] before the range" "$LC_OUT"
+  assert_contains "side-MYHOST.md:0: [MYHOST]" "$LC_OUT"
+  assert_contains "(message):1: [MYHOST] on a side branch" "$LC_OUT"
+  assert_exit 1 "$BIN" --history-range "$base..HEAD"
+  assert_contains "$named:notes-from-MYHOST.md:0: [MYHOST]" "$LC_OUT"
+  assert_contains "$named:(message):1: [MYHOST] in the range, on MYHOST" "$LC_OUT"
+  assert_contains "$oops:.leakcheckrc.local:0: [config:local-in-history]" "$LC_OUT"
+  assert_not_contains "old-MYHOST" "$LC_OUT"
+  assert_not_contains "before the range" "$LC_OUT"
+  assert_not_contains "side" "$LC_OUT"
+}
+
+t_history_range_in_a_shallow_clone() {
+  seed f.txt "one"
+  commit one
+  seed f.txt "two"
+  commit two
+  seed f.txt "/home/alice/three"
+  commit three
+  seed f.txt "four"
+  commit four
+  # Depth 3 holds two..four, and "two" is the boundary: its parent is absent.
+  git clone -q --depth 3 "file://$PWD" shallow
+  cd shallow
+  # Based ON the boundary, the range never needs what lies behind it.
+  assert_exit 1 "$BIN" --history-range HEAD~2..HEAD
+  assert_contains ":f.txt:1: [/home/" "$LC_OUT"
+  assert_contains "history scanned: 2 commits in range HEAD~2..HEAD only" "$LC_ERR"
+  # Reaching the boundary, it would silently miss "one".
+  assert_exit 2 "$BIN" --history-range HEAD
+  assert_contains "shallow clone: HEAD reaches commit" "$LC_ERR"
+  assert_exit 2 "$BIN" --history
+  assert_contains "shallow clone" "$LC_ERR"
+}
+
+t_history_range_refusals() {
+  seed f.txt "x"
+  commit one
+  # An option-shaped value would change what the walk means.
+  assert_exit 2 "$BIN" --history-range --all
+  assert_contains "not an option: --all" "$LC_ERR"
+  assert_exit 2 "$BIN" --history-range HEAD --history-range HEAD
+  assert_contains "given twice" "$LC_ERR"
+  assert_exit 2 "$BIN" --history-range nosuch..HEAD
+  assert_contains "bad revision 'nosuch..HEAD'" "$LC_ERR"
+  assert_exit 2 "$BIN" --history-range
+  assert_contains "needs a value" "$LC_ERR"
+}
+
+t_history_range_empty_is_stated() {
+  seed f.txt "x"
+  commit one
+  assert_exit 0 "$BIN" --history-range HEAD..HEAD
+  assert_contains "history scanned: 0 commits in range HEAD..HEAD only" "$LC_OUT"
+}
+
+t_history_range_json() {
+  seed f.txt "/home/alice/x"
+  commit one
+  seed f.txt "clean"
+  commit two
+  assert_exit 0 "$BIN" --history-range HEAD~1..HEAD --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["clean"] is True, doc
+assert doc["history"] == {"commits": 1, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": "HEAD~1..HEAD"}, doc
+assert list(doc["history"])[-1] == "range", doc
+PY
 }
 
 # ─── runner ───────────────────────────────────────────────────────────
@@ -1558,6 +1683,12 @@ lc_test "history: JSON shape"                         t_history_json_shape
 lc_test "history: default JSON unchanged"             t_history_default_json_unchanged
 lc_test "history: empty repo"                         t_history_empty_repo
 lc_test "history: leak still present, reported twice" t_history_leak_still_present_is_reported_twice
+lc_test "history range: scans only the range"         t_history_range_scans_only_the_range
+lc_test "history range: applies to every pass"        t_history_range_applies_to_every_pass
+lc_test "history range: in a shallow clone"           t_history_range_in_a_shallow_clone
+lc_test "history range: refusals"                     t_history_range_refusals
+lc_test "history range: an empty range is stated"     t_history_range_empty_is_stated
+lc_test "history range: JSON names the range"         t_history_range_json
 
 echo
 echo "  $PASS passed  ·  $FAIL failed"

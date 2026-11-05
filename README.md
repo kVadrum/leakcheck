@@ -6,7 +6,7 @@ Credential scanners such as gitleaks, trufflehog and git-secrets look for secret
 leakcheck looks for what they ignore: home paths that carry your username, the names of your machines, and the codenames only your team uses — references that pile up in a private repo and get noticed only after it goes public.
 It is one bash script, and git is its only real dependency.
 
-*README v0.5.0*
+*README v0.6.0*
 
 ## Install
 
@@ -153,6 +153,42 @@ A history hit leads with the full commit id, then `path:line:`; commit metadata 
   In GitHub Actions, check out with `fetch-depth: 0`.
 - **Commits no ref reaches** — reflog-only and dangling objects — are not scanned, because a push does not publish them.
 
+### Only the commits a push adds
+
+`--history-range RANGE` scans one git revision range instead of every ref; `origin/main..HEAD` is what pushing your branch to `main` would add:
+
+```text
+$ leakcheck --history-range origin/main..HEAD
+0a2a94c80d26e6f9f0c6465f619b5ffb5e0d9be5:notes.md:1: [MYHOST] Deploys to MYHOST nightly.
+leakcheck: 1 match(es)
+leakcheck: scanned 3 tracked files (index + worktree; 0 binary skipped, 0 submodules not scanned, 1 skipped by config, 0 allowed; history scanned: 2 commits in range origin/main..HEAD only, 0 binary files skipped, 0 skipped by config, 0 current-config lines exempt)
+```
+
+The host name was edited out again before the push, so the tree is clean, but the commit that added it is still part of the push.
+
+- **Everything above applies inside the range**: every added line, path name and commit's metadata, once per finding at its earliest commit in the range.
+- **A finding older than the range is not reported** — that is the point — so a range scan vouches only for its range, and the summary and the JSON (`history.range`) say which range it was.
+- `RANGE` is one revision argument as `git log` takes it: `A..B`, `A...B`, or a single commit for everything it reaches.
+  An option-shaped value such as `--all` is refused, and so is a second `--history-range`.
+- **A shallow clone is accepted when it holds the whole range**, and refused when the range reaches past the clone's oldest commits.
+
+As a `pre-push` hook (`.git/hooks/pre-push`, executable), it scans exactly what each push adds and stops the push on anything non-zero:
+
+```sh
+#!/bin/sh
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case $local_sha in *[!0]*) ;; *) continue ;; esac   # deleting a branch adds nothing
+  case $remote_sha in
+    *[!0]*) range=$remote_sha..$local_sha ;;
+    *)      range=$local_sha ;;                       # a new branch: everything it reaches
+  esac
+  vendor/leakcheck --history-range "$range" || exit
+done
+```
+
+A new branch is scanned whole, so it also re-reports what other branches already published.
+If the remote holds commits you have not fetched, the range cannot be resolved and the push stops with exit `2`; fetch first.
+
 ## Configuration
 
 leakcheck reads up to two files from the repo's top level, in this order:
@@ -208,6 +244,7 @@ Mistakes in the config stop the run with exit `2` rather than narrowing the scan
 leakcheck                     scan with the defaults plus .leakcheckrc / .leakcheckrc.local
 leakcheck --strict            also report every file whose content was not scanned
 leakcheck --history           also scan every commit reachable from any ref
+leakcheck --history-range R   the same, over the commits in revision range R only
 leakcheck --json              machine-readable output
 leakcheck --list-patterns     print the effective pattern set
 leakcheck -c, --config FILE   use FILE instead of .leakcheckrc / .leakcheckrc.local
@@ -240,7 +277,7 @@ Some hits are not regex matches, and they use these names in the pattern slot:
 
 - `unscanned:binary` and `unscanned:submodule` — with `--strict`, one per file whose content was not scanned;
 - `config:local-tracked` — a committed `.leakcheckrc.local`;
-- `config:local-in-history` — with `--history`, a `.leakcheckrc.local` committed at any point.
+- `config:local-in-history` — with `--history` or `--history-range`, a `.leakcheckrc.local` committed at any point it scanned.
 
 A path or symlink target holding a newline is printed C-quoted (`"two\nlines.md":1: …`), so every hit stays on one line.
 
@@ -270,7 +307,8 @@ Here is the Quick start run, formatted for reading:
 
 - `version` is the leakcheck version that ran.
 - `source` says where a hit was found: `index`, `worktree` or `both` — or `history`, and then the hit also carries `commit`, the full commit id, after `source`.
-- With `--history`, `history_scanned` is `true` and a final `history` object follows: `{"commits": 4, "binary": 0, "skipped": 0, "config_lines_exempt": 1}`.
+- With `--history`, `history_scanned` is `true` and a final `history` object follows: `{"commits": 4, "binary": 0, "skipped": 0, "config_lines_exempt": 1, "range": null}`.
+  `range` is the `--history-range` value, or `null` when every ref was scanned.
 - `allowed` lists what each allow rule suppressed.
 - Strings are JSON-escaped, and bytes that are not valid UTF-8 become U+FFFD.
 - The schema is a contract, and new fields are only ever appended.
@@ -312,13 +350,26 @@ To scan history in CI, check out the full history — the default checkout is sh
   run: ./vendor/leakcheck --history
 ```
 
+To scan only what a pull request adds, pass its range; the shas go through `env` rather than straight into the script:
+
+```yaml
+- uses: actions/checkout@v5
+  with:
+    fetch-depth: 0
+- name: leakcheck (this pull request's commits)
+  env:
+    BASE: ${{ github.event.pull_request.base.sha }}
+    HEAD: ${{ github.event.pull_request.head.sha }}
+  run: ./vendor/leakcheck --history-range "$BASE..$HEAD"
+```
+
 ## Tests
 
 ```sh
 ./test/run-tests.sh
 ```
 
-The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist and its counts, `--strict`, the JSON shape and its escaping, file names holding spaces, colons and newlines, and `--history` — merges, a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, and once-per-finding reporting.
+The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist and its counts, `--strict`, the JSON shape and its escaping, file names holding spaces, colons and newlines, and `--history` — merges, a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, and once-per-finding reporting — and `--history-range`, in every pass and in a shallow clone.
 Each test runs in its own throwaway repo with your git hooks disabled.
 It needs bash 4.4+, git and python3 (for JSON round-trip checks; leakcheck itself never uses python3).
 `LEAKCHECK_BIN=/path/to/leakcheck ./test/run-tests.sh` runs the suite against another build.
