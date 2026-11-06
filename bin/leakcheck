@@ -80,7 +80,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.10.2"
+VERSION="0.10.3"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -220,7 +220,8 @@ DEFAULTS=(
   # Single backslashes, any spelling except the canonical C:\Users\ above
   '([A-BD-Za-z]:\\[Uu][Ss][Ee][Rr][Ss]|C:\\(u[Ss][Ee][Rr][Ss]|U(S[Ee][Rr][Ss]|s(E[Rr][Ss]|e(R[Ss]|rS)))))\\[A-Za-z0-9_][A-Za-z0-9_.-]*\\'
   # Usernames holding a non-ASCII character (zoë, José); [^ -~] is "not
-  # printable ASCII" in both a UTF-8 and a C locale
+  # printable ASCII", and the defaults run in the C locale (pat_args), where
+  # it meets every byte of any encoding
   '/(home|Users)/([A-Za-z0-9_][A-Za-z0-9_.-]*[^ -~]|[^ -~]+[A-Za-z0-9_])([A-Za-z0-9_.-]|[^ -~])*/'
   '[A-Za-z]:(\\\\|\\)[Uu][Ss][Ee][Rr][Ss](\\\\|\\)([A-Za-z0-9_][A-Za-z0-9_.-]*[^ -~]|[^ -~]+[A-Za-z0-9_])([A-Za-z0-9_.-]|[^ -~])*(\\\\|\\)'
 )
@@ -367,6 +368,25 @@ check_escapes() { # regex where
 }
 
 # Read each config in order. Absence is fine — defaults still apply.
+# The blanks a copy from a rendered page brings, as UTF-8 bytes, which
+# [[:space:]] does not see (measured, in a UTF-8 and a C locale): no-break,
+# U+1680, U+180E, U+2000 through the zero-width space, the line and
+# paragraph separators, narrow no-break, medium mathematical, word joiner,
+# ideographic, and the BOM.
+UNICODE_BLANKS=($'\xc2\xa0' $'\xe1\x9a\x80' $'\xe1\xa0\x8e' $'\xe2\x80\xa8' $'\xe2\x80\xa9'
+                $'\xe2\x80\xaf' $'\xe2\x81\x9f' $'\xe2\x81\xa0' $'\xe3\x80\x80' $'\xef\xbb\xbf')
+for b in 80 81 82 83 84 85 86 87 88 89 8a 8b; do
+  printf -v c "\\xe2\\x80\\x$b"
+  UNICODE_BLANKS+=("$c")
+done
+unicode_blank_edge() { # text: does it begin or end in one of them?
+  local LC_ALL=C b
+  for b in "${UNICODE_BLANKS[@]}"; do
+    [[ "$1" != "$b"* && "$1" != *"$b" ]] || return 0
+  done
+  return 1
+}
+
 parse_config() { # path name-for-messages
   local file=$1 name=$2 lineno=0 line keyword rest
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -394,6 +414,8 @@ parse_config() { # path name-for-messages
           # and turn `pattern MYHOST ` into a pattern that misses `MYHOST.`.
           [[ "$rest" != *[[:space:]] ]] ||
             die "$name:$lineno: $keyword '$rest' ends in whitespace, which git would match literally; delete it, or write [ ] for a space you mean"
+          ! unicode_blank_edge "$rest" ||
+            die "$name:$lineno: $keyword '$rest' begins or ends in an invisible Unicode space (no-break, zero-width, ideographic or a BOM), which git would match literally; delete it"
           RULE_CHECK+=("$keyword" "$name:$lineno" "$rest")
         fi
         case "$keyword" in
@@ -440,11 +462,18 @@ fi
 # RE_LOC how to run it. A credential rule runs in the C locale: it is ASCII
 # throughout, so it matches the same bytes there, and git's regex runs over
 # ten times faster than under UTF-8 (18 s against 1.4 s, 59 rules over 24 MB
-# of history: measured). A config pattern keeps the caller's locale.
+# of history: measured). The defaults run there too, so their [^ -~] meets
+# every byte: under UTF-8 a Latin-1 ë is no character at all, and a Latin-1
+# file's home path for user zoë read clean (measured). A config pattern
+# keeps the caller's locale.
 in_c() { LC_ALL=C "$@"; }
+declare -A DEFAULT_RE=()
+for p in "${DEFAULTS[@]}"; do DEFAULT_RE["l$p"]=1; done
 pat_args() {
   if [[ -n "${CRED_RE["l$1"]+x}" ]]; then
     re_args "${CRED_RE["l$1"]}"; RE_LOC=(in_c)
+  elif [[ -n "${DEFAULT_RE["l$1"]+x}" ]]; then
+    re_args "$1"; RE_LOC=(in_c)
   else
     re_args "$1"; RE_LOC=()
   fi
@@ -490,6 +519,10 @@ TMPD="$(mktemp -d "${TMPDIR:-/tmp}/leakcheck.XXXXXX")" || die "cannot create a t
 # in every repo, which run_git rightly reads as a scan error (both measured).
 export GIT_NO_REPLACE_OBJECTS=1
 export GIT_GRAFT_FILE="$TMPD/no-grafts"
+# Pathspec magic is the script's to choose: GIT_LITERAL_PATHSPECS=1 made
+# `:(literal).leakcheckrc.local` a filename matching nothing, and a committed
+# .leakcheckrc.local in history then read clean, exit 0 (measured).
+unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_ICASE_PATHSPECS
 mkdir "$TMPD/subj"
 
 # Binary detection must depend on content alone. git grep -I otherwise
@@ -538,11 +571,28 @@ re_args() {
 # somewhere in a hit's `path:line:match`, would excuse every hit. A stray
 # `|` after the last alternative or an `x*` is a typo, like an empty
 # directive, and one of them turns a dirty repo clean.
+# A rule can also match the empty string only beside a character, which no
+# empty line shows: `\b`, `\<`, `\b(docs|)\b`, `a|\b` (each excused every
+# hit through v0.10.2, measured). Each edge probe puts one context (line
+# edge, word character, other character) on each side of a gap; its regex
+# ^L(R)T$ can match no line but its own, and that only with R empty. A rule
+# holding a backreference skips the probes, since the added group would
+# renumber it.
 printf '\n' > "$TMPD/empty-line"
+printf '%s\n' a - b @ cd e, %f '=~' > "$TMPD/edge-lines"
+EDGE_PROBES=('' a '' - b '' @ '' c d e , % f = '~')
 for (( i = 0; i < ${#RULE_CHECK[@]}; i += 3 )); do
   re_args "${RULE_CHECK[i + 2]}"
   run_git "${RULE_CHECK[i]} '${RULE_CHECK[i + 2]}'" "$TMPD/e" \
     git -C "$TMPD" grep --no-index -l --no-color "${RE_ARGS[@]}" -- empty-line
+  if [[ ! -s "$TMPD/e" && "${RULE_CHECK[i + 2]}" != *'\'[1-9]* ]]; then
+    edge=("${RE_ARGS[@]:0:${#RE_ARGS[@]}-2}")
+    for (( k = 0; k < ${#EDGE_PROBES[@]}; k += 2 )); do
+      edge+=(-e "^${EDGE_PROBES[k]}(${RE_ARGS[-1]})${EDGE_PROBES[k + 1]}\$")
+    done
+    run_git "${RULE_CHECK[i]} '${RULE_CHECK[i + 2]}'" "$TMPD/e" \
+      git -C "$TMPD" grep --no-index -l --no-color "${edge[@]}" -- edge-lines
+  fi
   if [[ -s "$TMPD/e" ]]; then
     if [[ "${RULE_CHECK[i]}" == pattern ]]; then what="flag every line"; else what="excuse every hit"; fi
     die "${RULE_CHECK[i + 1]}: ${RULE_CHECK[i]} '${RULE_CHECK[i + 2]}' matches the empty string, so it would $what"
@@ -874,8 +924,14 @@ if [[ "$HISTORY" -eq 1 ]]; then
   # log.diffMerges: since git 2.32 `-m` means the user's default, and
   # `combined` prints a merge as `diff --cc` with `@@@` hunks — a merge's own
   # lines then went unscanned, exit 0 (measured). Older git ignores the key,
-  # and its `-m` is already `separate`.
+  # and its `-m` is already `separate`. core.bigFileThreshold: `log -p`
+  # prints a file above it as binary, and at `1m` a removed 1 MB source
+  # map's home path went to "binary files skipped", exit 0 (measured);
+  # pinned to git's default, so a larger file is still skipped and counted.
+  # i18n.logOutputEncoding: UTF-16 output split the metadata pass's NUL
+  # framing, and a Latin-1 message hid a home path for user zoë (measured).
   HLOG=(-c log.showRoot=true -c core.quotePath=false -c log.diffMerges=separate
+        -c core.bigFileThreshold=512m -c i18n.logOutputEncoding=UTF-8
         log "${HREVS[@]}" --full-history --date-order --reverse --no-show-signature)
 
   # Commit metadata, ref names and tags share one subject file, each distinct
@@ -1124,6 +1180,71 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
       hm_add "$sha" "(message)" "$k" "$ml"
     done
   done
+
+  # A merge of a signed tag (`git pull <url> tag v1`) carries the whole tag
+  # in its own header, `mergetag`, so pushing the merge publishes the tag's
+  # name, tagger and message with no tag ref at all; the tagger never
+  # reaches %B, and was clean through v0.10.2 (measured). Scanned as a
+  # tag's fields are, at the merge commit, from the raw objects: header
+  # lines, then continuation lines that each lead with one space.
+  parse_mergetags() { # <cat-file --batch output, NULs as \x01>
+    local LC_ALL=C hdr sha size body nl head line tag in_tag th name tagger msg ml kk
+    local -a tags
+    while IFS= read -r hdr; do
+      [[ "$hdr" =~ ^([0-9a-f]+)\ commit\ ([0-9]+)$ ]] ||
+        die "scan error: unexpected commit object from git cat-file: $hdr"
+      sha=${BASH_REMATCH[1]}; size=${BASH_REMATCH[2]}
+      body=""
+      if (( size > 0 )); then IFS= read -r -N "$size" body || true; fi
+      (( ${#body} == size )) || die "scan error: commit object $sha could not be read whole"
+      IFS= read -r nl || true
+      [[ -z "$nl" ]] || die "scan error: unexpected commit object framing from git cat-file"
+      [[ "$body" == *$'\nmergetag '* ]] || continue
+      head=${body%%$'\n\n'*}
+      tags=(); in_tag=0
+      while [[ -n "$head" ]]; do
+        line=${head%%$'\n'*}
+        if [[ "$head" == *$'\n'* ]]; then head=${head#*$'\n'}; else head=""; fi
+        if [[ "$line" == 'mergetag '* ]]; then
+          tags+=("${line#mergetag }"); in_tag=1
+        elif (( in_tag )) && [[ "$line" == ' '* ]]; then
+          tags[${#tags[@]} - 1]+=$'\n'"${line:1}"
+        else
+          in_tag=0
+        fi
+      done
+      for tag in "${tags[@]}"; do
+        th=${tag%%$'\n\n'*}
+        msg=""
+        if [[ "$tag" == *$'\n\n'* ]]; then msg=${tag#*$'\n\n'}; fi
+        name=""; tagger=""
+        while [[ -n "$th" ]]; do
+          line=${th%%$'\n'*}
+          if [[ "$th" == *$'\n'* ]]; then th=${th#*$'\n'}; else th=""; fi
+          case "$line" in
+            "tag "*)    name=${line#tag } ;;
+            "tagger "*) tagger=${line#tagger } ;;
+          esac
+        done
+        if [[ "$tagger" =~ ^(.*)\ [0-9]+\ [-+][0-9]{4}$ ]]; then tagger=${BASH_REMATCH[1]}; fi
+        hm_add "$sha" "(tag)" 0 "$name"
+        hm_add "$sha" "(tagger)" 0 "$tagger"
+        kk=0
+        while [[ -n "$msg" ]]; do
+          kk=$((kk + 1))
+          ml=${msg%%$'\n'*}
+          if [[ "$msg" == *$'\n'* ]]; then msg=${msg#*$'\n'}; else msg=""; fi
+          hm_add "$sha" "(tag message)" "$kk" "$ml"
+        done
+      done
+    done < "$1"
+  }
+  run_git "rev-list (merges)" "$TMPD/hmerges" g rev-list "${HREVS[@]}" --merges --
+  if [[ -s "$TMPD/hmerges" ]]; then
+    run_git "cat-file (merges)" "$TMPD/hmt0" g cat-file --batch < "$TMPD/hmerges"
+    LC_ALL=C tr '\000' '\001' < "$TMPD/hmt0" > "$TMPD/hmt"
+    parse_mergetags "$TMPD/hmt"
+  fi
 fi
 
 if [[ "$HISTORY" -eq 1 ]]; then
@@ -1141,6 +1262,15 @@ if [[ "$HISTORY" -eq 1 ]]; then
     run_git "rev-list" "$TMPD/hrange" g rev-list "${HREVS[@]}" --
     declare -A IN_RANGE=()
     while IFS= read -r c; do IN_RANGE["c$c"]=1; done < "$TMPD/hrange"
+    # A tree or a blob is in no range a walk can list, but the README's
+    # pre-push hook passes a pushed tag's own id as the range, and a tag on a
+    # blob or a tree went out clean, `0 refs` (measured). Such a ref is in
+    # the range when the range names it, its tag or its object as a tip.
+    run_git "rev-parse" "$TMPD/htips" g rev-parse "${HREVS[@]}" --
+    declare -A RANGE_TIP=()
+    while IFS= read -r c; do
+      [[ "$c" == '^'* || "$c" == -- ]] || RANGE_TIP["o$c"]=1
+    done < "$TMPD/htips"
   fi
   # Ref names hold no space or control character (git check-ref-format).
   run_git "for-each-ref" "$TMPD/hrefs" g for-each-ref --format='%(objectname) %(objecttype) %(refname)'
@@ -1212,8 +1342,14 @@ if [[ "$HISTORY" -eq 1 ]]; then
     # Peel through any chain of tags to the object the ref ends at.
     o=${REF_OBJ[k]}; t=${REF_TYPE[k]}; chain=()
     while [[ "$t" == tag ]]; do chain+=("$o"); t=${TAG_OTYPE[$o]}; o=${TAG_OBJ[$o]}; done
-    if [[ -n "$HIST_RANGE" ]]; then
-      [[ "$t" == commit && -n "${IN_RANGE["c$o"]+x}" ]] || continue
+    if [[ -n "$HIST_RANGE" && "$t" == commit ]]; then
+      [[ -n "${IN_RANGE["c$o"]+x}" ]] || continue
+    elif [[ -n "$HIST_RANGE" ]]; then
+      tip=0
+      for x in "${REF_OBJ[k]}" "${chain[@]}" "$o"; do
+        [[ -z "${RANGE_TIP["o$x"]+x}" ]] || tip=1
+      done
+      (( tip )) || continue
     fi
     HIST_REFS=$((HIST_REFS + 1))
     hm_add "${REF_OBJ[k]}" "(ref)" 0 "${REF_NAME[k]}"
@@ -1269,8 +1405,10 @@ fi
 # to keep out of git. Reported as a finding of its own, in every mode and
 # whatever --config says: its patterns need not match their own source text
 # (`pattern ^SECRET-[0-9]+$` does not), so "its lines will report it" is not
-# a guarantee.
-if [[ -n "${SEEN_PATH["p.leakcheckrc.local"]+x}" ]]; then
+# a guarantee. Looked up past `skip`, which listed it away: `skip
+# .leakcheckrc*` turned this finding into a skipped path, exit 0 (measured).
+run_git "ls-files (.leakcheckrc.local)" "$TMPD/lslocal" g ls-files -z -- ':(literal).leakcheckrc.local'
+if [[ -s "$TMPD/lslocal" ]]; then
   add_hit "config:local-tracked" ".leakcheckrc.local" 0 \
     "(a committed .leakcheckrc.local publishes the tells it holds; gitignore it)" "index"
 fi

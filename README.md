@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.10.2*
+*README v0.10.3*
 
 ## Install
 
@@ -66,7 +66,7 @@ It also catches the same paths as they look once serialized or spelled different
 - usernames holding a non-ASCII character, such as `zoë` or `José`, in both the POSIX and the Windows shapes.
 
 Every default is an absolute home path, and each shape was measured against real repositories before it became a default, because a false positive in a default lands on everyone.
-The defaults never overlap, so one path is one hit, and they behave the same in a UTF-8 and a C locale.
+The defaults never overlap, so one path is one hit, and they behave the same in a UTF-8 and a C locale and in any file encoding: they run in the C locale, so a home path for a user named `zoë` is found in a Latin-1 file too.
 
 Some things are deliberately left alone:
 
@@ -168,7 +168,7 @@ What it does not scan, and says so on every run:
 - **every added line** of every commit, at its line number in that commit's version of the file, merge commits included;
 - **every path** that ever existed, so a file renamed away from `notes-from-MYHOST.md` is still found;
 - **author, committer and message** of every commit;
-- **every ref name** — `feature/MYHOST-fix` leaks in its name — **and every annotated tag**: its name, tagger and message, a tag of a tag included.
+- **every ref name** — `feature/MYHOST-fix` leaks in its name — **and every annotated tag**: its name, tagger and message, a tag of a tag included, and a signed tag a merge commit carries in its header (`git pull <url> tag v1` puts it there, and pushing the merge publishes it).
 
 ```text
 $ leakcheck --history
@@ -198,7 +198,7 @@ Ref and tag hits use `(ref)`, `(tag)`, `(tagger)` or `(tag message)`, and lead w
 - **A shallow clone is refused** with exit `2`: its history is incomplete, and a clean verdict over part of it would be a lie.
   In GitHub Actions, check out with `fetch-depth: 0`.
 - **Commits no ref reaches** — reflog-only and dangling objects — are not scanned, because a push does not publish them.
-- **Your git config does not change what is scanned**: the diff formats for merges and submodules are fixed, and a line of git's output that leakcheck does not recognise is exit `2`, never skipped.
+- **Your git config does not change what is scanned**: the diff formats for merges and submodules, the size above which a file counts as binary (git's default, 512 MiB) and the log's output encoding are fixed, a `GIT_*_PATHSPECS` variable in the environment is ignored, and a line of git's output that leakcheck does not recognise is exit `2`, never skipped.
 
 ### Only the commits a push adds
 
@@ -213,7 +213,7 @@ leakcheck: scanned 3 tracked files (index + worktree; 0 binary skipped, 0 submod
 
 The host name was edited out again before the push, so the tree is clean, but the commit that added it is still part of the push.
 
-- **Everything above applies inside the range**: every added line, path name and commit's metadata, once per finding at its earliest commit in the range, and the refs and annotated tags that point into it — the ones the push carries.
+- **Everything above applies inside the range**: every added line, path name and commit's metadata, once per finding at its earliest commit in the range, and the refs and annotated tags that point into it — the ones the push carries — including a tag on a tree or a blob when the range names it, its tag or its object, as the hook below does for a new tag.
 - **A finding older than the range is not reported** — that is the point — so a range scan vouches only for its range, and the summary and the JSON (`history.range`) say which range it was.
 - `RANGE` is one revision argument as `git log` takes it: `A..B`, `A...B`, or a single commit for everything it reaches.
   An option-shaped value such as `--all` is refused, and so is a second `--history-range`.
@@ -244,7 +244,7 @@ leakcheck reads up to two files from the repo's top level, in this order:
 - **`.leakcheckrc.local`**: gitignore this one, and put your real hostnames and codenames in it.
 
 Your config is an inventory of exactly what you are trying to hide, which is why the second file exists.
-A *tracked* `.leakcheckrc.local` is reported as a finding of its own (`config:local-tracked`), whatever `--config` says, and unlike `.leakcheckrc` its content is scanned like any other file.
+A *tracked* `.leakcheckrc.local` is reported as a finding of its own (`config:local-tracked`), whatever `--config` or a `skip` says, and unlike `.leakcheckrc` its content is scanned like any other file.
 `--config FILE` replaces both files with `FILE`.
 
 Both files are line-oriented and take five directives; blank lines and `#` comments are ignored:
@@ -294,7 +294,7 @@ How patterns behave — read this before you write one:
 leakcheck does not match its own config file's content against your patterns — otherwise every `pattern` line would match itself — and counts it under `skipped by config`.
 The credential rules still read it, and its name and symlink target are scanned like any other, because a clone publishes all three.
 
-Mistakes in the config stop the run with exit `2` rather than narrowing the scan: an empty `pattern`, `allow` or `skip` (an empty `allow` would allow everything), a `pattern` or `allow` that matches the empty string (`MYHOST|`, `x*`: such an allow rule would excuse every hit), a `pattern` or `allow` ending in whitespace (write `[ ]` for a space you mean), an unknown directive, an invalid regex, a backslash escape POSIX does not have, a `pattern` spelled like a credential rule's label (`credential:github-token`), or a config file that is missing or unreadable.
+Mistakes in the config stop the run with exit `2` rather than narrowing the scan: an empty `pattern`, `allow` or `skip` (an empty `allow` would allow everything), a `pattern` or `allow` that matches the empty string, anywhere or only beside a word (`MYHOST|`, `x*`, `\b`, `\b(docs|)\b`: such an allow rule would excuse every hit), a `pattern` or `allow` ending in whitespace (write `[ ]` for a space you mean) or beginning or ending in an invisible Unicode space (no-break, zero-width, a BOM), an unknown directive, an invalid regex, a backslash escape POSIX does not have, a `pattern` spelled like a credential rule's label (`credential:github-token`), or a config file that is missing or unreadable.
 
 ## Usage
 
@@ -433,7 +433,7 @@ To scan only what a pull request adds, pass its range; the shas go through `env`
 ./test/run-tests.sh
 ```
 
-The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist — a rule excuses only what it names — and its counts, `(?i)` at every site a pattern reaches git, `--strict`, the JSON shape and its escaping, every credential rule against a stand-in for its own format (each hitting exactly once, never printed), credentials at every place a pattern reaches, the stand-in rule at its threshold, real keys whose structure looks like a stand-in, and the masking, file names holding spaces, colons and newlines, and `--history` — merges (under `log.diffMerges=combined` too), a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, once-per-finding reporting, ref names and annotated tags (nested, holding NUL bytes, and in a repository with no commits) — and `--history-range`, in every pass and in a shallow clone.
+The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean, and a Latin-1 username), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist — a rule excuses only what it names — and its counts, `(?i)` at every site a pattern reaches git, `--strict`, the JSON shape and its escaping, every credential rule against a stand-in for its own format (each hitting exactly once, never printed), credentials at every place a pattern reaches, the stand-in rule at its threshold, real keys whose structure looks like a stand-in, and the masking, file names holding spaces, colons and newlines, and `--history` — merges (under `log.diffMerges=combined` too, and a signed tag a merge carries), a big file under a small `core.bigFileThreshold`, metadata under another log encoding, a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, once-per-finding reporting, ref names and annotated tags (nested, holding NUL bytes, and in a repository with no commits) — and `--history-range`, in every pass, in a shallow clone, and over a tag on a blob or a tree.
 Each test runs in its own throwaway repo with your git hooks disabled.
 It needs bash 4.4+, git and python3 (for JSON round-trip checks; leakcheck itself never uses python3).
 `LEAKCHECK_BIN=/path/to/leakcheck ./test/run-tests.sh` runs the suite against another build.

@@ -2489,6 +2489,163 @@ t_config_rule_matching_the_empty_string_is_refused() {
   assert_exit 1 "$BIN"
 }
 
+t_config_rule_matching_the_empty_string_beside_a_word_is_refused() {
+  # No empty line shows these: each matches the empty string only next to
+  # a word character or a word's edge, which every hit's path:line:match
+  # holds, so it excused every hit, exit 0.
+  seed a.txt "see /home/alice/x on MYHOST"
+  commit init
+  local r
+  for r in '\b(docs|)\b' '\<' '\b' 'a|\b' '\B' '(?i)\>'; do
+    rc_file 'pattern MYHOST' "allow $r"
+    assert_exit 2 "$BIN"
+    assert_contains ".leakcheckrc:2: allow '$r' matches the empty string, so it would excuse every hit" "$LC_ERR"
+  done
+  rc_file 'pattern \bx?\b'
+  assert_exit 2 "$BIN"
+  assert_contains "pattern '\bx?\b' matches the empty string, so it would flag every line" "$LC_ERR"
+  # A boundary around something is a rule, and a backreference keeps its
+  # number (the probes are skipped for it).
+  rc_file 'pattern MYHOST' 'allow \bdocs\b' 'allow (MY)\1'
+  assert_exit 1 "$BIN"
+}
+
+t_config_rule_with_an_invisible_unicode_space_is_refused() {
+  # A copy from a rendered page brings a no-break or zero-width space that
+  # [[:space:]] does not see; trailing, it narrowed `pattern MYHOST` to miss
+  # `MYHOST.`, exit 0.
+  seed a.txt "deploys to MYHOST."
+  commit init
+  local b
+  for b in $'\xc2\xa0' $'\xe2\x80\x8b' $'\xef\xbb\xbf'; do
+    rc_file "pattern MYHOST$b"
+    LC_ALL=C.UTF-8 assert_exit 2 "$BIN"
+    assert_contains "begins or ends in an invisible Unicode space" "$LC_ERR"
+    LC_ALL=C assert_exit 2 "$BIN"
+    rc_file "pattern ${b}MYHOST"
+    LC_ALL=C.UTF-8 assert_exit 2 "$BIN"
+    assert_contains "begins or ends in an invisible Unicode space" "$LC_ERR"
+  done
+}
+
+t_history_range_tag_on_a_blob_or_tree() {
+  # The README's pre-push hook passes a new ref's own id as the range, and
+  # a tag on a blob or a tree is in no range a walk lists: it went out
+  # clean, 0 refs.
+  seed f.txt "x"
+  commit one
+  local blob tree tag
+  blob=$(printf 'deployed\n' | git hash-object -w --stdin)
+  tree=$(printf '100644 blob %s\tf\n' "$blob" | git mktree)
+  git tag deploy-MYHOST "$blob"
+  git tag -a -m "tree built on MYHOST" treetag "$tree"
+  tag=$(git rev-parse treetag)
+  rc_file 'pattern MYHOST'
+  commit two
+  assert_exit 1 "$BIN" --history-range "$blob"
+  assert_contains "$blob:(ref):0: [MYHOST] refs/tags/deploy-MYHOST" "$LC_OUT"
+  assert_contains "1 refs, 0 annotated tags, 1 tagged trees or blobs not scanned" "$LC_ERR"
+  assert_exit 1 "$BIN" --history-range "$tag"
+  assert_contains "$tag:(tag message):1: [MYHOST] tree built on MYHOST" "$LC_OUT"
+  assert_not_contains "deploy-MYHOST" "$LC_OUT"
+  # The object itself as the range: the tag on it is the ref that carries it.
+  assert_exit 1 "$BIN" --history-range "$tree"
+  assert_contains "$tag:(tag message):1: [MYHOST] tree built on MYHOST" "$LC_OUT"
+  # A range that names no tip of theirs still leaves them out.
+  assert_exit 0 "$BIN" --history-range "HEAD~1..HEAD"
+  assert_contains "1 refs, 0 annotated tags, 0 tagged trees or blobs not scanned" "$LC_OUT"
+}
+
+t_history_signed_tag_a_merge_carries() {
+  # Merging a signed tag copies the whole tag into the merge commit's
+  # header (mergetag); the push publishes it with no tag ref, and its
+  # tagger never reaches the commit's own fields: clean, exit 0.
+  rc_file 'pattern MYHOST'
+  seed f.txt "x"
+  commit one
+  git checkout -q -b side
+  seed s.txt "s"
+  commit side
+  local tg m
+  tg=$(printf 'object %s\ntype commit\ntag v1-rc\ntagger bob <bob@MYHOST.example> 1700000000 +0000\n\nrelease candidate built on MYHOST\n-----BEGIN PGP SIGNATURE-----\n\nc2lnbmF0dXJl\n-----END PGP SIGNATURE-----\n' "$(sha_of)" | git mktag)
+  git checkout -q dev
+  git -c core.hooksPath=/dev/null -c commit.gpgsign=false merge -q --no-ff -m "Merge release candidate" "$tg" >/dev/null 2>&1
+  git branch -q -D side
+  m=$(sha_of)
+  git cat-file -p HEAD | grep -q '^mergetag ' || { echo "    git recorded no mergetag"; return 1; }
+  assert_exit 1 "$BIN" --history
+  assert_contains "$m:(tagger):0: [MYHOST] bob <bob@MYHOST.example>" "$LC_OUT"
+  assert_contains "$m:(tag message):1: [MYHOST] release candidate built on MYHOST" "$LC_OUT"
+}
+
+t_history_big_file_under_a_small_threshold() {
+  # core.bigFileThreshold makes `log -p` print a larger file as binary: a
+  # removed source map's home path went to "binary files skipped", exit 0.
+  python3 -c 'print("{\"sources\":[\"/home/alice/src/app.ts\"],\"x\":\"" + "a" * 4000 + "\"}")' > app.js.map
+  git add app.js.map
+  commit one
+  git rm -q app.js.map
+  commit two
+  local cfg="$PWD/.git/bft.cfg"
+  printf '[core]\n\tbigFileThreshold = 1k\n' > "$cfg"
+  GIT_CONFIG_GLOBAL="$cfg" assert_exit 1 "$BIN" --history
+  assert_contains "app.js.map:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/]" "$LC_OUT"
+  assert_contains "0 binary files skipped" "$LC_ERR"
+  rm -f "$cfg"
+}
+
+t_history_metadata_under_another_log_encoding() {
+  # i18n.logOutputEncoding re-encodes what the metadata pass reads: UTF-16
+  # split its NUL framing, and Latin-1 hid a non-ASCII username.
+  seed f.txt "x"
+  git -c user.email=ops@MYHOST.example commit -q -m "see /home/zoë/x" --no-verify
+  rc_file 'pattern MYHOST'
+  commit two
+  local cfg="$PWD/.git/enc.cfg" enc
+  for enc in UTF-16LE ISO-8859-1; do
+    printf '[i18n]\n\tlogOutputEncoding = %s\n' "$enc" > "$cfg"
+    GIT_CONFIG_GLOBAL="$cfg" LC_ALL=C.UTF-8 assert_exit 1 "$BIN" --history
+    assert_contains "(author):0: [MYHOST] t <ops@MYHOST.example>" "$LC_OUT"
+    assert_contains "(message):1: [/(home|Users)/" "$LC_OUT"
+  done
+  rm -f "$cfg"
+}
+
+t_history_pathspec_env_cannot_hide_a_local_config() {
+  # GIT_LITERAL_PATHSPECS=1 read `:(literal).leakcheckrc.local` as a file
+  # of that name, so a .leakcheckrc.local in history went unreported.
+  seed f.txt "x"
+  printf 'pattern ^SECRET-[0-9]+$\n' > .leakcheckrc.local
+  git add .leakcheckrc.local
+  commit one
+  git rm -q --cached .leakcheckrc.local
+  commit two
+  GIT_LITERAL_PATHSPECS=1 assert_exit 1 "$BIN" --history
+  assert_contains ".leakcheckrc.local:0: [config:local-in-history]" "$LC_OUT"
+}
+
+t_default_finds_a_latin1_username_in_a_utf8_locale() {
+  # In a Latin-1 file ë is one byte, which no UTF-8 regex reads as a
+  # character: /home/zoë/ was clean under UTF-8 and found under C.
+  printf '/home/zo\xeb/x\n' > a.txt
+  git add a.txt
+  commit init
+  LC_ALL=C.UTF-8 assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [/(home|Users)/" "$LC_OUT"
+}
+
+t_skip_cannot_hide_a_tracked_local_config() {
+  # `skip .leakcheckrc*` listed the tracked .leakcheckrc.local away before
+  # it could be reported: clean, exit 0.
+  seed f.txt "x"
+  printf 'pattern ZZZ-UNUSED\n' > .leakcheckrc.local
+  git add .leakcheckrc.local
+  rc_file 'skip .leakcheckrc*'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains ".leakcheckrc.local:0: [config:local-tracked]" "$LC_OUT"
+}
+
 # ─── runner ───────────────────────────────────────────────────────────
 
 echo "leakcheck self-tests"
@@ -2664,6 +2821,15 @@ lc_test "history: merge lines, combined diffMerges"   t_history_merge_lines_unde
 lc_test "history: submodule, diff.submodule=log"     t_history_submodule_under_diff_submodule_log
 lc_test "config: trailing whitespace refused"         t_config_rule_ending_in_whitespace_is_refused
 lc_test "config: empty-string rule refused"           t_config_rule_matching_the_empty_string_is_refused
+lc_test "config: empty match beside a word refused"   t_config_rule_matching_the_empty_string_beside_a_word_is_refused
+lc_test "config: invisible Unicode space refused"     t_config_rule_with_an_invisible_unicode_space_is_refused
+lc_test "history range: tag on a blob or tree"        t_history_range_tag_on_a_blob_or_tree
+lc_test "history: a signed tag a merge carries"       t_history_signed_tag_a_merge_carries
+lc_test "history: big file, small threshold"          t_history_big_file_under_a_small_threshold
+lc_test "history: metadata, other log encoding"       t_history_metadata_under_another_log_encoding
+lc_test "history: pathspec env, local config"         t_history_pathspec_env_cannot_hide_a_local_config
+lc_test "default: Latin-1 username, UTF-8 locale"     t_default_finds_a_latin1_username_in_a_utf8_locale
+lc_test "skip cannot hide a tracked .local"           t_skip_cannot_hide_a_tracked_local_config
 
 echo
 echo "  $PASS passed  ·  $FAIL failed"
