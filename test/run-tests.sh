@@ -2496,7 +2496,7 @@ t_config_rule_matching_the_empty_string_beside_a_word_is_refused() {
   seed a.txt "see /home/alice/x on MYHOST"
   commit init
   local r
-  for r in '\b(docs|)\b' '\<' '\b' 'a|\b' '\B' '(?i)\>'; do
+  for r in '\b(docs|)\b' '\<' '\b' 'a|\b' '\B' '(?i)\>' '\b(docs|)\1\b' '(x|)\1\b' 'x[]|]|\b' '(docs|\>)'; do
     rc_file 'pattern MYHOST' "allow $r"
     assert_exit 2 "$BIN"
     assert_contains ".leakcheckrc:2: allow '$r' matches the empty string, so it would excuse every hit" "$LC_ERR"
@@ -2504,9 +2504,12 @@ t_config_rule_matching_the_empty_string_beside_a_word_is_refused() {
   rc_file 'pattern \bx?\b'
   assert_exit 2 "$BIN"
   assert_contains "pattern '\bx?\b' matches the empty string, so it would flag every line" "$LC_ERR"
-  # A boundary around something is a rule, and a backreference keeps its
-  # number (the probes are skipped for it).
-  rc_file 'pattern MYHOST' 'allow \bdocs\b' 'allow (MY)\1'
+  # A boundary around something is a rule, a backreference keeps its number
+  # in the probes, each alternative gets its own context (unsplit, `qq|d`
+  # would read as `…qq` or `d$`), and a `|` escaped, in brackets or in a
+  # class bracket is not an alternative.
+  rc_file 'pattern MYHOST' 'allow \bdocs\b' 'allow (MY)\1' 'allow (zz)|(yy)\2' 'allow qq|d' \
+    'allow [|]\b' 'allow x\|\b' 'allow [[:alpha:]|]zz'
   assert_exit 1 "$BIN"
 }
 

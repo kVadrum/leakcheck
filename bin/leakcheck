@@ -80,7 +80,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.10.3"
+VERSION="0.10.4"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -574,10 +574,50 @@ re_args() {
 # A rule can also match the empty string only beside a character, which no
 # empty line shows: `\b`, `\<`, `\b(docs|)\b`, `a|\b` (each excused every
 # hit through v0.10.2, measured). Each edge probe puts one context (line
-# edge, word character, other character) on each side of a gap; its regex
-# ^L(R)T$ can match no line but its own, and that only with R empty. A rule
-# holding a backreference skips the probes, since the added group would
-# renumber it.
+# edge, word character, other character) on each side of a gap, around each
+# top-level alternative A of the rule: ^LAT$|^LBT$… can match no line but
+# its own, and that only with the rule matching empty. No group is added,
+# so a backreference keeps its number (`\b(docs|)\1\b`; a first draft
+# wrapped the rule in one and skipped every rule holding a backreference,
+# found by /cxr). An alternative never begins with a quantifier that the
+# context would then bind: git refuses one anywhere (measured), and the
+# empty-line run has already stopped on it.
+split_alts() { # ERE -> its top-level alternatives, in ALTS; brackets as in check_escapes
+  local re=$1 n=${#1} i=0 c d rest tail cur="" depth=0 in_br=0 open=0
+  ALTS=()
+  while (( i < n )); do
+    c=${re:i:1}
+    if (( in_br )); then
+      if [[ $c == '[' ]] && (( i + 1 < n )); then
+        d=${re:i+1:1}
+        if [[ $d == ':' || $d == '=' || $d == '.' ]]; then
+          rest=${re:i+2}
+          tail=${rest#*"$d]"}
+          if [[ $tail == "$rest" ]]; then cur+=${re:i}; break; fi
+          cur+=${re:i:n-${#tail}-i}
+          i=$(( n - ${#tail} ))
+          continue
+        fi
+      fi
+      if [[ $c == ']' ]] && (( i > open )); then in_br=0; fi
+      cur+=$c; i=$(( i + 1 ))
+      continue
+    fi
+    case "$c" in
+      '\') cur+=${re:i:2}; i=$(( i + 2 )); continue ;;
+      '[')
+        in_br=1; cur+=$c; i=$(( i + 1 ))
+        if [[ ${re:i:1} == '^' ]]; then cur+='^'; i=$(( i + 1 )); fi
+        open=$i
+        continue ;;
+      '(') depth=$(( depth + 1 )) ;;
+      ')') if (( depth > 0 )); then depth=$(( depth - 1 )); fi ;;
+      '|') if (( depth == 0 )); then ALTS+=("$cur"); cur=""; i=$(( i + 1 )); continue; fi ;;
+    esac
+    cur+=$c; i=$(( i + 1 ))
+  done
+  ALTS+=("$cur")
+}
 printf '\n' > "$TMPD/empty-line"
 printf '%s\n' a - b @ cd e, %f '=~' > "$TMPD/edge-lines"
 EDGE_PROBES=('' a '' - b '' @ '' c d e , % f = '~')
@@ -585,10 +625,13 @@ for (( i = 0; i < ${#RULE_CHECK[@]}; i += 3 )); do
   re_args "${RULE_CHECK[i + 2]}"
   run_git "${RULE_CHECK[i]} '${RULE_CHECK[i + 2]}'" "$TMPD/e" \
     git -C "$TMPD" grep --no-index -l --no-color "${RE_ARGS[@]}" -- empty-line
-  if [[ ! -s "$TMPD/e" && "${RULE_CHECK[i + 2]}" != *'\'[1-9]* ]]; then
+  if [[ ! -s "$TMPD/e" ]]; then
+    split_alts "${RE_ARGS[-1]}"
     edge=("${RE_ARGS[@]:0:${#RE_ARGS[@]}-2}")
     for (( k = 0; k < ${#EDGE_PROBES[@]}; k += 2 )); do
-      edge+=(-e "^${EDGE_PROBES[k]}(${RE_ARGS[-1]})${EDGE_PROBES[k + 1]}\$")
+      e=""
+      for a in "${ALTS[@]}"; do e+="${e:+|}^${EDGE_PROBES[k]}$a${EDGE_PROBES[k + 1]}\$"; done
+      edge+=(-e "$e")
     done
     run_git "${RULE_CHECK[i]} '${RULE_CHECK[i + 2]}'" "$TMPD/e" \
       git -C "$TMPD" grep --no-index -l --no-color "${edge[@]}" -- edge-lines
