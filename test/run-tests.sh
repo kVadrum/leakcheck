@@ -1958,10 +1958,10 @@ t_credential_every_rule_finds_its_own_format() {
   git add .
   commit init
   assert_exit 1 "$BIN" --json
-  cp "$LC_OUT" ../cred.json
+  cp "$LC_OUT" .git/cred.json
   # Each file is one hit, of its own rule only, printed masked; the count of
   # rules is the count of stand-ins, so a rule added without one fails here.
-  python3 - ../cred.json "$CRED_TSV" <<'PY'
+  python3 - .git/cred.json "$CRED_TSV" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
@@ -1983,7 +1983,7 @@ PY
     case "$id" in private-key|putty-private-key) continue ;; esac
     assert_not_contains "$m" "$LC_OUT"
     assert_not_contains "$m" "$LC_ERR"
-    assert_not_contains "$m" ../cred.json
+    assert_not_contains "$m" .git/cred.json
   done < "$CRED_TSV"
 }
 
@@ -2003,8 +2003,8 @@ t_credential_in_every_tree_source() {
   rm swapped
   printf 'hook=%s\n' "$sl" > swapped
   assert_exit 1 "$BIN" --json
-  cp "$LC_OUT" ../tree.json
-  python3 - ../tree.json "notes-$(masked "$np").md" <<'PY'
+  cp "$LC_OUT" .git/tree.json
+  python3 - .git/tree.json "notes-$(masked "$np").md" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
 got = {(h["file"], h["pattern"], h["source"]) for h in doc["hits"]}
@@ -2025,7 +2025,7 @@ PY
   for t in "$gh" "$np" "$st" "$sl" "$pu"; do
     assert_not_contains "$t" "$LC_OUT"
     assert_not_contains "$t" "$LC_ERR"
-    assert_not_contains "$t" ../tree.json
+    assert_not_contains "$t" .git/tree.json
   done
 }
 
@@ -2244,6 +2244,210 @@ t_credential_other_hits_keep_their_text() {
   assert_contains "a.txt:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] /home/alice/x k=$gh" "$LC_OUT"
 }
 
+# v0.10.1: what QA of v0.4.1..v0.10.0 found.
+
+t_credential_private_key_is_never_a_placeholder() {
+  # A key body is base64 of a structured format: OpenSSH's unencrypted key
+  # puts nine As in its first 64 characters, which read as a placeholder run
+  # and set a real key aside, exit 0. A fixture's X-filled body is reported
+  # too: the header with a body after it is what makes it a key.
+  local h body x
+  h="-----BEGIN OPENSSH ""PRIVATE KEY-----"
+  body=$(python3 -c '
+import base64, random, struct
+r = random.Random(5)
+def s(b): return struct.pack(">I", len(b)) + b
+pub = s(b"ssh-ed25519") + s(r.randbytes(32))
+blob = b"openssh-key-v1\0" + s(b"none") + s(b"none") + s(b"") + struct.pack(">I", 1) + s(pub) + s(r.randbytes(160))
+print(base64.b64encode(blob).decode())')
+  x=$(printf 'X%.0s' {1..64})
+  {
+    printf '{"k": "%s\\n%s\\n"}\n' "$h" "$body"
+    printf 'KEY="%s %s"\n' "$h" "$body"
+    printf 'KEY="%s %s"\n' "$h" "$x"
+  } > keys.txt
+  git add keys.txt
+  commit init
+  assert_exit 1 "$BIN"
+  local n
+  for n in 1 2 3; do
+    assert_contains "keys.txt:$n: [credential:private-key] $h" "$LC_OUT"
+  done
+  assert_contains "0 placeholders not reported" "$LC_ERR"
+  assert_not_contains "${body:0:24}" "$LC_OUT"
+}
+
+t_credential_zero_bytes_are_not_a_placeholder_run() {
+  # Base64 of zero bytes is a run of As, and a token holding a zero-filled
+  # field (a macaroon's 8-byte key id, here) has one in every real token.
+  local fly
+  fly=$(python3 -c '
+import base64, random
+r = random.Random(3)
+b = bytes([0x94, 0x93, 0xc4, 0x08]) + (4242).to_bytes(8, "big") + bytes([0xc4, 0x10]) + r.randbytes(16) + bytes([0xc4, 0x60]) + r.randbytes(96)
+print("f" "m2_" + base64.b64encode(b).decode())')
+  [[ "$fly" == *AAAAAAAA* ]] || { echo "    stand-in has no run of As"; return 1; }
+  seed a.txt "FLY_API_TOKEN=$fly"
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [credential:flyio-token] $(masked "$fly")" "$LC_OUT"
+  assert_contains "0 placeholders not reported" "$LC_ERR"
+}
+
+t_credential_jwt_header_in_base64url() {
+  # A JWT header segment is base64url: `-` and `_` are in its alphabet.
+  local hdr payload sig
+  hdr=$(python3 -c 'import base64; print(base64.urlsafe_b64encode(b"{\"alg\":\"HS256\",\"kid\":\"k?>~\"}").decode().rstrip("="))')
+  [[ "$hdr" == *[-_]* ]] || { echo "    header has no - or _"; return 1; }
+  payload="ey""JzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkFsaWNlIn0"
+  sig="Qm9ndXNTaWduYXR1cmVGb3JUZXN0aW5nT25seQ"
+  seed a.txt "auth=$hdr.$payload.$sig"
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [credential:jwt] $(masked "$hdr.$payload.$sig")" "$LC_OUT"
+}
+
+t_credential_in_a_name_is_masked_wherever_the_name_prints() {
+  # A token in a path rides along in every hit's location in that file, and
+  # in the text of a hit on the name itself; a token in a ref name, in an
+  # --strict hit about that ref.
+  local gh np
+  gh=$(cred github-token)
+  np=$(cred npm-token)
+  seed "cache-$gh/a.txt" "see /home/alice/x"
+  rc_file 'pattern cache-'
+  commit init
+  git tag "rel-$np" "$(git rev-parse HEAD:.leakcheckrc)"
+  assert_exit 1 "$BIN" --history --strict
+  assert_contains "cache-$(masked "$gh")/a.txt:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] see /home/alice/x" "$LC_OUT"
+  assert_contains "cache-$(masked "$gh")/a.txt:0: [cache-] cache-$(masked "$gh")/a.txt" "$LC_OUT"
+  assert_contains "(ref):0: [unscanned:tagged-blob] refs/tags/rel-$(masked "$np") (points at a blob" "$LC_OUT"
+  assert_not_contains "$gh" "$LC_OUT"
+  assert_not_contains "$np" "$LC_OUT"
+  assert_exit 1 "$BIN" --history --strict --json
+  assert_not_contains "$gh" "$LC_OUT"
+  assert_not_contains "$np" "$LC_OUT"
+}
+
+t_credential_in_an_allow_rule_is_masked_in_json() {
+  # The JSON report prints every allow rule; a credential in one is masked,
+  # a stand-in is printed as written.
+  local gh aws
+  gh=$(cred github-token)
+  aws="AK""IA""IOSFODNN7EXAMPLE"
+  seed a.txt "k=$gh"
+  seed b.txt "k=$aws"
+  rc_file "allow $gh" "allow $aws"
+  commit init
+  assert_exit 0 "$BIN" --json
+  assert_not_contains "$gh" "$LC_OUT"
+  python3 -c '
+import json, sys
+a = [r["rule"] for r in json.load(open(sys.argv[1]))["allowed"]]
+assert a == sys.argv[2:], a' \
+    "$LC_OUT" "$(masked "$gh")" "$aws"
+}
+
+t_credential_rules_read_a_type_changed_config() {
+  # .leakcheckrc a symlink in the index and a file on disk: `git commit -a`
+  # publishes the file, a token in it included. Its own pattern lines are
+  # still not reported.
+  local gh
+  gh=$(cred github-token)
+  ln -s elsewhere .leakcheckrc
+  git add .leakcheckrc
+  commit init
+  rm .leakcheckrc
+  printf '%s\n' 'pattern MYHOST' "# k=$gh" > .leakcheckrc
+  assert_exit 1 "$BIN"
+  assert_contains ".leakcheckrc:2: [credential:github-token] $(masked "$gh")" "$LC_OUT"
+  assert_not_contains "[MYHOST]" "$LC_OUT"
+  assert_contains "leakcheck: 1 match(es)" "$LC_ERR"
+}
+
+t_history_merge_lines_under_combined_diff_merges() {
+  # A line only a merge adds — an evil merge's resolution — is published by
+  # that merge. log.diffMerges=combined made git print it in a format the
+  # parser skipped, exit 0.
+  seed a.txt "base"
+  commit base
+  git checkout -q -b side
+  seed b.txt "side"
+  commit side
+  git checkout -q dev
+  seed c.txt "main"
+  commit main
+  git -c core.hooksPath=/dev/null merge -q --no-ff --no-commit side >/dev/null 2>&1
+  printf 'see /home/alice/x\n' >> a.txt
+  git add a.txt
+  commit merge
+  local m; m=$(sha_of)
+  git rm -q a.txt
+  commit scrub
+  local cfg="$PWD/.git/dm.cfg" mode
+  for mode in combined dense-combined; do
+    printf '[log]\n\tdiffMerges = %s\n' "$mode" > "$cfg"
+    GIT_CONFIG_GLOBAL="$cfg" assert_exit 1 "$BIN" --history
+    assert_contains "$m:a.txt:2: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] see /home/alice/x" "$LC_OUT"
+  done
+  rm -f "$cfg"
+}
+
+t_history_submodule_under_diff_submodule_log() {
+  # Guard (v0.10.0 passes too, by skipping what it does not read): under
+  # diff.submodule=log a gitlink's diff is a `Submodule` summary, which the
+  # parser now refuses, so the history pass pins the short form, and a
+  # commit holding a gitlink still scans as ever.
+  local z; printf -v z '%040d' 1
+  git update-index --add --cacheinfo "160000,$z,sub"
+  seed a.txt "see /home/alice/x"
+  commit init
+  local c; c=$(sha_of)
+  local cfg="$PWD/.git/sm.cfg"
+  printf '[diff]\n\tsubmodule = log\n' > "$cfg"
+  GIT_CONFIG_GLOBAL="$cfg" assert_exit 1 "$BIN" --history
+  assert_contains "$c:a.txt:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] see /home/alice/x" "$LC_OUT"
+}
+
+t_config_rule_ending_in_whitespace_is_refused() {
+  # `pattern MYHOST ` misses `MYHOST.`: the trailing blank is part of the
+  # regex and invisible in an editor.
+  seed a.txt "deploys to MYHOST."
+  rc_file 'pattern MYHOST '
+  commit init
+  assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc:1: pattern 'MYHOST ' ends in whitespace" "$LC_ERR"
+  printf '%s\n' 'pattern MYHOST' $'allow a\\.txt\t' > .leakcheckrc
+  assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc:2: allow" "$LC_ERR"
+  assert_contains "ends in whitespace" "$LC_ERR"
+  rc_file 'pattern MYHOST[ ]'
+  assert_exit 0 "$BIN"
+}
+
+t_config_rule_matching_the_empty_string_is_refused() {
+  # An allow rule matching the empty string matches somewhere in every
+  # hit's `path:line:match`, so it excused every hit, exit 0; a pattern
+  # matching it flags every line.
+  seed a.txt "see /home/alice/x on MYHOST"
+  rc_file 'pattern MYHOST' 'allow docs\.example\.com|'
+  commit init
+  assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc:2: allow 'docs\.example\.com|' matches the empty string, so it would excuse every hit" "$LC_ERR"
+  rc_file 'pattern MYHOST' 'allow (fixtures/)?'
+  assert_exit 2 "$BIN"
+  assert_contains "matches the empty string" "$LC_ERR"
+  rc_file 'pattern MYHOST' 'allow (?i)x*'
+  assert_exit 2 "$BIN"
+  assert_contains "matches the empty string" "$LC_ERR"
+  rc_file 'pattern MYHOST|'
+  assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc:1: pattern 'MYHOST|' matches the empty string, so it would flag every line" "$LC_ERR"
+  # An anchor alone is not the empty string on its own.
+  rc_file 'pattern MYHOST' 'allow ^fixtures/'
+  assert_exit 1 "$BIN"
+}
+
 # ─── runner ───────────────────────────────────────────────────────────
 
 echo "leakcheck self-tests"
@@ -2407,6 +2611,16 @@ lc_test "credentials: allow sees the real text"       t_credential_allow_rules_s
 lc_test "credentials: in the committed config"        t_credential_in_the_committed_config
 lc_test "credentials: a PEM header needs a key"       t_credential_private_key_needs_a_key_after_its_header
 lc_test "credentials: other hits keep their text"     t_credential_other_hits_keep_their_text
+lc_test "credentials: a key is never a placeholder"    t_credential_private_key_is_never_a_placeholder
+lc_test "credentials: zero bytes are not a run"       t_credential_zero_bytes_are_not_a_placeholder_run
+lc_test "credentials: base64url JWT header"           t_credential_jwt_header_in_base64url
+lc_test "credentials: masked wherever a name prints"  t_credential_in_a_name_is_masked_wherever_the_name_prints
+lc_test "credentials: masked in a JSON allow rule"    t_credential_in_an_allow_rule_is_masked_in_json
+lc_test "credentials: a type-changed config"          t_credential_rules_read_a_type_changed_config
+lc_test "history: merge lines, combined diffMerges"   t_history_merge_lines_under_combined_diff_merges
+lc_test "history: submodule, diff.submodule=log"     t_history_submodule_under_diff_submodule_log
+lc_test "config: trailing whitespace refused"         t_config_rule_ending_in_whitespace_is_refused
+lc_test "config: empty-string rule refused"           t_config_rule_matching_the_empty_string_is_refused
 
 echo
 echo "  $PASS passed  ·  $FAIL failed"

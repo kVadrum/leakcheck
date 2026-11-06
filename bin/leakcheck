@@ -80,7 +80,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.10.0"
+VERSION="0.10.1"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -277,7 +277,7 @@ CREDENTIALS=(
   twilio-api-key              'SK[0-9a-fA-F]{32}'
   digitalocean-token          'do[opr]_v1_[a-f0-9]{64}'
   shopify-token               'shp(at|ca|pa|ss)_[a-fA-F0-9]{32}'
-  jwt                         'ey[A-Za-z0-9]{17,}\.ey[A-Za-z0-9/\\_-]{17,}\.([A-Za-z0-9/\\_-]{10,}={0,2})?'
+  jwt                         'ey[A-Za-z0-9_-]{17,}\.ey[A-Za-z0-9/\\_-]{17,}\.([A-Za-z0-9/\\_-]{10,}={0,2})?'
   age-secret-key              'AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}'
   vault-token                 'hv[sb]\.[A-Za-z0-9_-]{90,}'
   terraform-cloud-token       '[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9_=-]{60,70}'
@@ -308,6 +308,7 @@ CREDENTIALS=(
 
 PATTERNS=()
 ALLOWLIST=()
+RULE_CHECK=()
 SKIPS=()
 USE_DEFAULTS=1
 USE_CREDENTIALS=1
@@ -389,6 +390,11 @@ parse_config() { # path name-for-messages
         fi
         if [[ $keyword != skip ]]; then
           check_escapes "$rest" "$name:$lineno: $keyword '$rest'"
+          # Trailing blanks are part of the regex, invisible in an editor,
+          # and turn `pattern MYHOST ` into a pattern that misses `MYHOST.`.
+          [[ "$rest" != *[[:space:]] ]] ||
+            die "$name:$lineno: $keyword '$rest' ends in whitespace, which git would match literally; delete it, or write [ ] for a space you mean"
+          RULE_CHECK+=("$keyword" "$name:$lineno" "$rest")
         fi
         case "$keyword" in
           pattern) PATTERNS+=("$rest") ;;
@@ -526,6 +532,22 @@ GREP_FLAGS=(-z --no-color --no-column --no-textconv --no-recurse-submodules)
 re_args() {
   if [[ "$1" == '(?i)'* ]]; then RE_ARGS=(-i -E -e "${1:4}"); else RE_ARGS=(-E -e "$1"); fi
 }
+
+# A config rule that matches the empty string matches everything: a pattern
+# would flag every line, and an allow rule, which needs to match only
+# somewhere in a hit's `path:line:match`, would excuse every hit. A stray
+# `|` after the last alternative or an `x*` is a typo, like an empty
+# directive, and one of them turns a dirty repo clean.
+printf '\n' > "$TMPD/empty-line"
+for (( i = 0; i < ${#RULE_CHECK[@]}; i += 3 )); do
+  re_args "${RULE_CHECK[i + 2]}"
+  run_git "${RULE_CHECK[i]} '${RULE_CHECK[i + 2]}'" "$TMPD/e" \
+    git -C "$TMPD" grep --no-index -l --no-color "${RE_ARGS[@]}" -- empty-line
+  if [[ -s "$TMPD/e" ]]; then
+    if [[ "${RULE_CHECK[i]}" == pattern ]]; then what="flag every line"; else what="excuse every hit"; fi
+    die "${RULE_CHECK[i + 1]}: ${RULE_CHECK[i]} '${RULE_CHECK[i + 2]}' matches the empty string, so it would $what"
+  fi
+done
 
 # Credential rules go to git once per pass first, all of them as one -l
 # grep: most subjects hold no credential, and one process beats one per rule
@@ -696,15 +718,19 @@ content_pass worktree
 # path, but `git commit -a` stages the new file — and v0.2.2's per-file grep,
 # which read whatever was on disk, did scan it. Each one is copied under a
 # numbered name and scanned there, with the same flags and the same binary
-# rule, then mapped back to its real path.
+# rule, then mapped back to its real path. The config is among them when it
+# changed type: the credential rules read its content, as in the tree.
 TC_PATHS=()
+TC_CFG=()
 for path in "${PATHS[@]}"; do
   case "${MODE_OF["p$path"]}" in
     120000|160000) ;;
     *) continue ;;
   esac
-  [[ "$path" == "$CONFIG_REL" ]] && continue
-  if [[ -f "$path" && ! -L "$path" ]]; then TC_PATHS+=("$path"); fi
+  if [[ -f "$path" && ! -L "$path" ]]; then
+    if [[ "$path" == "$CONFIG_REL" ]]; then TC_CFG=(":(exclude,literal)${#TC_PATHS[@]}"); fi
+    TC_PATHS+=("$path")
+  fi
 done
 if [[ ${#TC_PATHS[@]} -gt 0 ]]; then
   mkdir "$TMPD/tc"
@@ -723,8 +749,10 @@ if [[ ${#TC_PATHS[@]} -gt 0 ]]; then
   pass_patterns "type changes" gni -z -l -I -E "${CRED_E[@]}" -- .
   for p in "${PASS_PATS[@]}"; do
     pat_args "$p"
+    ex=("${TC_CFG[@]}")
+    if [[ -n "${CRED_RE["l$p"]+x}" ]]; then ex=(); fi
     run_git "pattern '$p' (type changes)" "$TMPD/hits" \
-      "${RE_LOC[@]}" gni -z -n -I --no-color --no-column "${RE_ARGS[@]}" -- .
+      "${RE_LOC[@]}" gni -z -n -I --no-color --no-column "${RE_ARGS[@]}" -- . "${ex[@]}"
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       # An indexed subscript is arithmetic: a non-numeric name would quietly
       # map to entry 0, so check the shape before the lookup.
@@ -843,7 +871,11 @@ if [[ "$HISTORY" -eq 1 ]]; then
 fi
 
 if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
-  HLOG=(-c log.showRoot=true -c core.quotePath=false
+  # log.diffMerges: since git 2.32 `-m` means the user's default, and
+  # `combined` prints a merge as `diff --cc` with `@@@` hunks — a merge's own
+  # lines then went unscanned, exit 0 (measured). Older git ignores the key,
+  # and its `-m` is already `separate`.
+  HLOG=(-c log.showRoot=true -c core.quotePath=false -c log.diffMerges=separate
         log "${HREVS[@]}" --full-history --date-order --reverse --no-show-signature)
 
   # Old versions of the config ARE scanned: a hostname that sat in
@@ -951,13 +983,19 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
           ln=${h%%,*}
           [[ "$ln" =~ ^[0-9]+$ ]] || die "scan error: unexpected hunk header: $line"
           in_hunk=1 ;;
+        # The extended header lines git prints with these flags. Anything
+        # else — a `diff --cc` and its `@@@` hunks, a `Submodule` summary —
+        # is output this parser does not understand, and skipping it would
+        # skip whatever it carried.
+        ''|'index '*|'--- '*|'+++ '*|'new file mode '*|'deleted file mode '*|'old mode '*|'new mode '*) ;;
+        *) die "scan error: unexpected line in the history diff: ${line:0:40}" ;;
       esac
     done < "$TMPD/hlog"
     exec 3>&- 4>&-
   }
 
   run_git "log (history)" "$TMPD/hlog" g "${HLOG[@]}" -m --no-renames -p -U0 \
-    --inter-hunk-context=0 --no-color --no-ext-diff --no-textconv \
+    --inter-hunk-context=0 --no-color --no-ext-diff --no-textconv --submodule=short \
     --src-prefix=a/ --dst-prefix=b/ --format=%x01%H -- . "${skip_excludes[@]}"
   hist_parse
   mapfile -t HMETA < "$TMPD/hmeta"
@@ -1382,22 +1420,29 @@ fi
 
 # ─── credentials ──────────────────────────────────────────────────────
 # A credential hit prints its matches masked, never its line: the line may
-# hold a second secret no rule knows. It prints its path with every
-# credential the name passes found there masked too, since a token in a file
-# name would otherwise ride along in the location of every hit in that file.
+# hold a second secret no rule knows. A credential the name passes found in a
+# path, a ref name or a tag name is masked wherever that name is printed — in
+# every hit's path, and in a hit whose text is the name — since it would
+# otherwise ride along in the location of every hit in that file.
 # A hit whose every match is a stand-in (is_placeholder) is not reported, and
 # is counted. Each test is something a random secret all but never does — 8
 # equal characters in a row, or 8 letters or digits counting up, is under one
 # in a million even for a 64-character hex key — and that docs and fixtures
 # do all the time: an X-filled key, an alphabet run, AWS's documented key
-# ending in EXAMPLE.
+# ending in EXAMPLE. A run of `A` does not count: it is base64 for zero bytes,
+# and a format holding zero-filled fields has one in every real key —
+# OpenSSH's unencrypted private key (measured: nine As in its first 64
+# characters), and by its msgpack layout Fly.io's macaroon token.
+# A private-key header is never a placeholder: the body after it is base64
+# of a structured format, and the rule's key-after-the-header requirement is
+# what tells a fixture from a key.
 is_placeholder() { # match
   local LC_ALL=C m=$1 i c o prev=-2 same=0 up=0
   if [[ "$m" == *EXAMPLE* || "$m" == *example* ]]; then return 0; fi
   for (( i = 0; i < ${#m}; i++ )); do
     c=${m:i:1}
     printf -v o '%d' "'$c"
-    if (( o == prev )); then same=$((same + 1)); else same=1; fi
+    if (( o == prev )) && [[ "$c" != A ]]; then same=$((same + 1)); else same=1; fi
     if (( o == prev + 1 )) && [[ "$c" == [A-Za-z0-9] && "${m:i-1:1}" == [A-Za-z0-9] ]]; then
       up=$((up + 1))
     else
@@ -1422,13 +1467,31 @@ cred_show() {
   fi
 }
 
-# Credentials in path names, from the name hits (line 0, text = the path).
-declare -A PATH_TOKS=()
+# A name hit: its text is the name itself — a path (line 0, text = the
+# path), a ref name or a tag name; an --strict hit on a ref leads with it.
+is_name_hit() { # hit
+  [[ "${H_LINE[$1]}" == 0 ]] || return 1
+  [[ "${H_FILE[$1]}" == "${H_TEXT[$1]}" || "${H_FILE[$1]}" == "(ref)" || "${H_FILE[$1]}" == "(tag)" ]]
+}
+# Credentials in names, from the name hits; mask_names <string> -> REPLY.
+NAME_TOKS=()
+declare -A NAME_TOK_SEEN=()
 for i in "${!H_FILE[@]}"; do
-  if [[ -n "${CRED_RE["l${H_PAT[$i]}"]+x}" && "${H_LINE[$i]}" == 0 && "${H_FILE[$i]}" == "${H_TEXT[$i]}" ]]; then
-    for j in ${MT_OF[$i]}; do PATH_TOKS["p${H_FILE[$i]}"]+="${MT_TXT[j]}"$'\n'; done
+  if [[ -n "${CRED_RE["l${H_PAT[$i]}"]+x}" ]] && is_name_hit "$i"; then
+    for j in ${MT_OF[$i]}; do
+      [[ -z "${NAME_TOK_SEEN["t${MT_TXT[j]}"]+x}" ]] || continue
+      NAME_TOK_SEEN["t${MT_TXT[j]}"]=1
+      NAME_TOKS+=("${MT_TXT[j]}")
+    done
   fi
 done
+mask_names() {
+  local tok
+  REPLY=$1
+  for tok in "${NAME_TOKS[@]}"; do
+    REPLY=${REPLY//"$tok"/"${tok:0:4}[redacted, ${#tok} chars]"}
+  done
+}
 
 KEEP=()
 SHOW=()
@@ -1442,15 +1505,13 @@ for i in "${!H_FILE[@]}"; do
     continue
   fi
   SHOW[$i]=${H_TEXT[$i]}
-  SHOW_FILE[$i]=${H_FILE[$i]}
+  mask_names "${H_FILE[$i]}"; SHOW_FILE[$i]=$REPLY
+  if is_name_hit "$i"; then
+    mask_names "${H_TEXT[$i]}"; SHOW[$i]=$REPLY
+  fi
   if [[ -n "${CRED_RE["l${H_PAT[$i]}"]+x}" ]]; then
-    toks=${PATH_TOKS["p${H_FILE[$i]}"]-}
-    while [[ -n "$toks" ]]; do
-      tok=${toks%%$'\n'*}
-      toks=${toks#*$'\n'}
-      SHOW_FILE[$i]=${SHOW_FILE[$i]//"$tok"/"${tok:0:4}[redacted, ${#tok} chars]"}
-    done
     ph=1
+    [[ -z "${CRED_MARKER["l${H_PAT[$i]}"]+x}" ]] || ph=0
     SHOW[$i]=""
     for j in ${MT_OF[$i]}; do
       is_placeholder "${MT_TXT[j]}" || ph=0
@@ -1480,6 +1541,21 @@ else
   CSCOPE="credentials not scanned"
 fi
 SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodules not scanned, $SKIPPED_COUNT skipped by config, $ALLOWED_TOTAL allowed; $HSCOPE; $CSCOPE"
+
+# An allow rule may name a credential outright — the README's way to excuse
+# a stand-in — and the JSON report prints every rule: each credential in one
+# that is not a placeholder is masked there, like a hit's.
+ALLOW_SHOW=("${ALLOWLIST[@]}")
+if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 && "$CRED_RULES" -gt 0 ]]; then
+  printf '%s\n' "${ALLOWLIST[@]}" > "$TMPD/subj/allow-rules"
+  run_git "credential rules (allow rules)" "$TMPD/rmatch" \
+    in_c git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E "${CRED_E[@]}" -- allow-rules
+  while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
+    [[ "$l" =~ ^[0-9]+$ && -n "${ALLOW_SHOW[l - 1]+x}" ]] || die "internal error: allow-rule mask returned line $l"
+    is_placeholder "$m" && continue
+    ALLOW_SHOW[l - 1]=${ALLOW_SHOW[l - 1]//"$m"/"${m:0:4}[redacted, ${#m} chars]"}
+  done < "$TMPD/rmatch"
+fi
 
 # ─── output ───────────────────────────────────────────────────────────
 if [[ "$OUTPUT_MODE" == "json" ]]; then
@@ -1541,7 +1617,7 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
   for r in "${!ALLOWLIST[@]}"; do
     [[ "$first" -eq 1 ]] || printf ','
     first=0
-    printf '{"rule":"%s","count":%d}' "$(json_escape "${ALLOWLIST[$r]}")" "${ALLOW_COUNTS[$r]}"
+    printf '{"rule":"%s","count":%d}' "$(json_escape "${ALLOW_SHOW[$r]}")" "${ALLOW_COUNTS[$r]}"
   done
   if [[ "$HISTORY" -eq 1 ]]; then
     hr=null
