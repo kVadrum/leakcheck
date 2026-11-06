@@ -80,7 +80,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.10.1"
+VERSION="0.10.2"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -266,7 +266,7 @@ CREDENTIALS=(
   groq-key                    'gsk_[A-Za-z0-9]{52}'
   perplexity-key              'pplx-[A-Za-z0-9]{48}'
   xai-key                     'xai-[A-Za-z0-9]{80}'
-  huggingface-token           'hf_[A-Za-z]{34}|api_org_[A-Za-z]{34}'
+  huggingface-token           'hf_[A-Za-z0-9]{34}|api_org_[A-Za-z0-9]{34}'
   npm-token                   'npm_[A-Za-z0-9]{36}'
   pypi-token                  'pypi-AgE(IcHlwaS5vcmc|NdGVzdC5weXBpLm9yZw)[A-Za-z0-9_-]{50,}'
   rubygems-token              'rubygems_[a-f0-9]{48}'
@@ -870,7 +870,7 @@ if [[ "$HISTORY" -eq 1 ]]; then
   [[ "$HIST_COMMITS" =~ ^[0-9]+$ ]] || die "scan error: unexpected commit count: $HIST_COMMITS"
 fi
 
-if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
+if [[ "$HISTORY" -eq 1 ]]; then
   # log.diffMerges: since git 2.32 `-m` means the user's default, and
   # `combined` prints a merge as `diff --cc` with `@@@` hunks — a merge's own
   # lines then went unscanned, exit 0 (measured). Older git ignores the key,
@@ -878,6 +878,28 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
   HLOG=(-c log.showRoot=true -c core.quotePath=false -c log.diffMerges=separate
         log "${HREVS[@]}" --full-history --date-order --reverse --no-show-signature)
 
+  # Commit metadata, ref names and tags share one subject file, each distinct
+  # (field, text) once, at the first commit or ref that carries it.
+  M_SHA=()
+  M_FIELD=()
+  M_LINE=()
+  M_TEXT=()
+  declare -A M_SEEN=()
+  hm_add() { # commit field line text
+    local key="${#2}:$2:$4"
+    [[ -n "$4" && -z "${M_SEEN[$key]+x}" ]] || return 0
+    M_SEEN[$key]=1
+    M_SHA+=("$1"); M_FIELD+=("$2"); M_LINE+=("$3"); M_TEXT+=("$4")
+    printf '%s\n' "$4" >&9
+  }
+  exec 9>"$TMPD/subj/hm"
+fi
+
+# The commit passes. With no commits there is nothing for them to read, but
+# the ref pass after them still runs: a ref can end at a blob or a tree, and
+# a repo whose only ref was a tag named deploy-MYHOST on a blob reported
+# "0 refs", exit 0, through v0.10.1 (measured).
+if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
   # Old versions of the config ARE scanned: a hostname that sat in
   # .leakcheckrc before .leakcheckrc.local existed is still in every commit
   # that held it, and excluding the config's history (the first draft) hid
@@ -1089,19 +1111,6 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
     --format='%H%x00%an <%ae>%x00%cn <%ce>%x00%B'
   mapfile -d '' -t HM < "$TMPD/hmlog"
   (( ${#HM[@]} % 4 == 0 )) || die "scan error: unexpected commit metadata from git log"
-  M_SHA=()
-  M_FIELD=()
-  M_LINE=()
-  M_TEXT=()
-  declare -A M_SEEN=()
-  hm_add() { # commit field line text
-    local key="${#2}:$2:$4"
-    [[ -n "$4" && -z "${M_SEEN[$key]+x}" ]] || return 0
-    M_SEEN[$key]=1
-    M_SHA+=("$1"); M_FIELD+=("$2"); M_LINE+=("$3"); M_TEXT+=("$4")
-    printf '%s\n' "$4" >&5
-  }
-  exec 5>"$TMPD/subj/hm"
   for (( i = 0; i < ${#HM[@]}; i += 4 )); do
     sha=${HM[i]}
     hm_add "$sha" "(author)" 0 "${HM[i + 1]}"
@@ -1115,7 +1124,9 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
       hm_add "$sha" "(message)" "$k" "$ml"
     done
   done
+fi
 
+if [[ "$HISTORY" -eq 1 ]]; then
   # Ref names and annotated tags. A push of --all, --tags or --follow-tags
   # publishes them, and neither is part of any commit: a branch named
   # feature/MYHOST-fix and a tag message "built on MYHOST" were both clean
@@ -1124,7 +1135,8 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
   # and message, `(tag)`, `(tagger)`, `(tag message)`. With --history-range,
   # only the refs and tags that point into the range — those its push
   # carries. A ref that ends at a tree or a blob, not a commit, publishes
-  # content no diff shows: counted, and reported under --strict.
+  # content no diff shows: counted, and reported under --strict. This pass
+  # runs with or without commits.
   if [[ -n "$HIST_RANGE" ]]; then
     run_git "rev-list" "$TMPD/hrange" g rev-list "${HREVS[@]}" --
     declare -A IN_RANGE=()
@@ -1227,7 +1239,7 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
       done
     done
   done
-  exec 5>&-
+  exec 9>&-
   pass_patterns "history metadata" git -C "$TMPD/subj" grep --no-index -a -z -l -E "${CRED_E[@]}" -- hm
   for p in "${PASS_PATS[@]}"; do
     pat_args "$p"
@@ -1242,12 +1254,14 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
 
   # A .leakcheckrc.local committed at ANY point published its tells, even if
   # it is gone today: the same rule as for the tree, and for the same reason.
-  run_git "log (.leakcheckrc.local)" "$TMPD/hlocal" g "${HLOG[@]}" --format=%H \
-    -- ':(literal).leakcheckrc.local'
-  if [[ -s "$TMPD/hlocal" ]]; then
-    IFS= read -r sha < "$TMPD/hlocal"
-    add_hit "config:local-in-history" ".leakcheckrc.local" 0 \
-      "(a .leakcheckrc.local committed in history publishes the tells it held; remove it from history)" history "$sha"
+  if [[ "$HIST_COMMITS" -gt 0 ]]; then
+    run_git "log (.leakcheckrc.local)" "$TMPD/hlocal" g "${HLOG[@]}" --format=%H \
+      -- ':(literal).leakcheckrc.local'
+    if [[ -s "$TMPD/hlocal" ]]; then
+      IFS= read -r sha < "$TMPD/hlocal"
+      add_hit "config:local-in-history" ".leakcheckrc.local" 0 \
+        "(a .leakcheckrc.local committed in history publishes the tells it held; remove it from history)" history "$sha"
+    fi
   fi
 fi
 

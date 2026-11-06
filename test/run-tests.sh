@@ -1843,6 +1843,26 @@ t_history_tagged_blob_counted_and_strict() {
   assert_contains "(ref):0: [unscanned:tagged-blob] refs/tags/blobtag" "$LC_OUT"
 }
 
+t_history_refs_with_no_commits() {
+  # No commit anywhere, but `git push --tags` still publishes a tag on a
+  # blob, or an annotated tag on a tree, by name and message.
+  rc_file 'pattern MYHOST'
+  local blob tree
+  blob=$(printf 'x\n' | git hash-object -w --stdin)
+  tree=$(printf '100644 blob %s\tf\n' "$blob" | git mktree)
+  git tag deploy-MYHOST "$blob"
+  git tag -a -m "built on MYHOST" rel "$tree"
+  local tag; tag=$(git rev-parse rel)
+  [[ $(git rev-list --all --count) -eq 0 ]] || { echo "    fixture has a commit"; return 1; }
+  assert_exit 1 "$BIN" --history
+  assert_contains "$blob:(ref):0: [MYHOST] refs/tags/deploy-MYHOST" "$LC_OUT"
+  assert_contains "$tag:(tag message):1: [MYHOST] built on MYHOST" "$LC_OUT"
+  assert_contains "history scanned: 0 commits" "$LC_ERR"
+  assert_contains "2 refs, 1 annotated tags, 2 tagged trees or blobs not scanned" "$LC_ERR"
+  assert_exit 1 "$BIN" --history --strict
+  assert_contains "$tree:(ref):0: [unscanned:tagged-tree] refs/tags/rel" "$LC_OUT"
+}
+
 t_history_range_refs_in_range_only() {
   seed f.txt "x"
   commit one
@@ -2307,6 +2327,27 @@ t_credential_jwt_header_in_base64url() {
   assert_contains "a.txt:1: [credential:jwt] $(masked "$hdr.$payload.$sig")" "$LC_OUT"
 }
 
+t_credential_huggingface_token_with_digits() {
+  # Both Hugging Face prefixes, each body holding a digit.
+  local hf org
+  { read -r hf; read -r org; } < <(python3 -c '
+import random, string
+r = random.Random(11)
+def body():
+    while True:
+        s = "".join(r.choice(string.ascii_letters + string.digits) for _ in range(34))
+        if any(c.isdigit() for c in s):
+            return s
+print("h" "f_" + body())
+print("api" "_org_" + body())')
+  seed a.txt "HF_TOKEN=$hf"
+  seed b.txt "HF_ORG_TOKEN=$org"
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [credential:huggingface-token] $(masked "$hf")" "$LC_OUT"
+  assert_contains "b.txt:1: [credential:huggingface-token] $(masked "$org")" "$LC_OUT"
+}
+
 t_credential_in_a_name_is_masked_wherever_the_name_prints() {
   # A token in a path rides along in every hit's location in that file, and
   # in the text of a hit on the name itself; a token in a ref name, in an
@@ -2592,6 +2633,7 @@ lc_test "history: ref names"                          t_history_ref_names
 lc_test "history: annotated tag"                      t_history_annotated_tag
 lc_test "history: nested tag"                         t_history_nested_tag
 lc_test "history: tagged blob counted, --strict"      t_history_tagged_blob_counted_and_strict
+lc_test "history: refs with no commits"            t_history_refs_with_no_commits
 lc_test "history range: refs in the range only"       t_history_range_refs_in_range_only
 lc_test "history: tag holding NUL bytes"             t_history_tag_holding_nul_bytes
 lc_test "(?i): pattern in the tree"                   t_ignorecase_pattern_in_the_tree
@@ -2614,6 +2656,7 @@ lc_test "credentials: other hits keep their text"     t_credential_other_hits_ke
 lc_test "credentials: a key is never a placeholder"    t_credential_private_key_is_never_a_placeholder
 lc_test "credentials: zero bytes are not a run"       t_credential_zero_bytes_are_not_a_placeholder_run
 lc_test "credentials: base64url JWT header"           t_credential_jwt_header_in_base64url
+lc_test "credentials: Hugging Face token with digits" t_credential_huggingface_token_with_digits
 lc_test "credentials: masked wherever a name prints"  t_credential_in_a_name_is_masked_wherever_the_name_prints
 lc_test "credentials: masked in a JSON allow rule"    t_credential_in_an_allow_rule_is_masked_in_json
 lc_test "credentials: a type-changed config"          t_credential_rules_read_a_type_changed_config

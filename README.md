@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.10.1*
+*README v0.10.2*
 
 ## Install
 
@@ -194,6 +194,7 @@ Ref and tag hits use `(ref)`, `(tag)`, `(tagger)` or `(tag message)`, and lead w
 - **A `.leakcheckrc.local` committed at any point is a finding** (`config:local-in-history`), even if it was removed later.
 - **Binary files in history are skipped and counted**; `--strict` reports each.
 - **A ref that ends at a tree or a blob** instead of a commit publishes content no diff shows: counted as `tagged trees or blobs not scanned`, and reported under `--strict`.
+  Its name, and any annotated tag on the way, is scanned like any other, even in a repository with no commits at all.
 - **A shallow clone is refused** with exit `2`: its history is incomplete, and a clean verdict over part of it would be a lie.
   In GitHub Actions, check out with `fetch-depth: 0`.
 - **Commits no ref reaches** — reflog-only and dangling objects — are not scanned, because a push does not publish them.
@@ -432,7 +433,7 @@ To scan only what a pull request adds, pass its range; the shas go through `env`
 ./test/run-tests.sh
 ```
 
-The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist — a rule excuses only what it names — and its counts, `(?i)` at every site a pattern reaches git, `--strict`, the JSON shape and its escaping, every credential rule against a stand-in for its own format (each hitting exactly once, never printed), credentials at every place a pattern reaches, the stand-in rule at its threshold, real keys whose structure looks like a stand-in, and the masking, file names holding spaces, colons and newlines, and `--history` — merges (under `log.diffMerges=combined` too), a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, once-per-finding reporting, ref names and annotated tags (nested, and holding NUL bytes) — and `--history-range`, in every pass and in a shallow clone.
+The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist — a rule excuses only what it names — and its counts, `(?i)` at every site a pattern reaches git, `--strict`, the JSON shape and its escaping, every credential rule against a stand-in for its own format (each hitting exactly once, never printed), credentials at every place a pattern reaches, the stand-in rule at its threshold, real keys whose structure looks like a stand-in, and the masking, file names holding spaces, colons and newlines, and `--history` — merges (under `log.diffMerges=combined` too), a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, once-per-finding reporting, ref names and annotated tags (nested, holding NUL bytes, and in a repository with no commits) — and `--history-range`, in every pass and in a shallow clone.
 Each test runs in its own throwaway repo with your git hooks disabled.
 It needs bash 4.4+, git and python3 (for JSON round-trip checks; leakcheck itself never uses python3).
 `LEAKCHECK_BIN=/path/to/leakcheck ./test/run-tests.sh` runs the suite against another build.
