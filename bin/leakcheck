@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # leakcheck — scan a repo's tracked files for workspace-internal references
-# (host paths, internal names) before the repo goes public.
+# (host paths, internal names) and credentials before the repo goes public.
 #
 # Scans the whole repo from its top level, wherever it is run: the index
 # (what the next commit publishes) AND the worktree copy of every tracked
 # file, plus every tracked path name and symlink target. Reads default
 # patterns + the optional .leakcheckrc and .leakcheckrc.local at the repo
 # top level (keep the .local one gitignored); --config replaces both.
+# Built-in credential rules find keys and tokens in formats their issuers
+# fixed (cloud, AI and git-host keys, webhooks, private key headers); a
+# credential hit is labelled credential:<id> and printed masked.
 #
 # Usage:
 #   leakcheck                    # scan with defaults + .leakcheckrc(.local)
@@ -33,7 +36,8 @@
 #                            # path:line:text, or path:line:<match> for
 #                            # every match of the hit's own pattern there
 #   skip    <glob>           # skip paths matching glob (git pathspec, top-relative)
-#   no-defaults              # disable the built-in default pattern set
+#   no-defaults              # disable the built-in home-path patterns
+#   no-credentials           # disable the built-in credential rules
 #
 # Blank lines and lines starting with '#' are ignored. Name and symlink hits
 # report line 0.
@@ -76,7 +80,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.9.0"
+VERSION="0.10.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -221,10 +225,92 @@ DEFAULTS=(
   '[A-Za-z]:(\\\\|\\)[Uu][Ss][Ee][Rr][Ss](\\\\|\\)([A-Za-z0-9_][A-Za-z0-9_.-]*[^ -~]|[^ -~]+[A-Za-z0-9_])([A-Za-z0-9_.-]|[^ -~])*(\\\\|\\)'
 )
 
+# Credential rules, on by default (`no-credentials` turns them off): each
+# names one format by a prefix or shape the issuer fixed, so a match is a
+# credential, or a stand-in written to look like one. Formats with no such
+# anchor (an AWS secret key, a password, `token = <anything>`) are not here:
+# telling them from ordinary text needs a keyword, the value and its entropy,
+# which one ERE per rule cannot weigh. A hit is labelled `credential:<id>`
+# and printed masked; allow rules and the placeholder check see the real
+# text. No `\b`: git's ERE is the system regex, and one that reads `\b` as a
+# plain `b` would make a rule match nothing, silently. A rule may match
+# inside a longer run (a key pasted into a larger blob is still a key).
+# The first two name a header, not the secret, and print it alone. A PEM
+# header counts only where a key can follow it: at the end of its line, or
+# before a body (64 base64 characters, or an armor header such as
+# Proc-Type:) on the same line, after nothing, spaces or an escaped newline,
+# or before a closing quote, as in a key built from one string per line.
+# All five headers a measurement over real repositories' histories found
+# were stand-ins: a string constant holding the header alone, or a test
+# fixture with a body of `xx` or `not a key`.
+CRED_MARKERS=(private-key putty-private-key)
+CREDENTIALS=(
+  private-key                 $'-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY( BLOCK)?-----([[:space:]]*$|[[:space:]]*[A-Za-z0-9+/=\\\\]{64}|(\\\\+r)?\\\\+n(["\'`]|[A-Za-z-]+: ))'
+  putty-private-key           'PuTTY-User-Key-File-[0-9]+:'
+  aws-access-key-id           '(A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}'
+  github-token                'gh[pousr]_[A-Za-z0-9]{36}'
+  github-fine-grained-token   'github_pat_[A-Za-z0-9_]{22,}'
+  gitlab-token                'gl(pat|ptt|rt|dt|soat|cbt|ft|imt|agent|oas)-[A-Za-z0-9_-]{20,}|GR1348941[A-Za-z0-9_-]{20}'
+  slack-token                 'xox[abeoprs]-[A-Za-z0-9-]{10,}|xapp-[0-9]-[A-Za-z0-9-]{10,}'
+  slack-webhook               'hooks\.slack\.com/(services|workflows|triggers)/[A-Za-z0-9+/]{43,}'
+  discord-webhook             'discord(app)?\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,}'
+  teams-webhook               '\.webhook\.office\.com/webhookb2/[A-Za-z0-9@/-]{60,}'
+  stripe-key                  '[rs]k_(live|test|prod)_[A-Za-z0-9]{24,}'
+  webhook-signing-secret      'whsec_[A-Za-z0-9+/=]{24,}'
+  google-api-key              'AIza[A-Za-z0-9_-]{35}'
+  google-oauth-client-secret  'GOCSPX-[A-Za-z0-9_-]{28}'
+  anthropic-key               'sk-ant-[A-Za-z0-9_-]{20,}'
+  openai-key                  'sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{40,}'
+  openrouter-key              'sk-or-v1-[a-f0-9]{64}'
+  deepseek-key                'sk-[a-f0-9]{32}'
+  groq-key                    'gsk_[A-Za-z0-9]{52}'
+  perplexity-key              'pplx-[A-Za-z0-9]{48}'
+  xai-key                     'xai-[A-Za-z0-9]{80}'
+  huggingface-token           'hf_[A-Za-z]{34}|api_org_[A-Za-z]{34}'
+  npm-token                   'npm_[A-Za-z0-9]{36}'
+  pypi-token                  'pypi-AgE(IcHlwaS5vcmc|NdGVzdC5weXBpLm9yZw)[A-Za-z0-9_-]{50,}'
+  rubygems-token              'rubygems_[a-f0-9]{48}'
+  clojars-token               'CLOJARS_[a-z0-9]{60}'
+  sendgrid-key                'SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'
+  brevo-key                   'x(keysib|smtpsib)-[a-f0-9]{64}-[A-Za-z0-9]{16}'
+  mailchimp-key               '[0-9a-f]{32}-us[0-9]{1,2}'
+  twilio-api-key              'SK[0-9a-fA-F]{32}'
+  digitalocean-token          'do[opr]_v1_[a-f0-9]{64}'
+  shopify-token               'shp(at|ca|pa|ss)_[a-fA-F0-9]{32}'
+  jwt                         'ey[A-Za-z0-9]{17,}\.ey[A-Za-z0-9/\\_-]{17,}\.([A-Za-z0-9/\\_-]{10,}={0,2})?'
+  age-secret-key              'AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}'
+  vault-token                 'hv[sb]\.[A-Za-z0-9_-]{90,}'
+  terraform-cloud-token       '[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9_=-]{60,70}'
+  doppler-token               'dp\.(pt|st|sa|ct|scim|audit)\.[A-Za-z0-9]{40,44}'
+  linear-api-key              'lin_api_[A-Za-z0-9]{40}'
+  postman-api-key             'PMAK-[a-fA-F0-9]{24}-[a-fA-F0-9]{34}'
+  sentry-token                'sntrys_eyJ[A-Za-z0-9+/=_]{50,}|sntryu_[a-f0-9]{64}'
+  grafana-token               'glc_[A-Za-z0-9+/]{32,}={0,2}|glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}'
+  databricks-token            'dapi[a-f0-9]{32}(-[0-9])?'
+  atlassian-token             'ATATT3[A-Za-z0-9_=-]{186}'
+  notion-token                'ntn_[0-9]{11}[A-Za-z0-9]{35}'
+  1password-token             'ops_eyJ[A-Za-z0-9+/]{250,}={0,3}|A3-[A-Z0-9]{6}-([A-Z0-9]{11}|[A-Z0-9]{6}-[A-Z0-9]{5})-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}'
+  facebook-token              'EAA[MC][A-Za-z0-9]{100,}'
+  square-token                'sq0(atp|csp)-[A-Za-z0-9_-]{22,}'
+  pulumi-token                'pul-[a-f0-9]{40}'
+  planetscale-token           'pscale_(tkn|oauth|pw)_[A-Za-z0-9=._-]{32,64}'
+  flyio-token                 'fo1_[A-Za-z0-9_-]{43}|fm[12][ar]?_[A-Za-z0-9+/]{100,}={0,3}'
+  dynatrace-token             'dt0c01\.[A-Za-z0-9]{24}\.[A-Za-z0-9]{64}'
+  tailscale-key               'tskey-(auth|api|client|scim|webhook)-[A-Za-z0-9]{4,}-[A-Za-z0-9]{16,}'
+  heroku-key                  'HRKU-AA[A-Za-z0-9_-]{58}'
+  supabase-key                'sbp_[a-f0-9]{40}|sb_secret_[A-Za-z0-9_-]{20,}'
+  azure-storage-key           'AccountKey=[A-Za-z0-9+/]{86}=='
+  azure-ad-client-secret      '[A-Za-z0-9_~.]{3}[0-9]Q~[A-Za-z0-9_~.-]{31,34}'
+  new-relic-key               'NRAK-[A-Z0-9]{27}|NRII-[A-Za-z0-9_-]{32}'
+  cloudflare-origin-ca-key    'v1\.0-[a-f0-9]{24}-[a-f0-9]{146}'
+  mapbox-secret-token         'sk\.eyJ1[A-Za-z0-9._-]{50,}'
+)
+
 PATTERNS=()
 ALLOWLIST=()
 SKIPS=()
 USE_DEFAULTS=1
+USE_CREDENTIALS=1
 
 # POSIX ERE has no \d, \t or \x: git's regex reads `\` before an ordinary
 # letter as that letter, so `SECRET-\d+` and a single-backslash
@@ -311,6 +397,7 @@ parse_config() { # path name-for-messages
         esac
         ;;
       no-defaults)   USE_DEFAULTS=0 ;;
+      no-credentials) USE_CREDENTIALS=0 ;;
       *)             die "$name: unknown directive: $keyword" ;;
     esac
   done < "$file"
@@ -319,13 +406,47 @@ for i in "${!CONFIG_FILES[@]}"; do
   parse_config "${CONFIG_FILES[$i]}" "${CONFIG_NAMES[$i]}"
 done
 
+# A credential rule's label is `credential:<id>`; every other pattern is its
+# own label. CRED_RE maps a label to its ERE, so a config pattern spelled
+# like a label would be read as that rule's regex: refused.
+declare -A CRED_RE=() CRED_MARKER=()
+CRED_LABELS=()
+for (( i = 0; i < ${#CREDENTIALS[@]}; i += 2 )); do
+  CRED_RE["lcredential:${CREDENTIALS[i]}"]=${CREDENTIALS[i + 1]}
+  CRED_LABELS+=("credential:${CREDENTIALS[i]}")
+done
+for id in "${CRED_MARKERS[@]}"; do CRED_MARKER["lcredential:$id"]=1; done
+for p in "${PATTERNS[@]}"; do
+  [[ -z "${CRED_RE["l$p"]+x}" ]] || die "pattern '$p' is the name of a built-in credential rule; write the ERE you mean"
+done
+CRED_RULES=0
 if [[ "$USE_DEFAULTS" -eq 1 ]]; then
   PATTERNS=("${DEFAULTS[@]}" "${PATTERNS[@]}")
 fi
+# After the config's patterns, so --list-patterns and the hit order only
+# ever gain lines at the end.
+if [[ "$USE_CREDENTIALS" -eq 1 ]]; then
+  PATTERNS+=("${CRED_LABELS[@]}")
+  CRED_RULES=${#CRED_LABELS[@]}
+fi
+
+# pat_args <label>: re_args for the ERE behind a pattern label, and in
+# RE_LOC how to run it. A credential rule runs in the C locale: it is ASCII
+# throughout, so it matches the same bytes there, and git's regex runs over
+# ten times faster than under UTF-8 (18 s against 1.4 s, 59 rules over 24 MB
+# of history: measured). A config pattern keeps the caller's locale.
+in_c() { LC_ALL=C "$@"; }
+pat_args() {
+  if [[ -n "${CRED_RE["l$1"]+x}" ]]; then
+    re_args "${CRED_RE["l$1"]}"; RE_LOC=(in_c)
+  else
+    re_args "$1"; RE_LOC=()
+  fi
+}
 
 if [[ "$LIST_ONLY" -eq 1 ]]; then
   for p in "${PATTERNS[@]}"; do
-    printf '%s\n' "$p"
+    printf '%s\n' "${CRED_RE["l$p"]:-$p}"
   done
   exit 0
 fi
@@ -404,6 +525,27 @@ GREP_FLAGS=(-z --no-color --no-column --no-textconv --no-recurse-submodules)
 # goes through here.
 re_args() {
   if [[ "$1" == '(?i)'* ]]; then RE_ARGS=(-i -E -e "${1:4}"); else RE_ARGS=(-E -e "$1"); fi
+}
+
+# Credential rules go to git once per pass first, all of them as one -l
+# grep: most subjects hold no credential, and one process beats one per rule
+# (59 of them took a scan of a small repo from 0.1 s to 1.2 s). Same engine,
+# flags and subject as each rule's own run, so where this finds nothing no
+# rule could. pass_patterns <label> <git grep command with "${CRED_E[@]}">
+# sets PASS_PATS: every pattern, less the credential rules on a miss.
+CRED_E=()
+for p in "${PATTERNS[@]}"; do
+  if [[ -n "${CRED_RE["l$p"]+x}" ]]; then CRED_E+=(-e "${CRED_RE["l$p"]}"); fi
+done
+OTHER_PATS=("${PATTERNS[@]:0:${#PATTERNS[@]}-CRED_RULES}")
+pass_patterns() {
+  local label=$1
+  shift
+  PASS_PATS=("${PATTERNS[@]}")
+  if [[ "$CRED_RULES" -eq 0 ]]; then return 0; fi
+  run_git "credential rules ($label)" "$TMPD/cpre" in_c "$@"
+  if [[ ! -s "$TMPD/cpre" ]]; then PASS_PATS=("${OTHER_PATS[@]}"); fi
+  return 0
 }
 
 # ─── what is tracked ──────────────────────────────────────────────────
@@ -522,14 +664,21 @@ add_hit() { # pattern file line text source [commit]
 # pattern is compiled by git: an invalid ERE exits 128 here, where GNU grep
 # behind `2>/dev/null || true` once made it match nothing, forever.
 # --no-column is load-bearing: grep.column=true in a user's gitconfig adds a
-# field and shifts the parse.
+# field and shifts the parse. A credential rule reads the config's content
+# too: the exemption exists because pattern lines match themselves, which no
+# credential rule's does, and a key pasted into a committed .leakcheckrc is
+# published like any other.
 content_pass() { # source [git grep args...]
   local src=$1 p f l t
+  local -a ex
   shift
-  for p in "${PATTERNS[@]}"; do
-    re_args "$p"
+  pass_patterns "$src" g grep "$@" "${GREP_FLAGS[@]}" -l -I -E "${CRED_E[@]}" -- . "${skip_excludes[@]}"
+  for p in "${PASS_PATS[@]}"; do
+    pat_args "$p"
+    ex=("${excludes[@]}")
+    if [[ -n "${CRED_RE["l$p"]+x}" ]]; then ex=("${skip_excludes[@]}"); fi
     run_git "pattern '$p' ($src)" "$TMPD/hits" \
-      g grep "$@" "${GREP_FLAGS[@]}" -n -I -H --full-name "${RE_ARGS[@]}" -- . "${excludes[@]}"
+      "${RE_LOC[@]}" g grep "$@" "${GREP_FLAGS[@]}" -n -I -H --full-name "${RE_ARGS[@]}" -- . "${ex[@]}"
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       add_hit "$p" "$f" "$l" "$t" "$src"
     done < "$TMPD/hits"
@@ -571,10 +720,11 @@ if [[ ${#TC_PATHS[@]} -gt 0 ]]; then
   run_git "binary sniff (type changes)" "$TMPD/text" gni -z -I -l -e '' -- .
   binary_rows
   for k in "${BINARY_ROWS[@]}"; do mark_binary "${TC_PATHS[$k]}" worktree; done
-  for p in "${PATTERNS[@]}"; do
-    re_args "$p"
+  pass_patterns "type changes" gni -z -l -I -E "${CRED_E[@]}" -- .
+  for p in "${PASS_PATS[@]}"; do
+    pat_args "$p"
     run_git "pattern '$p' (type changes)" "$TMPD/hits" \
-      gni -z -n -I --no-color --no-column "${RE_ARGS[@]}" -- .
+      "${RE_LOC[@]}" gni -z -n -I --no-color --no-column "${RE_ARGS[@]}" -- .
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       # An indexed subscript is arithmetic: a non-numeric name would quietly
       # map to entry 0, so check the shape before the lookup.
@@ -625,10 +775,11 @@ else
   : > "$TMPD/subj/s"
 fi
 
-for p in "${PATTERNS[@]}"; do
-  re_args "$p"
+pass_patterns "names" git -C "$TMPD/subj" grep --no-index -a -z -l -E "${CRED_E[@]}" -- s
+for p in "${PASS_PATS[@]}"; do
+  pat_args "$p"
   run_git "pattern '$p' (names)" "$TMPD/shits" \
-    git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- s
+    "${RE_LOC[@]}" git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- s
   while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
     i="${SUBJ_OF_LINE[$l]:-}"
     [[ -n "$i" ]] || die "internal error: names pass returned line $l"
@@ -819,15 +970,17 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
     add_hit "$2" "$3" "$4" "$5" history "$6"
   }
 
-  for p in "${PATTERNS[@]}"; do
-    re_args "$p"
+  pass_patterns "history" git -C "$TMPD/subj" grep --no-index -a -z -l -E "${CRED_E[@]}" -- h
+  for p in "${PASS_PATS[@]}"; do
+    pat_args "$p"
     run_git "pattern '$p' (history)" "$TMPD/hhits" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- h
+      "${RE_LOC[@]}" git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- h
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       m="${HMETA[l - 1]-}"
       [[ -n "$m" ]] || die "internal error: history pass returned line $l"
       fc=${m%% *}
-      if [[ -n "$CONFIG_REL" && "${FC_PATH[fc]}" == "$CONFIG_REL" && -n "${CUR_CFG["l$t"]+x}" ]]; then
+      if [[ -n "$CONFIG_REL" && "${FC_PATH[fc]}" == "$CONFIG_REL" && -n "${CUR_CFG["l$t"]+x}" &&
+            -z "${CRED_RE["l$p"]+x}" ]]; then
         CFG_EXEMPT["l$t"]=1
         continue
       fi
@@ -855,10 +1008,11 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
     done
   done
   exec 5>&-
-  for p in "${PATTERNS[@]}"; do
-    re_args "$p"
+  pass_patterns "history names" git -C "$TMPD/subj" grep --no-index -a -z -l -E "${CRED_E[@]}" -- hn
+  for p in "${PASS_PATS[@]}"; do
+    pat_args "$p"
     run_git "pattern '$p' (history names)" "$TMPD/hhits" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- hn
+      "${RE_LOC[@]}" git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- hn
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       e="${HN_OF_LINE[l]-}"
       [[ -n "$e" ]] || die "internal error: history names pass returned line $l"
@@ -1036,10 +1190,11 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
     done
   done
   exec 5>&-
-  for p in "${PATTERNS[@]}"; do
-    re_args "$p"
+  pass_patterns "history metadata" git -C "$TMPD/subj" grep --no-index -a -z -l -E "${CRED_E[@]}" -- hm
+  for p in "${PASS_PATS[@]}"; do
+    pat_args "$p"
     run_git "pattern '$p' (history metadata)" "$TMPD/hhits" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- hm
+      "${RE_LOC[@]}" git -C "$TMPD/subj" grep --no-index -a -z -n --no-color --no-column "${RE_ARGS[@]}" -- hm
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       i=$((l - 1))
       [[ -n "${M_SHA[i]-}" ]] || die "internal error: history metadata pass returned line $l"
@@ -1104,18 +1259,24 @@ ALLOWED=()
 ALLOW_COUNTS=()
 for i in "${!H_FILE[@]}"; do ALLOWED[$i]=0; done
 for r in "${!ALLOWLIST[@]}"; do ALLOW_COUNTS[$r]=0; done
-if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
-  # lines_of <string>: how many lines a record takes in a subject file (a
-  # path or text may hold a newline).
-  lines_of() { local nl=${1//[!$'\n']/}; REPLY=$(( ${#nl} + 1 )); }
-
+# lines_of <string>: how many lines a record takes in a subject file (a
+# path or text may hold a newline).
+lines_of() { local nl=${1//[!$'\n']/}; REPLY=$(( ${#nl} + 1 )); }
+# The matches are needed by the allow rules, and by every credential hit,
+# which prints them masked and is judged on them by the placeholder check.
+NEED_MT=0
+if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then NEED_MT=1; fi
+for i in "${!H_FILE[@]}"; do
+  if [[ -n "${CRED_RE["l${H_PAT[$i]}"]+x}" ]]; then NEED_MT=1; break; fi
+done
+MT_HIT=(); MT_TXT=(); MT_OF=()
+if [[ "$NEED_MT" -eq 1 ]]; then
   # Every match of each hit's own pattern, as text. A text the pattern finds
   # no non-empty match in as displayed (an anchored pattern on a
   # `-> target` symlink hit), or that no pattern produced (unscanned:binary
   # and the other pseudo-patterns), counts as one match: the whole text.
   declare -A IS_PAT=() BY_PAT=()
   for p in "${PATTERNS[@]}"; do IS_PAT["l$p"]=1; done
-  MT_HIT=(); MT_TXT=(); MT_OF=()
   for i in "${!H_FILE[@]}"; do
     MT_OF[$i]=""
     BY_PAT["l${H_PAT[$i]}"]+="$i "
@@ -1131,12 +1292,12 @@ if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
       for (( k = 0; k < REPLY; k++ )); do n=$((n + 1)); T_HIT[n]=$i; done
     done
     exec 6>&-
-    re_args "$p"
-    run_git "pattern '$p' (allow)" "$TMPD/tmatch" \
-      git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column "${RE_ARGS[@]}" -- t
+    pat_args "$p"
+    run_git "pattern '$p' (matches)" "$TMPD/tmatch" \
+      "${RE_LOC[@]}" git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column "${RE_ARGS[@]}" -- t
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
       i=${T_HIT[l]:-}
-      [[ -n "$i" ]] || die "internal error: allow match pass returned line $l"
+      [[ -n "$i" ]] || die "internal error: match pass returned line $l"
       MT_OF[$i]+="${#MT_HIT[@]} "
       MT_HIT+=("$i"); MT_TXT+=("$m")
     done < "$TMPD/tmatch"
@@ -1147,7 +1308,9 @@ if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
       MT_HIT+=("$i"); MT_TXT+=("${H_TEXT[$i]}")
     fi
   done
+fi
 
+if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
   # Subjects: a holds each hit's whole line, m one line per match; each
   # subject line maps back to its hit (or match).
   A_OF=(); A_TXT=(); A_LINES=(); M_OF=()
@@ -1217,14 +1380,90 @@ if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
   done
 fi
 
+# ─── credentials ──────────────────────────────────────────────────────
+# A credential hit prints its matches masked, never its line: the line may
+# hold a second secret no rule knows. It prints its path with every
+# credential the name passes found there masked too, since a token in a file
+# name would otherwise ride along in the location of every hit in that file.
+# A hit whose every match is a stand-in (is_placeholder) is not reported, and
+# is counted. Each test is something a random secret all but never does — 8
+# equal characters in a row, or 8 letters or digits counting up, is under one
+# in a million even for a 64-character hex key — and that docs and fixtures
+# do all the time: an X-filled key, an alphabet run, AWS's documented key
+# ending in EXAMPLE.
+is_placeholder() { # match
+  local LC_ALL=C m=$1 i c o prev=-2 same=0 up=0
+  if [[ "$m" == *EXAMPLE* || "$m" == *example* ]]; then return 0; fi
+  for (( i = 0; i < ${#m}; i++ )); do
+    c=${m:i:1}
+    printf -v o '%d' "'$c"
+    if (( o == prev )); then same=$((same + 1)); else same=1; fi
+    if (( o == prev + 1 )) && [[ "$c" == [A-Za-z0-9] && "${m:i-1:1}" == [A-Za-z0-9] ]]; then
+      up=$((up + 1))
+    else
+      up=1
+    fi
+    if (( same >= 8 || up >= 8 )); then return 0; fi
+    prev=$o
+  done
+  return 1
+}
+# cred_show <label> <match>: a header as found; anything else as its first
+# four characters and its length.
+cred_show() {
+  local h
+  if [[ "$2" == -----BEGIN* ]]; then
+    h=${2#-----}
+    REPLY="-----${h%%-----*}-----"
+  elif [[ -n "${CRED_MARKER["l$1"]+x}" ]]; then
+    REPLY=$2
+  else
+    REPLY="${2:0:4}[redacted, ${#2} chars]"
+  fi
+}
+
+# Credentials in path names, from the name hits (line 0, text = the path).
+declare -A PATH_TOKS=()
+for i in "${!H_FILE[@]}"; do
+  if [[ -n "${CRED_RE["l${H_PAT[$i]}"]+x}" && "${H_LINE[$i]}" == 0 && "${H_FILE[$i]}" == "${H_TEXT[$i]}" ]]; then
+    for j in ${MT_OF[$i]}; do PATH_TOKS["p${H_FILE[$i]}"]+="${MT_TXT[j]}"$'\n'; done
+  fi
+done
+
 KEEP=()
+SHOW=()
+SHOW_FILE=()
 ALLOWED_TOTAL=0
+CRED_FOUND=0
+CRED_PLACEHOLDERS=0
 for i in "${!H_FILE[@]}"; do
   if [[ "${ALLOWED[$i]}" -eq 1 ]]; then
     ALLOWED_TOTAL=$((ALLOWED_TOTAL + 1))
-  else
-    KEEP+=("$i")
+    continue
   fi
+  SHOW[$i]=${H_TEXT[$i]}
+  SHOW_FILE[$i]=${H_FILE[$i]}
+  if [[ -n "${CRED_RE["l${H_PAT[$i]}"]+x}" ]]; then
+    toks=${PATH_TOKS["p${H_FILE[$i]}"]-}
+    while [[ -n "$toks" ]]; do
+      tok=${toks%%$'\n'*}
+      toks=${toks#*$'\n'}
+      SHOW_FILE[$i]=${SHOW_FILE[$i]//"$tok"/"${tok:0:4}[redacted, ${#tok} chars]"}
+    done
+    ph=1
+    SHOW[$i]=""
+    for j in ${MT_OF[$i]}; do
+      is_placeholder "${MT_TXT[j]}" || ph=0
+      cred_show "${H_PAT[$i]}" "${MT_TXT[j]}"
+      SHOW[$i]+="${SHOW[$i]:+ }$REPLY"
+    done
+    if [[ "$ph" -eq 1 ]]; then
+      CRED_PLACEHOLDERS=$((CRED_PLACEHOLDERS + 1))
+      continue
+    fi
+    CRED_FOUND=$((CRED_FOUND + 1))
+  fi
+  KEEP+=("$i")
 done
 HIT_COUNT=${#KEEP[@]}
 
@@ -1235,7 +1474,12 @@ if [[ "$HISTORY" -eq 1 ]]; then
 else
   HSCOPE="history not scanned"
 fi
-SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodules not scanned, $SKIPPED_COUNT skipped by config, $ALLOWED_TOTAL allowed; $HSCOPE"
+if [[ "$CRED_RULES" -gt 0 ]]; then
+  CSCOPE="credentials scanned, $CRED_PLACEHOLDERS placeholders not reported"
+else
+  CSCOPE="credentials not scanned"
+fi
+SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodules not scanned, $SKIPPED_COUNT skipped by config, $ALLOWED_TOTAL allowed; $HSCOPE; $CSCOPE"
 
 # ─── output ───────────────────────────────────────────────────────────
 if [[ "$OUTPUT_MODE" == "json" ]]; then
@@ -1285,8 +1529,8 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
     [[ "$first" -eq 1 ]] || printf ','
     first=0
     printf '{"file":"%s","line":%s,"pattern":"%s","text":"%s","source":"%s"' \
-      "$(json_escape "${H_FILE[$i]}")" "${H_LINE[$i]}" "$(json_escape "${H_PAT[$i]}")" \
-      "$(json_escape "${H_TEXT[$i]}")" "${H_SRC[$i]}"
+      "$(json_escape "${SHOW_FILE[$i]}")" "${H_LINE[$i]}" "$(json_escape "${H_PAT[$i]}")" \
+      "$(json_escape "${SHOW[$i]}")" "${H_SRC[$i]}"
     # Only history hits carry a commit; every other hit keeps its v0.3.0 shape.
     if [[ -n "${H_COMMIT[$i]}" ]]; then printf ',"commit":"%s"' "${H_COMMIT[$i]}"; fi
     printf '}'
@@ -1302,10 +1546,15 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
   if [[ "$HISTORY" -eq 1 ]]; then
     hr=null
     if [[ -n "$HIST_RANGE" ]]; then hr="\"$(json_escape "$HIST_RANGE")\""; fi
-    printf '],"history_scanned":true,"history":{"commits":%d,"binary":%d,"skipped":%d,"config_lines_exempt":%d,"range":%s,"refs":%d,"tags":%d,"tagged_unscanned":%d}}\n' \
+    printf '],"history_scanned":true,"history":{"commits":%d,"binary":%d,"skipped":%d,"config_lines_exempt":%d,"range":%s,"refs":%d,"tags":%d,"tagged_unscanned":%d}' \
       "$HIST_COMMITS" "$HIST_BINARY" "$HIST_SKIPPED" "${#CFG_EXEMPT[@]}" "$hr" "$HIST_REFS" "$HIST_TAGS" "$HIST_TAGGED"
   else
-    printf '],"history_scanned":false}\n'
+    printf '],"history_scanned":false'
+  fi
+  if [[ "$CRED_RULES" -gt 0 ]]; then
+    printf ',"credentials_scanned":true,"credentials":{"rules":%d,"placeholders":%d}}\n' "$CRED_RULES" "$CRED_PLACEHOLDERS"
+  else
+    printf ',"credentials_scanned":false}\n'
   fi
 else
   # One hit, one line. A field holding a newline — only a path name or a
@@ -1331,11 +1580,14 @@ else
     for i in "${KEEP[@]}"; do
       # A history hit leads with its commit: <sha>:path:line: [pattern] text.
       if [[ -n "${H_COMMIT[$i]}" ]]; then printf '%s:' "${H_COMMIT[$i]}"; fi
-      printf '%s:%s: [%s] %s\n' "$(line_safe "${H_FILE[$i]}")" "${H_LINE[$i]}" \
-        "${H_PAT[$i]}" "$(line_safe "${H_TEXT[$i]}")"
+      printf '%s:%s: [%s] %s\n' "$(line_safe "${SHOW_FILE[$i]}")" "${H_LINE[$i]}" \
+        "${H_PAT[$i]}" "$(line_safe "${SHOW[$i]}")"
     done
     echo "leakcheck: $HIT_COUNT match(es)" >&2
     echo "leakcheck: scanned $TRACKED_COUNT tracked files ($SCOPE)" >&2
+    if [[ "$CRED_FOUND" -gt 0 ]]; then
+      echo "leakcheck: $CRED_FOUND credential(s) among these: revoke and reissue any that has left this machine; deleting one from the files or the history does not revoke it" >&2
+    fi
   fi
 fi
 

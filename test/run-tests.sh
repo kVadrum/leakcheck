@@ -25,7 +25,117 @@ ONLY="${1:-}"
 
 LC_OUT="$(mktemp -t lc-out.XXXXXX)"
 LC_ERR="$(mktemp -t lc-err.XXXXXX)"
-trap 'rm -f "$LC_OUT" "$LC_ERR"' EXIT
+# Stand-in credentials, one per built-in credential rule, built at run time
+# from a fixed seed: this file is public, and is scanned by leakcheck and by
+# other scanners, so it holds no token, nor anything a credential rule
+# matches. Each row: rule id, a line holding the stand-in, the exact match.
+CRED_TSV="$(mktemp -t lc-cred.XXXXXX)"
+trap 'rm -f "$LC_OUT" "$LC_ERR" "$CRED_TSV"' EXIT
+python3 - > "$CRED_TSV" <<'PY'
+import random
+r = random.Random(20261105)
+CS = {
+    "an": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+    "an-_": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
+    "an_": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_",
+    "UD": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    "a": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+    "d": "0123456789",
+    "hex": "0123456789abcdef",
+    "b64": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+    "bech": "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L",
+    "lan": "abcdefghijklmnopqrstuvwxyz0123456789",
+}
+def stand_in_ok(s):
+    # Never a placeholder shape: those are excused (and tested on their own).
+    for i in range(len(s) - 7):
+        w = s[i:i + 8]
+        if len(set(w)) == 1 or all(ord(w[k + 1]) == ord(w[k]) + 1 for k in range(7)):
+            return False
+    return "EXAMPLE" not in s and "example" not in s
+def gen(spec):
+    while True:
+        s = "".join(p if isinstance(p, str) else "".join(r.choice(CS[p[0]]) for _ in range(p[1])) for p in spec)
+        if stand_in_ok(s):
+            return s
+GUID = [("hex", 8), "-", ("hex", 4), "-", ("hex", 4), "-", ("hex", 4), "-", ("hex", 12)]
+# id: (text before the match on its line, the match's parts)
+SPECS = {
+ "private-key": ("KEY=", ["-----BEGIN RSA ", "PRIVATE KEY-----"]),
+ "putty-private-key": ("", ["PuTTY-User-", "Key-File-3:"]),
+ "aws-access-key-id": ("KEY=", ["AK", "IA", ("UD", 16)]),
+ "github-token": ("KEY=", ["gh", "p_", ("an", 36)]),
+ "github-fine-grained-token": ("KEY=", ["github", "_pat_", ("an_", 82)]),
+ "gitlab-token": ("KEY=", ["gl", "pat-", ("an-_", 20)]),
+ "slack-token": ("KEY=", ["xo", "xb-", ("d", 12), "-", ("d", 13), "-", ("an", 24)]),
+ "slack-webhook": ("URL=https://", ["hooks", ".slack.com/services/T", ("UD", 10), "/B", ("UD", 10), "/", ("an", 24)]),
+ "discord-webhook": ("URL=https://", ["discord", ".com/api/webhooks/", ("d", 18), "/", ("an-_", 68)]),
+ "teams-webhook": ("URL=https://acme", [".webhook", ".office.com/webhookb2/"] + GUID + ["@"] + GUID + ["/IncomingWebhook/", ("hex", 32), "/"] + GUID),
+ "stripe-key": ("KEY=", ["sk", "_live_", ("an", 24)]),
+ "webhook-signing-secret": ("KEY=", ["wh", "sec_", ("an", 32)]),
+ "google-api-key": ("KEY=", ["AI", "za", ("an-_", 35)]),
+ "google-oauth-client-secret": ("KEY=", ["GOC", "SPX-", ("an-_", 28)]),
+ "anthropic-key": ("KEY=", ["sk-", "ant-api03-", ("an-_", 93), "AA"]),
+ "openai-key": ("KEY=", ["sk-", "proj-", ("an-_", 74), "T3BlbkFJ", ("an-_", 74)]),
+ "openrouter-key": ("KEY=", ["sk-", "or-v1-", ("hex", 64)]),
+ "deepseek-key": ("KEY=", ["sk", "-", ("hex", 32)]),
+ "groq-key": ("KEY=", ["gs", "k_", ("an", 52)]),
+ "perplexity-key": ("KEY=", ["pp", "lx-", ("an", 48)]),
+ "xai-key": ("KEY=", ["xa", "i-", ("an", 80)]),
+ "huggingface-token": ("KEY=", ["hf", "_", ("a", 34)]),
+ "npm-token": ("KEY=", ["np", "m_", ("an", 36)]),
+ "pypi-token": ("KEY=", ["pypi-", "AgEIcHlwaS5vcmc", ("an-_", 70)]),
+ "rubygems-token": ("KEY=", ["ruby", "gems_", ("hex", 48)]),
+ "clojars-token": ("KEY=", ["CLO", "JARS_", ("lan", 60)]),
+ "sendgrid-key": ("KEY=", ["SG", ".", ("an-_", 22), ".", ("an-_", 43)]),
+ "brevo-key": ("KEY=", ["xkey", "sib-", ("hex", 64), "-", ("an", 16)]),
+ "mailchimp-key": ("KEY=", [("hex", 32), "-us", ("d", 2)]),
+ "twilio-api-key": ("KEY=", ["S", "K", ("hex", 32)]),
+ "digitalocean-token": ("KEY=", ["dop", "_v1_", ("hex", 64)]),
+ "shopify-token": ("KEY=", ["shp", "at_", ("hex", 32)]),
+ "jwt": ("KEY=", ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", ".", "eyJ", ("an", 40), ".", ("an-_", 43)]),
+ "age-secret-key": ("KEY=", ["AGE-", "SECRET-KEY-1", ("bech", 58)]),
+ "vault-token": ("KEY=", ["hv", "s.", ("an-_", 95)]),
+ "terraform-cloud-token": ("KEY=", [("an", 14), ".atlas", "v1.", ("an-_", 67)]),
+ "doppler-token": ("KEY=", ["dp", ".pt.", ("an", 43)]),
+ "linear-api-key": ("KEY=", ["lin", "_api_", ("an", 40)]),
+ "postman-api-key": ("KEY=", ["PM", "AK-", ("hex", 24), "-", ("hex", 34)]),
+ "sentry-token": ("KEY=", ["sntr", "yu_", ("hex", 64)]),
+ "grafana-token": ("KEY=", ["gl", "sa_", ("an", 32), "_", ("hex", 8)]),
+ "databricks-token": ("KEY=", ["da", "pi", ("hex", 32)]),
+ "atlassian-token": ("KEY=", ["ATA", "TT3", ("an-_", 186)]),
+ "notion-token": ("KEY=", ["nt", "n_", ("d", 11), ("an", 35)]),
+ "1password-token": ("KEY=", ["ops", "_eyJ", ("b64", 260)]),
+ "facebook-token": ("KEY=", ["EA", "AC", ("an", 120)]),
+ "square-token": ("KEY=", ["sq0", "csp-", ("an-_", 43)]),
+ "pulumi-token": ("KEY=", ["pu", "l-", ("hex", 40)]),
+ "planetscale-token": ("KEY=", ["pscale", "_tkn_", ("an", 43)]),
+ "flyio-token": ("KEY=", ["fo", "1_", ("an-_", 43)]),
+ "dynatrace-token": ("KEY=", ["dt0", "c01.", ("UD", 24), ".", ("an", 64)]),
+ "tailscale-key": ("KEY=", ["tskey", "-auth-", ("an", 14), "-", ("an", 32)]),
+ "heroku-key": ("KEY=", ["HRKU", "-AA", ("an-_", 58)]),
+ "supabase-key": ("KEY=", ["sb", "p_", ("hex", 40)]),
+ "azure-storage-key": ("X;", ["Account", "Key=", ("b64", 86), "=="]),
+ "azure-ad-client-secret": ("KEY=", [("an", 3), ("d", 1), "Q", "~", ("an", 32)]),
+ "new-relic-key": ("KEY=", ["NR", "AK-", ("UD", 27)]),
+ "cloudflare-origin-ca-key": ("KEY=", ["v1", ".0-", ("hex", 24), "-", ("hex", 146)]),
+ "mapbox-secret-token": ("KEY=", ["sk", ".eyJ1", ("an-_", 80)]),
+}
+for cid, (before, spec) in SPECS.items():
+    m = gen(spec)
+    print(cid, before + m, m, sep="\t")
+PY
+
+# cred <id>: that rule's stand-in. masked <match>: how leakcheck prints it.
+cred() {
+  local id line m
+  while IFS=$'\t' read -r id line m; do
+    if [[ "$id" == "$1" ]]; then printf '%s\n' "$m"; return 0; fi
+  done < "$CRED_TSV"
+  echo "no stand-in for $1" >&2
+  return 1
+}
+masked() { printf '%s[redacted, %d chars]' "${1:0:4}" "${#1}"; }
 
 # Each test is a function. lc_test <name> <body...>; body runs with cwd set to
 # a fresh tmpdir initialized as a git repo.
@@ -240,6 +350,7 @@ t_no_defaults_with_no_pattern_errors() {
   seed README.md "hello"
   cat > .leakcheckrc <<'EOF'
 no-defaults
+no-credentials
 EOF
   git add .leakcheckrc
   commit init
@@ -1406,18 +1517,18 @@ assert doc["history_scanned"] is True, doc
 assert doc["history"] == {"commits": 2, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": None, "refs": 1, "tags": 0, "tagged_unscanned": 0}, doc
 (hit,) = doc["hits"]
 assert hit["source"] == "history" and hit["commit"] == sys.argv[2], hit
-assert list(hit)[-1] == "commit" and list(doc)[-1] == "history", doc
+assert list(hit)[-1] == "commit" and list(doc)[-3:] == ["history", "credentials_scanned", "credentials"], doc
 PY
 }
 
 t_history_default_json_unchanged() {
-  # Guard (passes on v0.4.1 by design): without --history no hit carries a
-  # commit and the envelope still ends at history_scanned:false.
+  # Without --history no hit carries a commit, and history_scanned:false is
+  # followed only by what later versions appended (v0.10.0: credentials).
   seed f.txt "/home/alice/x"
   commit one
   assert_exit 1 "$BIN" --json
   assert_not_contains '"commit"' "$LC_OUT"
-  assert_contains '"history_scanned":false}' "$LC_OUT"
+  assert_contains '"history_scanned":false,"credentials_scanned":true,"credentials":{' "$LC_OUT"
 }
 
 t_history_empty_repo() {
@@ -1838,6 +1949,301 @@ t_ignorecase_only_at_the_start() {
   assert_contains "Invalid preceding regular expression" "$LC_ERR"
 }
 
+# ─── credential rules (v0.10.0) ───────────────────────────────────────
+# Stand-ins come from cred (top of this file); none is ever written here.
+
+t_credential_every_rule_finds_its_own_format() {
+  local id line m
+  while IFS=$'\t' read -r id line m; do printf '%s\n' "$line" > "$id.txt"; done < "$CRED_TSV"
+  git add .
+  commit init
+  assert_exit 1 "$BIN" --json
+  cp "$LC_OUT" ../cred.json
+  # Each file is one hit, of its own rule only, printed masked; the count of
+  # rules is the count of stand-ins, so a rule added without one fails here.
+  python3 - ../cred.json "$CRED_TSV" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
+markers = {"private-key", "putty-private-key"}
+by = {}
+for h in doc["hits"]:
+    by.setdefault(h["file"], []).append(h)
+assert doc["credentials_scanned"] is True and doc["credentials"] == {"rules": len(rows), "placeholders": 0}, doc["credentials"]
+assert list(doc)[-2:] == ["credentials_scanned", "credentials"], list(doc)
+for cid, line, m in rows:
+    hs = by.pop(cid + ".txt", [])
+    want = m if cid in markers else "%s[redacted, %d chars]" % (m[:4], len(m))
+    assert [(h["pattern"], h["text"]) for h in hs] == [("credential:" + cid, want)], (cid, hs)
+assert not by, by
+PY
+  assert_exit 1 "$BIN"
+  assert_contains "github-token.txt:1: [credential:github-token] $(masked "$(cred github-token)")" "$LC_OUT"
+  while IFS=$'\t' read -r id line m; do
+    case "$id" in private-key|putty-private-key) continue ;; esac
+    assert_not_contains "$m" "$LC_OUT"
+    assert_not_contains "$m" "$LC_ERR"
+    assert_not_contains "$m" ../cred.json
+  done < "$CRED_TSV"
+}
+
+t_credential_in_every_tree_source() {
+  # Index, worktree, a path name, a symlink target, a type change: each pass
+  # runs the credential rules, each with its own rule here.
+  local gh np st sl pu
+  gh=$(cred github-token); np=$(cred npm-token); st=$(cred stripe-key); sl=$(cred slack-token)
+  pu=$(cred pulumi-token)
+  seed cur.txt "export TOKEN=$gh"
+  # A token in a path is masked wherever a credential hit prints that path.
+  seed "notes-$np.md" "pw=$pu"
+  ln -s "/srv/$st/conf" link
+  ln -s clean-target swapped
+  git add link swapped
+  commit init
+  rm swapped
+  printf 'hook=%s\n' "$sl" > swapped
+  assert_exit 1 "$BIN" --json
+  cp "$LC_OUT" ../tree.json
+  python3 - ../tree.json "notes-$(masked "$np").md" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = {(h["file"], h["pattern"], h["source"]) for h in doc["hits"]}
+assert ("cur.txt", "credential:github-token", "both") in got, got
+assert ("link", "credential:stripe-key", "both") in got, got
+assert ("swapped", "credential:slack-token", "worktree") in got, got
+assert (sys.argv[2], "credential:npm-token", "index") in got, got
+assert (sys.argv[2], "credential:pulumi-token", "both") in got, got
+PY
+  assert_exit 1 "$BIN"
+  assert_contains "cur.txt:1: [credential:github-token] $(masked "$gh")" "$LC_OUT"
+  assert_contains "link:0: [credential:stripe-key] $(masked "$st")" "$LC_OUT"
+  assert_contains "swapped:1: [credential:slack-token] $(masked "$sl")" "$LC_OUT"
+  assert_contains "notes-$(masked "$np").md:0: [credential:npm-token] $(masked "$np")" "$LC_OUT"
+  assert_contains "notes-$(masked "$np").md:1: [credential:pulumi-token] $(masked "$pu")" "$LC_OUT"
+  assert_contains "leakcheck: 5 credential(s) among these: revoke and reissue" "$LC_ERR"
+  local t
+  for t in "$gh" "$np" "$st" "$sl" "$pu"; do
+    assert_not_contains "$t" "$LC_OUT"
+    assert_not_contains "$t" "$LC_ERR"
+    assert_not_contains "$t" ../tree.json
+  done
+}
+
+t_credential_in_every_history_source() {
+  # Added lines, a path name, a commit message, a ref name, a tag message:
+  # every history pass runs the credential rules.
+  local aws hf an gk gq
+  aws=$(cred aws-access-key-id); hf=$(cred huggingface-token); an=$(cred anthropic-key)
+  gk=$(cred google-api-key); gq=$(cred groq-key)
+  seed old.txt "aws_access_key_id = $aws"
+  seed "dump-$hf.log" "x"
+  commit "rotate $an"
+  local first; first=$(sha_of)
+  git rm -q old.txt "dump-$hf.log"
+  commit scrub
+  git branch "fix-$gk"
+  git tag -a -m "release, key $gq" v1
+  assert_exit 0 "$BIN"
+  assert_exit 1 "$BIN" --history
+  assert_contains "$first:old.txt:1: [credential:aws-access-key-id] $(masked "$aws")" "$LC_OUT"
+  assert_contains "$first:dump-$(masked "$hf").log:0: [credential:huggingface-token] $(masked "$hf")" "$LC_OUT"
+  assert_contains "$first:(message):1: [credential:anthropic-key] $(masked "$an")" "$LC_OUT"
+  assert_contains "(ref):0: [credential:google-api-key] $(masked "$gk")" "$LC_OUT"
+  assert_contains "(tag message):1: [credential:groq-key] $(masked "$gq")" "$LC_OUT"
+  local t
+  for t in "$aws" "$hf" "$an" "$gk" "$gq"; do
+    assert_not_contains "$t" "$LC_OUT"
+    assert_not_contains "$t" "$LC_ERR"
+  done
+}
+
+t_credential_placeholders_are_counted_not_reported() {
+  local x36 r
+  x36=$(printf 'X%.0s' {1..36})
+  r=$(cred github-token)
+  # An X-filled token, exactly eight equal, AWS's documented key, an alphabet
+  # run, exactly eight digits counting up, a lowercase "example": each is a
+  # stand-in.
+  printf '%s\n' "a=gh""p_$x36" "b=gh""p_${r:4:28}XXXXXXXX" "c=AK""IA""IOSFODNN7EXAMPLE" \
+    "d=AK""IA""ABCDEFGHIJKLMNOP" "e=np""m_${r:4:28}12345678" "f=sk""_test_${r:4:20}example" > p.txt
+  git add p.txt
+  commit init
+  assert_exit 0 "$BIN"
+  assert_contains "credentials scanned, 6 placeholders not reported" "$LC_OUT"
+  assert_exit 0 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["credentials"]["placeholders"] == 6, doc["credentials"]
+PY
+  # Seven in a row, equal or counting up, is not a placeholder.
+  printf '%s\n' "g=gh""p_${r:4:29}XXXXXXX" "h=np""m_${r:4:29}1234567" > q.txt
+  git add q.txt
+  commit seven
+  assert_exit 1 "$BIN"
+  assert_contains "q.txt:1: [credential:github-token]" "$LC_OUT"
+  assert_contains "q.txt:2: [credential:npm-token]" "$LC_OUT"
+}
+
+t_credential_placeholder_excuses_only_itself() {
+  # A real token beside a stand-in on one line is still reported, with both
+  # matches shown masked.
+  local x36 r
+  x36=$(printf 'X%.0s' {1..36})
+  r=$(cred github-token)
+  printf '%s\n' "ghp_$x36 then $r" > a.txt
+  git add a.txt
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [credential:github-token] $(masked "ghp_$x36") $(masked "$r")" "$LC_OUT"
+  assert_contains "0 placeholders not reported" "$LC_ERR"
+}
+
+t_credential_no_credentials_directive() {
+  local gh; gh=$(cred github-token)
+  seed a.txt "k=$gh /home/alice/x"
+  rc_file 'no-credentials'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_not_contains "credential:" "$LC_OUT"
+  assert_contains "; credentials not scanned" "$LC_ERR"
+  assert_not_contains "credential(s) among these" "$LC_ERR"
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["credentials_scanned"] is False and "credentials" not in doc, doc
+assert list(doc)[-1] == "credentials_scanned", list(doc)
+PY
+  assert_exit 0 "$BIN" --list-patterns
+  [[ $(wc -l < "$LC_OUT") -eq 8 ]] || { echo "    expected the 8 home-path defaults only"; cat "$LC_OUT"; return 1; }
+  # no-defaults turns off the home paths and leaves the credential rules.
+  rc_file 'no-defaults'
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [credential:github-token]" "$LC_OUT"
+  assert_not_contains "/home/" "$LC_OUT"
+}
+
+t_credential_list_patterns_appends_the_rules() {
+  seed a.txt "x"
+  rc_file 'pattern MYHOST'
+  commit init
+  assert_exit 0 "$BIN" --list-patterns
+  local n; n=$(wc -l < "$CRED_TSV")
+  # Defaults, then the config's patterns, then one ERE per credential rule:
+  # what earlier versions printed stays a prefix.
+  python3 - "$LC_OUT" "$n" <<'PY'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+n = int(sys.argv[2])
+assert len(lines) == 8 + 1 + n, len(lines)
+assert lines[8] == "MYHOST", lines[8]
+assert not any(l.startswith("credential:") for l in lines), lines
+PY
+}
+
+t_credential_label_cannot_be_a_pattern() {
+  seed a.txt "x"
+  rc_file 'pattern credential:github-token'
+  commit init
+  assert_exit 2 "$BIN"
+  assert_contains "is the name of a built-in credential rule" "$LC_ERR"
+  # Guard: another pattern that merely starts so is an ordinary ERE.
+  seed b.txt "credential:in-a-yaml-file"
+  rc_file 'pattern credential:in-a'
+  commit b
+  assert_exit 1 "$BIN"
+  assert_contains "b.txt:1: [credential:in-a] credential:in-a-yaml-file" "$LC_OUT"
+}
+
+t_credential_allow_rules_see_the_real_text() {
+  local gh other; gh=$(cred github-token); other=$(cred npm-token)
+  seed a.txt "k=$gh"
+  # The allow line names the token, so the committed config holds it too:
+  # that hit is excused by the same rule.
+  rc_file "allow $gh"
+  commit init
+  assert_exit 0 "$BIN"
+  assert_contains "2 allowed" "$LC_OUT"
+  rc_file "allow ^a\\.txt:1:k=$gh\$"
+  assert_exit 1 "$BIN"
+  assert_contains "1 allowed" "$LC_ERR"
+  assert_contains ".leakcheckrc:1: [credential:github-token]" "$LC_OUT"
+  rc_file "allow $other"
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [credential:github-token]" "$LC_OUT"
+}
+
+t_credential_in_the_committed_config() {
+  # The config's content is exempt from the patterns it lists, never from the
+  # credential rules: a key pasted there is published.
+  local gh; gh=$(cred github-token)
+  seed a.txt "x"
+  rc_file "# deploy key $gh" 'pattern MYHOST'
+  commit init
+  local first; first=$(sha_of)
+  assert_exit 1 "$BIN"
+  assert_contains ".leakcheckrc:1: [credential:github-token] $(masked "$gh")" "$LC_OUT"
+  assert_not_contains "[MYHOST]" "$LC_OUT"
+  assert_exit 1 "$BIN" --history
+  assert_contains "$first:.leakcheckrc:1: [credential:github-token]" "$LC_OUT"
+  assert_contains "1 current-config lines exempt" "$LC_ERR"
+}
+
+t_credential_private_key_needs_a_key_after_its_header() {
+  # A header counts where a key can follow it, in every layout a real one
+  # takes, and prints alone; a header with no key behind it (a string
+  # constant, a fixture's `xx`) is not a credential.
+  local body p h g
+  body=$(cred azure-storage-key); body=${body#AccountKey=}; body=${body:0:64}
+  p="-----BEGIN ""PRIVATE KEY-----"; h="-----BEGIN RSA ""PRIVATE KEY-----"; g="-----BEGIN PGP ""PRIVATE KEY BLOCK-----"
+  {
+    printf '%s\n' "$h"                                   # 1 a PEM file
+    printf '%s\r\n' "$h"                                 # 2 CRLF
+    printf '{"k": "%s\\n%s\\n"}\n' "$p" "$body"          # 3 JSON
+    printf '{"k": "%s\\r\\n%s"}\n' "$p" "$body"          # 4 JSON, CRLF
+    printf '{"k": "%s\\\\n%s"}\n' "$p" "$body"           # 5 escaped twice
+    printf '"%s\\n" +\n' "$h"                            # 6 one string per line
+    printf "'%s\\\\\\\\n' +\n" "$h"                      # 7 single quotes, escaped twice
+    printf 'KEY="%s %s"\n' "$h" "$body"                  # 8 flattened with spaces
+    printf '%s%s\n' "$h" "$body"                         # 9 flattened
+    printf '"%s\\nProc-Type: 4,ENCRYPTED\\n"\n' "$h"     # 10 encrypted
+    printf '"%s\\n\\n%s"\n' "$g" "$body"                 # 11 PGP armor
+    printf '"%s\\n%s"\n' "$p" "${body:0:20}\\/${body:22}"  # 12 JSON with \/
+  } > keys.txt
+  {
+    printf "'%s'\n" "$p"
+    printf "if (!pem.includes('%s')) {\n" "$p"
+    printf "'%s\\\\nxx\\\\n-----END PRIVATE KEY-----'\n" "$p"
+    printf "'%s\\\\nnot a key\\\\n-----END PRIVATE KEY-----'\n" "$p"
+    printf '"%s\\n%s\\n"\n' "$h" "${body:0:21}"
+    printf '# a %s header, in prose.\n' "$p"
+  } > fakes.txt
+  git add keys.txt fakes.txt
+  commit init
+  assert_exit 1 "$BIN"
+  local n
+  for n in 1 2 3 4 5 6 7 8 9 10 12; do
+    grep -q "^keys.txt:$n: \[credential:private-key\] -----BEGIN \(RSA \)\{0,1\}PRIVATE KEY-----$" "$LC_OUT" ||
+      { echo "    keys.txt line $n not reported as a header alone"; cat "$LC_OUT"; return 1; }
+  done
+  assert_contains "keys.txt:11: [credential:private-key] $g" "$LC_OUT"
+  assert_not_contains "fakes.txt" "$LC_OUT"
+  assert_not_contains "${body:0:24}" "$LC_OUT"
+  assert_contains "leakcheck: 12 match(es)" "$LC_ERR"
+}
+
+t_credential_other_hits_keep_their_text() {
+  # Guard (v0.9.0 prints the same line): a home-path hit on a line that also
+  # holds a credential prints that line, as every pattern's hit always has —
+  # the hit line is append-only, and callers judge on its text.
+  local gh; gh=$(cred github-token)
+  seed a.txt "/home/alice/x k=$gh"
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] /home/alice/x k=$gh" "$LC_OUT"
+}
+
 # ─── runner ───────────────────────────────────────────────────────────
 
 echo "leakcheck self-tests"
@@ -1989,6 +2395,18 @@ lc_test "(?i): pattern in history"                    t_ignorecase_pattern_in_hi
 lc_test "(?i): allow rules"                           t_ignorecase_allow
 lc_test "(?i): alone is refused"                      t_ignorecase_alone_is_refused
 lc_test "(?i): only at the start"                     t_ignorecase_only_at_the_start
+lc_test "credentials: every rule, its own format"     t_credential_every_rule_finds_its_own_format
+lc_test "credentials: every tree source"              t_credential_in_every_tree_source
+lc_test "credentials: every history source"           t_credential_in_every_history_source
+lc_test "credentials: placeholders counted"           t_credential_placeholders_are_counted_not_reported
+lc_test "credentials: a placeholder excuses itself"   t_credential_placeholder_excuses_only_itself
+lc_test "credentials: no-credentials"                 t_credential_no_credentials_directive
+lc_test "credentials: --list-patterns appends"        t_credential_list_patterns_appends_the_rules
+lc_test "credentials: a label is not a pattern"       t_credential_label_cannot_be_a_pattern
+lc_test "credentials: allow sees the real text"       t_credential_allow_rules_see_the_real_text
+lc_test "credentials: in the committed config"        t_credential_in_the_committed_config
+lc_test "credentials: a PEM header needs a key"       t_credential_private_key_needs_a_key_after_its_header
+lc_test "credentials: other hits keep their text"     t_credential_other_hits_keep_their_text
 
 echo
 echo "  $PASS passed  ·  $FAIL failed"
