@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.11.3*
+*README v0.11.4*
 
 ## Install
 
@@ -131,7 +131,7 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
 - **Only an allow rule that names the credential rule excuses its hits**: `allow credential:<rule> <regex>`, or `allow credential:* <regex>` for every credential rule.
   A plain `allow` never excuses a credential, so a location rule written for home paths (`allow ^fixtures/`) cannot hide a key beside them; when one would have, a last line on stderr says how many such hits were reported anyway.
   A scoped rule still sees the real text, so `allow credential:github-token` followed by the token excuses that token's hits — and, since a rule is matched against the path too, every hit of that rule in a file whose name holds it.
-  In `--json`, an allow rule that names a credential prints it masked.
+  In `--json`, an allow rule that names a credential prints it masked, even written as a regex: with its punctuation escaped (`SG\.…`, `\/`) or bracketed (`[.]`), such a rule is shown unescaped, with the key masked.
 - **Deleting a credential does not undo its exposure.**
   Anyone who saw a pushed key can use it until it is revoked, so revoke and reissue it first; scrubbing it from the files and the history comes after, and is no substitute.
 - **Obvious stand-ins are counted, not reported**: a match holding eight equal characters in a row, eight letters or digits counting up, or `EXAMPLE` or `example` — an X-filled `ghp_XXXX…`, an alphabet run, AWS's documented example key.
@@ -386,7 +386,8 @@ Here is the Quick start run, formatted for reading:
 - With `--history`, `history_scanned` is `true` and a final `history` object follows: `{"commits": 4, "binary": 0, "skipped": 0, "config_lines_exempt": 1, "range": null, "refs": 1, "tags": 0, "tagged_unscanned": 0}`.
   `range` is the `--history-range` value, or `null` when every ref was scanned.
 - `allowed` lists what each allow rule suppressed, each rule as written, its `credential:` scope included.
-- `credentials` counts the credential rules that ran and the stand-ins not reported, then, when the config disables any, lists them: `"disabled": ["credential:mailchimp-key"]`; with `no-credentials`, `credentials_scanned` is `false` and the object is absent.
+- `credentials` counts the credential rules that ran and the stand-ins not reported, then, when the config disables any, lists them: `"disabled": ["credential:mailchimp-key"]`.
+  With `no-credentials`, `credentials_scanned` is `false` and the object is absent; when `disable` lines turn every rule off, `credentials_scanned` is `false` and the object stays, with `"rules": 0` and the list.
   A credential hit's `text` holds its masked matches, and its `file` masks any credential in the path.
 - Strings are JSON-escaped, and bytes that are not valid UTF-8 become U+FFFD.
 - The schema is a contract, and new fields are only ever appended.

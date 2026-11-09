@@ -2469,6 +2469,26 @@ PY
   rc_file 'disable credential:github-token credential:npm-token' 'allow credential:github-token ^a\.txt:'
   assert_exit 0 "$BIN"
   assert_contains "2 credential rules disabled by config" "$LC_OUT"
+  # Every rule turned off one by one is counted, not read as no-credentials;
+  # with no-credentials too, it is no-credentials.
+  cut -f1 "$CRED_TSV" | sed 's/^/disable credential:/' > .leakcheckrc
+  git add .leakcheckrc
+  assert_exit 0 "$BIN"
+  assert_contains "credentials not scanned, $n credential rules disabled by config)" "$LC_OUT"
+  assert_exit 0 "$BIN" --json
+  python3 - "$LC_OUT" "$CRED_TSV" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+ids = ["credential:" + ln.split("\t")[0] for ln in open(sys.argv[2])]
+assert doc["credentials_scanned"] is False, doc
+assert doc["credentials"] == {"rules": 0, "placeholders": 0, "disabled": ids}, doc["credentials"]
+PY
+  echo no-credentials >> .leakcheckrc
+  git add .leakcheckrc
+  assert_exit 0 "$BIN" --json
+  assert_not_contains '"credentials":' "$LC_OUT"
+  assert_exit 0 "$BIN"
+  assert_not_contains "disabled by config" "$LC_OUT"
   # Refused: an unknown id, every rule, a bare id, nothing.
   rc_file 'disable credential:no-such-rule'
   assert_exit 2 "$BIN"
@@ -2535,6 +2555,39 @@ for rid in sys.argv[2:]:
         assert (rid + ".txt", line, "credential:" + rid) in got, (rid, line, sorted(got))
 assert len(doc["hits"]) == 2 * len(sys.argv[2:]), len(doc["hits"])
 PY
+}
+
+t_credential_allow_rule_written_as_regex_is_masked() {
+  # A rule is a regex, so a key in one may have its punctuation escaped
+  # (`\.`, `\/`) or bracketed (`[.]`): still a key, masked in --json and
+  # shown unescaped. A backslash a rule's own class accepts (the JWT's) only
+  # matches as written, which is masked as written. A rule naming no key
+  # prints exactly as written.
+  local sg sw j seg1 seg2 jx esw
+  sg=$(cred sendgrid-key); sw=$(cred slack-webhook); j=$(cred jwt)
+  seg1=${j%%.*}; seg2=${j#*.}; seg2=${seg2%%.*}
+  jx="$seg1.ey${seg2:3:15}\\-."
+  esw=${sw//./\\.}; esw=${esw//\//\\/}
+  seed c.txt "k=$sg"
+  rc_file "allow credential:sendgrid-key ${sg//./\\.}" \
+          "allow credential:sendgrid-key ${sg//./[.]}" \
+          "allow credential:slack-webhook https:\\/\\/$esw" \
+          "allow credential:jwt $jx" \
+          'allow ^c\.txt:'
+  commit init
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${sg:3:22}" "$LC_OUT"
+  assert_not_contains "${sw: -24}" "$LC_OUT"
+  assert_not_contains "${seg2:3:15}" "$LC_OUT"
+  python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+a = [(r["rule"], r["count"]) for r in doc["allowed"]]
+want = [("credential:sendgrid-key " + sys.argv[2], 1), ("credential:sendgrid-key " + sys.argv[2], 0),
+        ("credential:slack-webhook https://" + sys.argv[3], 0), ("credential:jwt " + sys.argv[4], 0),
+        ("^c\\.txt:", 0)]
+assert a == want, a' \
+    "$LC_OUT" "$(masked "$sg")" "$(masked "$sw")" "$(masked "$jx")"
 }
 
 t_credential_rules_read_a_type_changed_config() {
@@ -2969,6 +3022,7 @@ lc_test "credentials: masked wherever a name prints"  t_credential_in_a_name_is_
 lc_test "credentials: masked in a JSON allow rule"    t_credential_in_an_allow_rule_is_masked_in_json
 lc_test "credentials: a type-changed config"          t_credential_rules_read_a_type_changed_config
 lc_test "credentials: JSON-escaped slashes"        t_credential_json_escaped_slashes
+lc_test "credentials: a key written as a regex"     t_credential_allow_rule_written_as_regex_is_masked
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
 lc_test "allow: a scope excuses only its rule"       t_allow_credential_scope_excuses_only_its_rule

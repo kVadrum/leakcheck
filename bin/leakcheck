@@ -90,7 +90,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.11.3"
+VERSION="0.11.4"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -1881,6 +1881,11 @@ if [[ "$CRED_RULES" -gt 0 ]]; then
   fi
 else
   CSCOPE="credentials not scanned"
+  # Every rule turned off one by one is not `no-credentials`: the config said
+  # which rules, so they are still counted (Codex, v0.11.3).
+  if [[ "$USE_CREDENTIALS" -eq 1 && ${#CRED_DISABLED[@]} -gt 0 ]]; then
+    CSCOPE+=", ${#CRED_DISABLED[@]} credential rules disabled by config"
+  fi
 fi
 SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodules not scanned, $SKIPPED_COUNT skipped by config, $ALLOWED_TOTAL allowed; $HSCOPE; $CSCOPE"
 
@@ -1891,17 +1896,39 @@ ALLOW_SHOW=("${ALLOW_TEXT[@]}")
 # Masked by EVERY built-in rule, whatever this config runs: `disable` and
 # `no-credentials` say which hits to look for, not which keys may be printed,
 # and an allow rule naming a disabled rule's key printed it raw (/qaa, v0.11.2).
+# A rule is a regex, so a careful writer escapes a key's punctuation, and
+# `SG\.<body>\.<body>` matches no credential rule as written: the rules are
+# also run over a literal form (a `\` before punctuation dropped, a
+# one-character bracket such as `[.]` unwrapped), and a rule a key is found
+# in prints in that form, masked (Codex, v0.11.3). The as-written scan stays
+# for what the literal form loses: a backslash a rule's class accepts.
 if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 ]]; then
   CRED_E_ALL=()
   for (( i = 1; i < ${#CREDENTIALS[@]}; i += 2 )); do CRED_E_ALL+=(-e "${CREDENTIALS[i]}"); done
   printf '%s\n' "${ALLOW_TEXT[@]}" > "$TMPD/subj/allow-rules"
+  LC_ALL=C sed -E 's/\[([^]^\\[])\]/\1/g; s/\\([^A-Za-z0-9])/\1/g' "$TMPD/subj/allow-rules" > "$TMPD/subj/allow-literal"
+  mapfile -t ALLOW_LIT < "$TMPD/subj/allow-literal"
+  [[ ${#ALLOW_LIT[@]} -eq ${#ALLOW_TEXT[@]} ]] || die "internal error: allow-rule literal form has ${#ALLOW_LIT[@]} lines for ${#ALLOW_TEXT[@]} rules"
   run_git "credential rules (allow rules)" "$TMPD/rmatch" \
-    in_c git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E "${CRED_E_ALL[@]}" -- allow-rules
+    in_c git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E "${CRED_E_ALL[@]}" -- allow-rules allow-literal
+  declare -A LIT_FOUND=()
+  AS_WRITTEN=()
   while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
     [[ "$l" =~ ^[0-9]+$ && -n "${ALLOW_SHOW[l - 1]+x}" ]] || die "internal error: allow-rule mask returned line $l"
     is_placeholder "$m" && continue
-    ALLOW_SHOW[l - 1]=${ALLOW_SHOW[l - 1]//"$m"/"${m:0:4}[redacted, ${#m} chars]"}
+    case "$f" in
+      allow-literal)
+        LIT_FOUND[$l]=1
+        ALLOW_LIT[l - 1]=${ALLOW_LIT[l - 1]//"$m"/"${m:0:4}[redacted, ${#m} chars]"} ;;
+      allow-rules) AS_WRITTEN+=("$l" "$m") ;;
+      *) die "internal error: allow-rule mask returned file $f" ;;
+    esac
   done < "$TMPD/rmatch"
+  for l in "${!LIT_FOUND[@]}"; do ALLOW_SHOW[l - 1]=${ALLOW_LIT[l - 1]}; done
+  for (( k = 0; k < ${#AS_WRITTEN[@]}; k += 2 )); do
+    l=${AS_WRITTEN[k]}; m=${AS_WRITTEN[k + 1]}
+    ALLOW_SHOW[l - 1]=${ALLOW_SHOW[l - 1]//"$m"/"${m:0:4}[redacted, ${#m} chars]"}
+  done
 fi
 
 # ─── output ───────────────────────────────────────────────────────────
@@ -1974,8 +2001,9 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
   else
     printf '],"history_scanned":false'
   fi
-  if [[ "$CRED_RULES" -gt 0 ]]; then
-    printf ',"credentials_scanned":true,"credentials":{"rules":%d,"placeholders":%d' "$CRED_RULES" "$CRED_PLACEHOLDERS"
+  if [[ "$CRED_RULES" -gt 0 || ( "$USE_CREDENTIALS" -eq 1 && ${#CRED_DISABLED[@]} -gt 0 ) ]]; then
+    if [[ "$CRED_RULES" -gt 0 ]]; then printf ',"credentials_scanned":true'; else printf ',"credentials_scanned":false'; fi
+    printf ',"credentials":{"rules":%d,"placeholders":%d' "$CRED_RULES" "$CRED_PLACEHOLDERS"
     if [[ ${#CRED_DISABLED[@]} -gt 0 ]]; then
       printf ',"disabled":['
       for k in "${!CRED_DISABLED[@]}"; do
