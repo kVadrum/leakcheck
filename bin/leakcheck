@@ -57,6 +57,10 @@
 #   1  one or more matches
 #   2  usage, config or scan error
 
+# SPDX-FileCopyrightText: 2026 KeMeK Network
+# SPDX-License-Identifier: MIT
+# Credential rules derived from gitleaks: notice after the CREDENTIALS table.
+
 # Older bash dies at its first empty-array expansion under `set -u` with exit
 # 1, "matches found", having printed nothing (measured on bash 3.2, macOS's
 # /bin/bash). Refuse it before anything else runs.
@@ -86,7 +90,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.11.0"
+VERSION="0.11.1"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -233,6 +237,15 @@ DEFAULTS=(
   '[A-Za-z]:(\\\\|\\)[Uu][Ss][Ee][Rr][Ss](\\\\|\\)([A-Za-z0-9_][A-Za-z0-9_.-]*[^ -~]|[^ -~]+[A-Za-z0-9_])([A-Za-z0-9_.-]|[^ -~])*(\\\\|\\)'
 )
 
+# SPDX-SnippetBegin
+# SPDX-SnippetCopyrightText: 2019 Zachary Rice
+# SPDX-SnippetCopyrightText: 2026 KeMeK Network
+# SPDX-License-Identifier: MIT
+# A row ending `# gitleaks: <id>` is derived from that rule (or rules) in
+# gitleaks' default configuration (config/gitleaks.toml, v8.30.1;
+# https://github.com/gitleaks/gitleaks): its prefix and shape, re-spelled as
+# POSIX ERE and in places widened or narrowed. A row with no such note has
+# no gitleaks counterpart. gitleaks' license notice follows the table.
 # Credential rules, on by default (`no-credentials` turns them off): each
 # names one format by a prefix or shape the issuer fixed, so a match is a
 # credential, or a stand-in written to look like one. Formats with no such
@@ -253,66 +266,91 @@ DEFAULTS=(
 # fixture with a body of `xx` or `not a key`.
 CRED_MARKERS=(private-key putty-private-key)
 CREDENTIALS=(
-  private-key                 $'-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY( BLOCK)?-----([[:space:]]*$|[[:space:]]*[A-Za-z0-9+/=\\\\]{64}|(\\\\+r)?\\\\+n(["\'`]|[A-Za-z-]+: ))'
+  private-key                 $'-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY( BLOCK)?-----([[:space:]]*$|[[:space:]]*[A-Za-z0-9+/=\\\\]{64}|(\\\\+r)?\\\\+n(["\'`]|[A-Za-z-]+: ))'  # gitleaks: private-key
   putty-private-key           'PuTTY-User-Key-File-[0-9]+:'
-  aws-access-key-id           '(A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}'
-  github-token                'gh[pousr]_[A-Za-z0-9]{36}'
-  github-fine-grained-token   'github_pat_[A-Za-z0-9_]{22,}'
-  gitlab-token                'gl(pat|ptt|rt|dt|soat|cbt|ft|imt|agent|oas)-[A-Za-z0-9_-]{20,}|GR1348941[A-Za-z0-9_-]{20}'
-  slack-token                 'xox[abeoprs]-[A-Za-z0-9-]{10,}|xapp-[0-9]-[A-Za-z0-9-]{10,}'
-  slack-webhook               'hooks\.slack\.com/(services|workflows|triggers)/[A-Za-z0-9+/]{43,}'
+  aws-access-key-id           '(A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}'  # gitleaks: aws-access-token
+  github-token                'gh[pousr]_[A-Za-z0-9]{36}'  # gitleaks: github-pat, github-oauth, github-app-token, github-refresh-token
+  github-fine-grained-token   'github_pat_[A-Za-z0-9_]{22,}'  # gitleaks: github-fine-grained-pat
+  gitlab-token                'gl(pat|ptt|rt|dt|soat|cbt|ft|imt|agent|oas)-[A-Za-z0-9_-]{20,}|GR1348941[A-Za-z0-9_-]{20}'  # gitleaks: gitlab-pat and the other gitlab-* token rules
+  slack-token                 'xox[abeoprs]-[A-Za-z0-9-]{10,}|xapp-[0-9]-[A-Za-z0-9-]{10,}'  # gitleaks: slack-bot-token, slack-user-token, slack-app-token
+  slack-webhook               'hooks\.slack\.com/(services|workflows|triggers)/[A-Za-z0-9+/]{43,}'  # gitleaks: slack-webhook-url
   discord-webhook             'discord(app)?\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,}'
-  teams-webhook               '\.webhook\.office\.com/webhookb2/[A-Za-z0-9@/-]{60,}'
-  stripe-key                  '[rs]k_(live|test|prod)_[A-Za-z0-9]{24,}'
+  teams-webhook               '\.webhook\.office\.com/webhookb2/[A-Za-z0-9@/-]{60,}'  # gitleaks: microsoft-teams-webhook
+  stripe-key                  '[rs]k_(live|test|prod)_[A-Za-z0-9]{24,}'  # gitleaks: stripe-access-token
   webhook-signing-secret      'whsec_[A-Za-z0-9+/=]{24,}'
-  google-api-key              'AIza[A-Za-z0-9_-]{35}'
+  google-api-key              'AIza[A-Za-z0-9_-]{35}'  # gitleaks: gcp-api-key
   google-oauth-client-secret  'GOCSPX-[A-Za-z0-9_-]{28}'
-  anthropic-key               'sk-ant-[A-Za-z0-9_-]{20,}'
-  openai-key                  'sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{40,}'
+  anthropic-key               'sk-ant-[A-Za-z0-9_-]{20,}'  # gitleaks: anthropic-api-key
+  openai-key                  'sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{40,}'  # gitleaks: openai-api-key
   openrouter-key              'sk-or-v1-[a-f0-9]{64}'
   deepseek-key                'sk-[a-f0-9]{32}'
   groq-key                    'gsk_[A-Za-z0-9]{52}'
-  perplexity-key              'pplx-[A-Za-z0-9]{48}'
+  perplexity-key              'pplx-[A-Za-z0-9]{48}'  # gitleaks: perplexity-api-key
   xai-key                     'xai-[A-Za-z0-9]{80}'
-  huggingface-token           'hf_[A-Za-z0-9]{34}|api_org_[A-Za-z0-9]{34}'
-  npm-token                   'npm_[A-Za-z0-9]{36}'
-  pypi-token                  'pypi-AgE(IcHlwaS5vcmc|NdGVzdC5weXBpLm9yZw)[A-Za-z0-9_-]{50,}'
-  rubygems-token              'rubygems_[a-f0-9]{48}'
-  clojars-token               'CLOJARS_[a-z0-9]{60}'
-  sendgrid-key                'SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'
-  brevo-key                   'x(keysib|smtpsib)-[a-f0-9]{64}-[A-Za-z0-9]{16}'
-  mailchimp-key               '[0-9a-f]{32}-us[0-9]{1,2}'
-  twilio-api-key              'SK[0-9a-fA-F]{32}'
-  digitalocean-token          'do[opr]_v1_[a-f0-9]{64}'
-  shopify-token               'shp(at|ca|pa|ss)_[a-fA-F0-9]{32}'
-  jwt                         'ey[A-Za-z0-9_-]{17,}\.ey[A-Za-z0-9/\\_-]{17,}\.([A-Za-z0-9/\\_-]{10,}={0,2})?'
-  age-secret-key              'AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}'
-  vault-token                 'hv[sb]\.[A-Za-z0-9_-]{90,}'
-  terraform-cloud-token       '[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9_=-]{60,70}'
-  doppler-token               'dp\.(pt|st|sa|ct|scim|audit)\.[A-Za-z0-9]{40,44}'
-  linear-api-key              'lin_api_[A-Za-z0-9]{40}'
-  postman-api-key             'PMAK-[a-fA-F0-9]{24}-[a-fA-F0-9]{34}'
-  sentry-token                'sntrys_eyJ[A-Za-z0-9+/=_]{50,}|sntryu_[a-f0-9]{64}'
-  grafana-token               'glc_[A-Za-z0-9+/]{32,}={0,2}|glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}'
-  databricks-token            'dapi[a-f0-9]{32}(-[0-9])?'
-  atlassian-token             'ATATT3[A-Za-z0-9_=-]{186}'
-  notion-token                'ntn_[0-9]{11}[A-Za-z0-9]{35}'
-  1password-token             'ops_eyJ[A-Za-z0-9+/]{250,}={0,3}|A3-[A-Z0-9]{6}-([A-Z0-9]{11}|[A-Z0-9]{6}-[A-Z0-9]{5})-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}'
-  facebook-token              'EAA[MC][A-Za-z0-9]{100,}'
-  square-token                'sq0(atp|csp)-[A-Za-z0-9_-]{22,}'
-  pulumi-token                'pul-[a-f0-9]{40}'
-  planetscale-token           'pscale_(tkn|oauth|pw)_[A-Za-z0-9=._-]{32,64}'
-  flyio-token                 'fo1_[A-Za-z0-9_-]{43}|fm[12][ar]?_[A-Za-z0-9+/]{100,}={0,3}'
-  dynatrace-token             'dt0c01\.[A-Za-z0-9]{24}\.[A-Za-z0-9]{64}'
+  huggingface-token           'hf_[A-Za-z0-9]{34}|api_org_[A-Za-z0-9]{34}'  # gitleaks: huggingface-access-token, huggingface-organization-api-token
+  npm-token                   'npm_[A-Za-z0-9]{36}'  # gitleaks: npm-access-token
+  pypi-token                  'pypi-AgE(IcHlwaS5vcmc|NdGVzdC5weXBpLm9yZw)[A-Za-z0-9_-]{50,}'  # gitleaks: pypi-upload-token
+  rubygems-token              'rubygems_[a-f0-9]{48}'  # gitleaks: rubygems-api-token
+  clojars-token               'CLOJARS_[a-z0-9]{60}'  # gitleaks: clojars-api-token
+  sendgrid-key                'SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'  # gitleaks: sendgrid-api-token
+  brevo-key                   'x(keysib|smtpsib)-[a-f0-9]{64}-[A-Za-z0-9]{16}'  # gitleaks: sendinblue-api-token
+  mailchimp-key               '[0-9a-f]{32}-us[0-9]{1,2}'  # gitleaks: mailchimp-api-key
+  twilio-api-key              'SK[0-9a-fA-F]{32}'  # gitleaks: twilio-api-key
+  digitalocean-token          'do[opr]_v1_[a-f0-9]{64}'  # gitleaks: digitalocean-pat, digitalocean-access-token, digitalocean-refresh-token
+  shopify-token               'shp(at|ca|pa|ss)_[a-fA-F0-9]{32}'  # gitleaks: shopify-access-token and the other shopify-* rules
+  jwt                         'ey[A-Za-z0-9_-]{17,}\.ey[A-Za-z0-9/\\_-]{17,}\.([A-Za-z0-9/\\_-]{10,}={0,2})?'  # gitleaks: jwt
+  age-secret-key              'AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}'  # gitleaks: age-secret-key
+  vault-token                 'hv[sb]\.[A-Za-z0-9_-]{90,}'  # gitleaks: vault-service-token, vault-batch-token
+  terraform-cloud-token       '[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9_=-]{60,70}'  # gitleaks: hashicorp-tf-api-token
+  doppler-token               'dp\.(pt|st|sa|ct|scim|audit)\.[A-Za-z0-9]{40,44}'  # gitleaks: doppler-api-token
+  linear-api-key              'lin_api_[A-Za-z0-9]{40}'  # gitleaks: linear-api-key
+  postman-api-key             'PMAK-[a-fA-F0-9]{24}-[a-fA-F0-9]{34}'  # gitleaks: postman-api-token
+  sentry-token                'sntrys_eyJ[A-Za-z0-9+/=_]{50,}|sntryu_[a-f0-9]{64}'  # gitleaks: sentry-org-token, sentry-user-token
+  grafana-token               'glc_[A-Za-z0-9+/]{32,}={0,2}|glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}'  # gitleaks: grafana-cloud-api-token, grafana-service-account-token
+  databricks-token            'dapi[a-f0-9]{32}(-[0-9])?'  # gitleaks: databricks-api-token
+  atlassian-token             'ATATT3[A-Za-z0-9_=-]{186}'  # gitleaks: atlassian-api-token
+  notion-token                'ntn_[0-9]{11}[A-Za-z0-9]{35}'  # gitleaks: notion-api-token
+  1password-token             'ops_eyJ[A-Za-z0-9+/]{250,}={0,3}|A3-[A-Z0-9]{6}-([A-Z0-9]{11}|[A-Z0-9]{6}-[A-Z0-9]{5})-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}'  # gitleaks: 1password-service-account-token, 1password-secret-key
+  facebook-token              'EAA[MC][A-Za-z0-9]{100,}'  # gitleaks: facebook-page-access-token
+  square-token                'sq0(atp|csp)-[A-Za-z0-9_-]{22,}'  # gitleaks: square-access-token
+  pulumi-token                'pul-[a-f0-9]{40}'  # gitleaks: pulumi-api-token
+  planetscale-token           'pscale_(tkn|oauth|pw)_[A-Za-z0-9=._-]{32,64}'  # gitleaks: planetscale-api-token, planetscale-oauth-token, planetscale-password
+  flyio-token                 'fo1_[A-Za-z0-9_-]{43}|fm[12][ar]?_[A-Za-z0-9+/]{100,}={0,3}'  # gitleaks: flyio-access-token
+  dynatrace-token             'dt0c01\.[A-Za-z0-9]{24}\.[A-Za-z0-9]{64}'  # gitleaks: dynatrace-api-token
   tailscale-key               'tskey-(auth|api|client|scim|webhook)-[A-Za-z0-9]{4,}-[A-Za-z0-9]{16,}'
-  heroku-key                  'HRKU-AA[A-Za-z0-9_-]{58}'
+  heroku-key                  'HRKU-AA[A-Za-z0-9_-]{58}'  # gitleaks: heroku-api-key-v2
   supabase-key                'sbp_[a-f0-9]{40}|sb_secret_[A-Za-z0-9_-]{20,}'
   azure-storage-key           'AccountKey=[A-Za-z0-9+/]{86}=='
-  azure-ad-client-secret      '[A-Za-z0-9_~.]{3}[0-9]Q~[A-Za-z0-9_~.-]{31,34}'
-  new-relic-key               'NRAK-[A-Z0-9]{27}|NRII-[A-Za-z0-9_-]{32}'
-  cloudflare-origin-ca-key    'v1\.0-[a-f0-9]{24}-[a-f0-9]{146}'
+  azure-ad-client-secret      '[A-Za-z0-9_~.]{3}[0-9]Q~[A-Za-z0-9_~.-]{31,34}'  # gitleaks: azure-ad-client-secret
+  new-relic-key               'NRAK-[A-Z0-9]{27}|NRII-[A-Za-z0-9_-]{32}'  # gitleaks: new-relic-user-api-key, new-relic-insert-key
+  cloudflare-origin-ca-key    'v1\.0-[a-f0-9]{24}-[a-f0-9]{146}'  # gitleaks: cloudflare-origin-ca-key
   mapbox-secret-token         'sk\.eyJ1[A-Za-z0-9._-]{50,}'
 )
+# SPDX-SnippetEnd
+# Third-party notice: the rows above marked `# gitleaks:` are derived from
+# gitleaks, https://github.com/gitleaks/gitleaks, used under this license:
+#
+# MIT License
+#
+# Copyright (c) 2019 Zachary Rice
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 PATTERNS=()
 ALLOWLIST=()

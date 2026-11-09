@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.11.0*
+*README v0.11.1*
 
 ## Install
 
@@ -109,6 +109,8 @@ Built-in rules also find keys and tokens in the formats their issuers fixed, by 
 - Stripe keys and webhook signing secrets, and Square, Shopify and Facebook tokens;
 - JSON Web Tokens;
 - keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana, Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare origin CA and Mapbox.
+
+Most of these rules are derived from the default rules of [gitleaks](https://github.com/gitleaks/gitleaks) (MIT): the script names, beside each one, the gitleaks rule it follows, and carries gitleaks' license notice, as does [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
 
 `leakcheck --list-rules` prints each rule's label and whether your config runs it; `leakcheck --list-patterns` prints each rule's regex, after your own patterns.
 
@@ -457,6 +459,7 @@ Why the default pattern set stays minimal, and why aggressive defaults read as a
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).
+The credential rules derived from gitleaks are used under its MIT license; its notice is in [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) and at the end of `bin/leakcheck`.
 
 ---
 
