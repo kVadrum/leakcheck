@@ -2295,6 +2295,16 @@ import json, sys
 a = [r["rule"] for r in json.load(open(sys.argv[1]))["allowed"]]
 assert a == sys.argv[2:], a' \
     "$LC_OUT" "credential:* $(masked "$gh")" "credential:aws-access-key-id $aws"
+  # Whatever the config runs: a rule disabled, or every rule off, still
+  # names a key, and the key is still masked.
+  rc_file 'disable credential:github-token' "allow credential:github-token $gh"
+  assert_exit 0 "$BIN" --json
+  assert_not_contains "$gh" "$LC_OUT"
+  assert_contains "credential:github-token $(masked "$gh")" "$LC_OUT"
+  rc_file 'no-credentials' "allow $gh"
+  assert_exit 0 "$BIN" --json
+  assert_not_contains "$gh" "$LC_OUT"
+  assert_contains "$(masked "$gh")" "$LC_OUT"
 }
 
 # ─── v0.11.0: an allow rule's scope ───────────────────────────────────
@@ -2351,6 +2361,8 @@ t_allow_credential_scope_excuses_only_its_rule() {
   assert_exit 1 "$BIN"
   assert_not_contains "fixtures/a.txt" "$LC_OUT"
   assert_contains "fixtures/b.txt:1: [credential:npm-token]" "$LC_OUT"
+  # The hint is for a rule that names no credential rule; this one names one.
+  assert_not_contains "matched an allow rule" "$LC_ERR"
   # A scoped rule never excuses a hit that is not a credential.
   assert_contains "fixtures/c.txt:1: [/home/" "$LC_OUT"
   assert_contains "1 allowed" "$LC_ERR"
@@ -2372,6 +2384,20 @@ assert [(r["rule"], r["count"]) for r in doc["allowed"]] == [
     ("credential:github-token ^fixtures/", 1)], doc["allowed"]
 assert "disabled" not in doc["credentials"], doc["credentials"]
 PY
+}
+
+t_allow_credential_scope_whole_line() {
+  # A scoped rule naming a whole line excuses its own rule's hit on it and
+  # nothing else there: not another credential rule's, not a home path.
+  local gh np; gh=$(cred github-token); np=$(cred npm-token)
+  seed a.txt "$gh $np /home/alice/x"
+  rc_file 'allow credential:github-token ^a\.txt:1:.*$'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_not_contains "[credential:github-token]" "$LC_OUT"
+  assert_contains "a.txt:1: [credential:npm-token]" "$LC_OUT"
+  assert_contains "a.txt:1: [/home/" "$LC_OUT"
+  assert_contains "1 allowed" "$LC_ERR"
 }
 
 t_allow_credential_scope_in_history() {
@@ -2947,6 +2973,7 @@ lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excu
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
 lc_test "allow: a scope excuses only its rule"       t_allow_credential_scope_excuses_only_its_rule
 lc_test "allow: a scope in history"                  t_allow_credential_scope_in_history
+lc_test "allow: a scope on a whole line"             t_allow_credential_scope_whole_line
 lc_test "allow: scope errors"                        t_allow_credential_scope_errors
 lc_test "disable: one credential rule"               t_disable_one_credential_rule
 lc_test "--list-rules"                               t_list_rules

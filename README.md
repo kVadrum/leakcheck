@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.11.2*
+*README v0.11.3*
 
 ## Install
 
@@ -464,7 +464,7 @@ Why the default pattern set stays minimal, and why aggressive defaults read as a
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).
-The credential rules derived from gitleaks are used under its MIT license; its notice is in [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) and at the end of `bin/leakcheck`.
+The credential rules derived from gitleaks are used under its MIT license; its notice is in [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) and after the credential rule table in `bin/leakcheck`.
 
 ---
 

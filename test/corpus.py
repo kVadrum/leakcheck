@@ -448,6 +448,10 @@ def main():
         with open(a.json, "w") as fh:
             json.dump(out, fh, indent=1)
     report(out, prev)
+    # A repository leakcheck could not scan is a measurement not taken, so it
+    # outranks any finding: exit 2, as leakcheck itself does on a scan error.
+    if any("error" in d for d in repos.values()):
+        sys.exit(2)
     bad = syn["misses"] or syn["cross"] or syn["lookalike_hits"] or syn["stray"]
     sys.exit(1 if bad else 0)
 

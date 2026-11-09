@@ -90,7 +90,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.11.2"
+VERSION="0.11.3"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -1888,10 +1888,15 @@ SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodule
 # a stand-in — and the JSON report prints every rule: each credential in one
 # that is not a placeholder is masked there, like a hit's.
 ALLOW_SHOW=("${ALLOW_TEXT[@]}")
-if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 && "$CRED_RULES" -gt 0 ]]; then
+# Masked by EVERY built-in rule, whatever this config runs: `disable` and
+# `no-credentials` say which hits to look for, not which keys may be printed,
+# and an allow rule naming a disabled rule's key printed it raw (/qaa, v0.11.2).
+if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 ]]; then
+  CRED_E_ALL=()
+  for (( i = 1; i < ${#CREDENTIALS[@]}; i += 2 )); do CRED_E_ALL+=(-e "${CREDENTIALS[i]}"); done
   printf '%s\n' "${ALLOW_TEXT[@]}" > "$TMPD/subj/allow-rules"
   run_git "credential rules (allow rules)" "$TMPD/rmatch" \
-    in_c git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E "${CRED_E[@]}" -- allow-rules
+    in_c git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E "${CRED_E_ALL[@]}" -- allow-rules
   while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
     [[ "$l" =~ ^[0-9]+$ && -n "${ALLOW_SHOW[l - 1]+x}" ]] || die "internal error: allow-rule mask returned line $l"
     is_placeholder "$m" && continue
