@@ -90,7 +90,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.11.6"
+VERSION="0.11.7"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -1875,12 +1875,42 @@ if [[ ${#H_FILE[@]} -gt 0 ]]; then
     NAME_TOKS+=("$tok")
   done < "$TMPD/nmatch"
 fi
-mask_names() {
-  local tok
-  REPLY=$1
-  for tok in "${NAME_TOKS[@]}"; do
-    REPLY=${REPLY//"$tok"/"${tok:0:4}[redacted, ${#tok} chars]"}
+# TEXT with each run of hidden bytes shown as its first four and its length,
+# a hit's mask; HIDE names an associative array keyed PREFIX<byte offset>.
+render_masked() { # text hide-array prefix -> REPLY
+  local LC_ALL=C t=$1 pre=$3 k run=-1
+  local -n rm_hide=$2
+  REPLY=""
+  for (( k = 0; k <= ${#t}; k++ )); do
+    if [[ $k -lt ${#t} && -n "${rm_hide[$pre$k]+x}" ]]; then
+      if [[ $run -lt 0 ]]; then run=$k; fi
+      continue
+    fi
+    if [[ $run -ge 0 ]]; then
+      REPLY+="${t:run:4}[redacted, $(( k - run )) chars]"; run=-1
+    fi
+    if [[ $k -lt ${#t} ]]; then REPLY+=${t:k:1}; fi
   done
+}
+# Every occurrence of every token marks its bytes, and each run prints once:
+# replacing tokens one after another let a shorter match over a longer one's
+# bytes break it, and the longer one's tail printed (Codex, v0.11.6).
+mask_names() {
+  REPLY=$1
+  [[ ${#NAME_TOKS[@]} -gt 0 ]] || return 0
+  local LC_ALL=C s=$1 tok o p k
+  local -A nhide=()
+  for tok in "${NAME_TOKS[@]}"; do
+    [[ -n "$tok" ]] || continue
+    o=0
+    while [[ "${s:o}" == *"$tok"* ]]; do
+      p=${s:o}; p=${p%%"$tok"*}; o=$(( o + ${#p} ))
+      for (( k = o; k < o + ${#tok}; k++ )); do nhide[$k]=1; done
+      o=$(( o + 1 ))
+    done
+  done
+  [[ ${#nhide[@]} -gt 0 ]] || return 0
+  render_masked "$s" nhide ""
 }
 
 KEEP=()
@@ -1983,7 +2013,7 @@ if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 ]]; then
     done
   }
   mask_allow_rules() {
-    local LC_ALL=C r f l m t o s e k n run cid marker
+    local LC_ALL=C r f l m t o s e k n cid marker
     local -a lit=() maps=() map=()
     local -A hide=() touched=()
     for r in "${!ALLOW_TEXT[@]}"; do
@@ -2022,20 +2052,10 @@ if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 ]]; then
       done
       (( n > 0 )) || die "internal error: allow-rule mask could not place a match in rule $l"
     done < "$TMPD/rmatch"
-    # A run of hidden bytes prints as its first four and its length, a hit's
-    # mask; runs from two scans that touch are one run.
+    # Runs from two scans that touch are one run.
     for r in "${!touched[@]}"; do
-      t=${ALLOW_TEXT[r]}; ALLOW_SHOW[r]=""; run=-1
-      for (( k = 0; k <= ${#t}; k++ )); do
-        if [[ $k -lt ${#t} && -n "${hide[$r:$k]+x}" ]]; then
-          if [[ $run -lt 0 ]]; then run=$k; fi
-          continue
-        fi
-        if [[ $run -ge 0 ]]; then
-          ALLOW_SHOW[r]+="${t:run:4}[redacted, $(( k - run )) chars]"; run=-1
-        fi
-        if [[ $k -lt ${#t} ]]; then ALLOW_SHOW[r]+=${t:k:1}; fi
-      done
+      render_masked "${ALLOW_TEXT[r]}" hide "$r:"
+      ALLOW_SHOW[r]=$REPLY
     done
   }
   mask_allow_rules

@@ -2724,6 +2724,24 @@ t_credential_disabled_rule_still_masks_names() {
   assert_not_contains "${gh:4:30}" "$LC_OUT"
 }
 
+t_credential_overlapping_keys_in_a_name_are_masked() {
+  # Two rules over one name's bytes, the longer disabled: replacing the
+  # shorter match first left the longer nothing to match, and its last eight
+  # characters printed in every hit on the file (Codex, v0.11.6). A legacy
+  # openai-key is `sk-` and 40 characters; its first 32, if hex, are a
+  # deepseek-key.
+  local ds tok
+  ds=$(cred deepseek-key); tok="$ds${ds:3:8}"
+  seed "d$tok/a.txt" "see /home/alice/x"
+  rc_file 'disable credential:openai-key'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "d$(masked "$tok")/a.txt:1: [" "$LC_OUT"
+  assert_not_contains "${tok: -8}" "$LC_OUT"
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${tok: -8}" "$LC_OUT"
+}
+
 t_config_errors_never_echo_a_key_for_a_rule_id() {
   # Until v0.11.0 a token was excused by `allow <token>`; one moved behind
   # `credential:` lands where a rule id goes, and each error printed it
@@ -3180,6 +3198,7 @@ lc_test "credentials: a private key to its end"     t_credential_allow_rule_priv
 lc_test "credentials: keys back to back"            t_credential_allow_rule_back_to_back_keys_are_masked
 lc_test "credentials: a disabled rule masks names"  t_credential_disabled_rule_still_masks_names
 lc_test "config errors never echo a key"            t_config_errors_never_echo_a_key_for_a_rule_id
+lc_test "credentials: overlapping keys in a name"   t_credential_overlapping_keys_in_a_name_are_masked
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
 lc_test "allow: a scope excuses only its rule"       t_allow_credential_scope_excuses_only_its_rule
