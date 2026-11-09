@@ -2473,6 +2473,44 @@ t_list_rules() {
   assert_exit 2 "$BIN" --list-rules
 }
 
+t_credential_json_escaped_slashes() {
+  # Every `/` a rule matches may be written `\/`, as PHP's json_encode and
+  # others write it: each rule whose match can hold one is pinned twice, as
+  # written and escaped. The `/` sits early in a body, so the escaped text
+  # leaves no run long enough for the unescaped rule to match a prefix of.
+  local src ids id v
+  src=$(cred 1password-token); src=${src:7}
+  slashed() { printf '%s/%s' "${1:0:3}" "${1:4}"; }  # a `/` at index 3
+  declare -A val=(
+    [slack-webhook]="https://$(cred slack-webhook)"
+    [discord-webhook]="https://$(cred discord-webhook)"
+    [teams-webhook]="https://acme$(cred teams-webhook)"
+    [1password-token]="ops""_eyJ$(slashed "${src:0:255}")"
+    [azure-storage-key]="Account""Key=$(slashed "${src:0:86}")=="
+    [webhook-signing-secret]="wh""sec_$(slashed "${src:0:30}")"
+    [sentry-token]="sntr""ys_eyJ$(slashed "${src:0:60}")"
+    [grafana-token]="gl""c_$(slashed "${src:0:40}")"
+    [flyio-token]="fm""2_$(slashed "${src:0:120}")"
+  )
+  for id in "${!val[@]}"; do
+    v=${val[$id]}
+    [[ "$v" == */* ]] || { echo "    $id: no slash to escape"; return 1; }
+    printf '%s\n' "k=$v" "{\"k\": \"${v//\//\\/}\"}" > "$id.txt"
+    git add "$id.txt"
+  done
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "${!val[@]}" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = {(h["file"], h["line"], h["pattern"]) for h in doc["hits"]}
+for rid in sys.argv[2:]:
+    for line in (1, 2):
+        assert (rid + ".txt", line, "credential:" + rid) in got, (rid, line, sorted(got))
+assert len(doc["hits"]) == 2 * len(sys.argv[2:]), len(doc["hits"])
+PY
+}
+
 t_credential_rules_read_a_type_changed_config() {
   # .leakcheckrc a symlink in the index and a file on disk: `git commit -a`
   # publishes the file, a token in it included. Its own pattern lines are
@@ -2904,6 +2942,7 @@ lc_test "credentials: Hugging Face token with digits" t_credential_huggingface_t
 lc_test "credentials: masked wherever a name prints"  t_credential_in_a_name_is_masked_wherever_the_name_prints
 lc_test "credentials: masked in a JSON allow rule"    t_credential_in_an_allow_rule_is_masked_in_json
 lc_test "credentials: a type-changed config"          t_credential_rules_read_a_type_changed_config
+lc_test "credentials: JSON-escaped slashes"        t_credential_json_escaped_slashes
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
 lc_test "allow: a scope excuses only its rule"       t_allow_credential_scope_excuses_only_its_rule
