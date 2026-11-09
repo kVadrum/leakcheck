@@ -904,7 +904,7 @@ t_help_lists_every_flag() {
   # The script header is --help: a flag missing there is undiscoverable.
   assert_exit 0 "$BIN" --help
   local f
-  for f in --strict --history --history-range --json --list-patterns --config --root --version --help; do
+  for f in --strict --history --history-range --json --list-patterns --list-rules --config --root --version --help; do
     assert_contains "$f" "$LC_OUT"
   done
 }
@@ -2181,15 +2181,15 @@ t_credential_allow_rules_see_the_real_text() {
   seed a.txt "k=$gh"
   # The allow line names the token, so the committed config holds it too:
   # that hit is excused by the same rule.
-  rc_file "allow $gh"
+  rc_file "allow credential:github-token $gh"
   commit init
   assert_exit 0 "$BIN"
   assert_contains "2 allowed" "$LC_OUT"
-  rc_file "allow ^a\\.txt:1:k=$gh\$"
+  rc_file "allow credential:github-token ^a\\.txt:1:k=$gh\$"
   assert_exit 1 "$BIN"
   assert_contains "1 allowed" "$LC_ERR"
   assert_contains ".leakcheckrc:1: [credential:github-token]" "$LC_OUT"
-  rc_file "allow $other"
+  rc_file "allow credential:github-token $other"
   assert_exit 1 "$BIN"
   assert_contains "a.txt:1: [credential:github-token]" "$LC_OUT"
 }
@@ -2378,15 +2378,192 @@ t_credential_in_an_allow_rule_is_masked_in_json() {
   aws="AK""IA""IOSFODNN7EXAMPLE"
   seed a.txt "k=$gh"
   seed b.txt "k=$aws"
-  rc_file "allow $gh" "allow $aws"
+  rc_file "allow credential:* $gh" "allow credential:aws-access-key-id $aws"
   commit init
   assert_exit 0 "$BIN" --json
   assert_not_contains "$gh" "$LC_OUT"
+  # Each rule prints as written, its scope included.
   python3 -c '
 import json, sys
 a = [r["rule"] for r in json.load(open(sys.argv[1]))["allowed"]]
 assert a == sys.argv[2:], a' \
-    "$LC_OUT" "$(masked "$gh")" "$aws"
+    "$LC_OUT" "credential:* $(masked "$gh")" "credential:aws-access-key-id $aws"
+}
+
+# ─── v0.11.0: an allow rule's scope ───────────────────────────────────
+
+t_allow_unscoped_never_excuses_a_credential() {
+  # A location rule written for home paths hid a real key beside them:
+  # clean, exit 0 (v0.10.4). It still excuses the home path.
+  local gh; gh=$(cred github-token)
+  seed docs/a.md "see /home/alice/notes"
+  seed docs/b.md "token: $gh"
+  rc_file 'allow ^docs/'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "docs/b.md:1: [credential:github-token] $(masked "$gh")" "$LC_OUT"
+  assert_not_contains "docs/a.md" "$LC_OUT"
+  assert_contains "1 allowed" "$LC_ERR"
+  assert_contains "leakcheck: 1 of them matched an allow rule that names no credential rule" "$LC_ERR"
+  # Nor does a whole-line rule, or one naming the token itself — whose two
+  # lines put the token in the committed config twice more.
+  rc_file "allow ^docs/b\\.md:1:token: $gh\$" "allow $gh"
+  assert_exit 1 "$BIN"
+  assert_contains "docs/b.md:1: [credential:github-token]" "$LC_OUT"
+  assert_contains "3 of them matched an allow rule" "$LC_ERR"
+  # A whole-line rule alone draws the hint too (the config's own copy of
+  # the token is a second hit, which that rule does not name).
+  rc_file "allow ^docs/b\\.md:1:token: $gh\$"
+  assert_exit 1 "$BIN"
+  assert_contains "leakcheck: 2 credential(s) among these" "$LC_ERR"
+  assert_contains "1 of them matched an allow rule" "$LC_ERR"
+  # A credential hit no unscoped rule matched gets no hint.
+  rc_file 'allow ^nowhere/'
+  assert_exit 1 "$BIN"
+  assert_not_contains "matched an allow rule" "$LC_ERR"
+}
+
+t_allow_unscoped_and_a_placeholder() {
+  # A stand-in under an unscoped rule is counted as a stand-in, not allowed,
+  # and draws no hint: nothing is reported.
+  seed docs/a.md "k=AK""IA""IOSFODNN7EXAMPLE"
+  rc_file 'allow ^docs/'
+  commit init
+  assert_exit 0 "$BIN"
+  assert_contains "0 allowed" "$LC_OUT"
+  assert_contains "credentials scanned, 1 placeholders not reported" "$LC_OUT"
+}
+
+t_allow_credential_scope_excuses_only_its_rule() {
+  local gh np; gh=$(cred github-token); np=$(cred npm-token)
+  seed fixtures/a.txt "k=$gh"
+  seed fixtures/b.txt "k=$np"
+  seed fixtures/c.txt "/home/alice/x"
+  rc_file 'allow credential:github-token ^fixtures/'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_not_contains "fixtures/a.txt" "$LC_OUT"
+  assert_contains "fixtures/b.txt:1: [credential:npm-token]" "$LC_OUT"
+  # A scoped rule never excuses a hit that is not a credential.
+  assert_contains "fixtures/c.txt:1: [/home/" "$LC_OUT"
+  assert_contains "1 allowed" "$LC_ERR"
+  # credential:* takes every credential rule, and still no home path.
+  rc_file 'allow credential:* ^fixtures/'
+  assert_exit 1 "$BIN"
+  assert_not_contains "credential:" "$LC_OUT"
+  assert_contains "fixtures/c.txt:1: [/home/" "$LC_OUT"
+  assert_contains "2 allowed" "$LC_ERR"
+  # A scope, (?i) and the per-match form compose; JSON names the rule as
+  # written.
+  rc_file "allow credential:npm-token (?i)NPM_" 'allow ^fixtures/c\.txt:' 'allow credential:github-token ^fixtures/'
+  assert_exit 0 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert [(r["rule"], r["count"]) for r in doc["allowed"]] == [
+    ("credential:npm-token (?i)NPM_", 1), ("^fixtures/c\\.txt:", 1),
+    ("credential:github-token ^fixtures/", 1)], doc["allowed"]
+assert "disabled" not in doc["credentials"], doc["credentials"]
+PY
+}
+
+t_allow_credential_scope_in_history() {
+  # History hits are judged by the same scope.
+  local gh; gh=$(cred github-token)
+  seed fixtures/a.txt "k=$gh"
+  commit one
+  git rm -q fixtures/a.txt
+  commit two
+  rc_file 'allow ^fixtures/'
+  commit rc
+  assert_exit 1 "$BIN" --history
+  assert_contains ":fixtures/a.txt:1: [credential:github-token]" "$LC_OUT"
+  rc_file 'allow credential:github-token ^fixtures/'
+  commit rc2
+  assert_exit 0 "$BIN" --history
+  assert_contains "1 allowed" "$LC_OUT"
+}
+
+t_allow_credential_scope_errors() {
+  seed a.txt "x"
+  commit init
+  rc_file 'allow credential:no-such-rule x'
+  assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc:1: allow names no built-in credential rule: credential:no-such-rule" "$LC_ERR"
+  rc_file 'allow credential:jwt'
+  assert_exit 2 "$BIN"
+  assert_contains "needs a regex after the rule; to turn the rule off, write: disable credential:jwt" "$LC_ERR"
+  rc_file 'allow credential: x'
+  assert_exit 2 "$BIN"
+  assert_contains "allow credential: names no rule" "$LC_ERR"
+  # The regex after the scope gets every check an allow rule gets.
+  rc_file 'allow credential:jwt x*'
+  assert_exit 2 "$BIN"
+  assert_contains "excuse every hit" "$LC_ERR"
+  rc_file 'allow credential:jwt \d'
+  assert_exit 2 "$BIN"
+  rc_file 'allow credential:jwt x '
+  assert_exit 2 "$BIN"
+  assert_contains "ends in whitespace" "$LC_ERR"
+}
+
+t_disable_one_credential_rule() {
+  local gh np n; gh=$(cred github-token); np=$(cred npm-token)
+  n=$(wc -l < "$CRED_TSV")
+  seed a.txt "k=$gh"
+  seed b.txt "k=$np"
+  rc_file 'disable credential:github-token'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_not_contains "credential:github-token" "$LC_OUT"
+  assert_contains "b.txt:1: [credential:npm-token]" "$LC_OUT"
+  assert_contains "credentials scanned, 0 placeholders not reported, 1 credential rules disabled by config)" "$LC_ERR"
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "$n" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+c = doc["credentials"]
+assert c == {"rules": int(sys.argv[2]) - 1, "placeholders": 0,
+             "disabled": ["credential:github-token"]}, c
+assert list(c) == ["rules", "placeholders", "disabled"], list(c)
+PY
+  assert_exit 0 "$BIN" --list-patterns
+  [[ $(wc -l < "$LC_OUT") -eq $(( 8 + n - 1 )) ]] || { echo "    expected one rule fewer"; return 1; }
+  assert_exit 0 "$BIN" --list-rules
+  assert_contains "credential:github-token"$'\t'"off" "$LC_OUT"
+  assert_contains "credential:npm-token"$'\t'"on" "$LC_OUT"
+  # Several on one line; an allow rule may scope a disabled rule.
+  rc_file 'disable credential:github-token credential:npm-token' 'allow credential:github-token ^a\.txt:'
+  assert_exit 0 "$BIN"
+  assert_contains "2 credential rules disabled by config" "$LC_OUT"
+  # Refused: an unknown id, every rule, a bare id, nothing.
+  rc_file 'disable credential:no-such-rule'
+  assert_exit 2 "$BIN"
+  assert_contains "disable names no built-in credential rule: credential:no-such-rule" "$LC_ERR"
+  rc_file 'disable credential:*'
+  assert_exit 2 "$BIN"
+  assert_contains "write no-credentials" "$LC_ERR"
+  rc_file 'disable github-token'
+  assert_exit 2 "$BIN"
+  assert_contains "disable takes a credential rule's label" "$LC_ERR"
+  rc_file 'disable'
+  assert_exit 2 "$BIN"
+  assert_contains "empty disable directive" "$LC_ERR"
+}
+
+t_list_rules() {
+  seed a.txt "x"
+  commit init
+  assert_exit 0 "$BIN" --list-rules
+  # Every rule, in table order, each the id a stand-in was made for.
+  cut -f1 "$CRED_TSV" | sed 's/^/credential:/; s/$/\ton/' > .git/want
+  diff -u .git/want "$LC_OUT"
+  rc_file 'no-credentials'
+  assert_exit 0 "$BIN" --list-rules
+  [[ $(command grep -c $'\ton$' "$LC_OUT" || true) -eq 0 ]] || { echo "    expected every rule off"; cat "$LC_OUT"; return 1; }
+  # A broken config fails here too.
+  rc_file 'disable credential:nope'
+  assert_exit 2 "$BIN" --list-rules
 }
 
 t_credential_rules_read_a_type_changed_config() {
@@ -2820,6 +2997,13 @@ lc_test "credentials: Hugging Face token with digits" t_credential_huggingface_t
 lc_test "credentials: masked wherever a name prints"  t_credential_in_a_name_is_masked_wherever_the_name_prints
 lc_test "credentials: masked in a JSON allow rule"    t_credential_in_an_allow_rule_is_masked_in_json
 lc_test "credentials: a type-changed config"          t_credential_rules_read_a_type_changed_config
+lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
+lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
+lc_test "allow: a scope excuses only its rule"       t_allow_credential_scope_excuses_only_its_rule
+lc_test "allow: a scope in history"                  t_allow_credential_scope_in_history
+lc_test "allow: scope errors"                        t_allow_credential_scope_errors
+lc_test "disable: one credential rule"               t_disable_one_credential_rule
+lc_test "--list-rules"                               t_list_rules
 lc_test "history: merge lines, combined diffMerges"   t_history_merge_lines_under_combined_diff_merges
 lc_test "history: submodule, diff.submodule=log"     t_history_submodule_under_diff_submodule_log
 lc_test "config: trailing whitespace refused"         t_config_rule_ending_in_whitespace_is_refused

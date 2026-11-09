@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.10.4*
+*README v0.11.0*
 
 ## Install
 
@@ -110,7 +110,7 @@ Built-in rules also find keys and tokens in the formats their issuers fixed, by 
 - JSON Web Tokens;
 - keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana, Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare origin CA and Mapbox.
 
-`leakcheck --list-patterns` prints each rule's regex, after your own patterns.
+`leakcheck --list-rules` prints each rule's label and whether your config runs it; `leakcheck --list-patterns` prints each rule's regex, after your own patterns.
 
 ```text
 $ leakcheck
@@ -124,7 +124,9 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
   Its label is `credential:<rule>`, and in place of the line it shows each match as its first four characters and its length.
   A credential in a file name, a ref name or a tag name is masked the same way wherever that name is printed: in the path of every hit in that file, and in a hit on the name itself.
   A private key header is printed as found, since the key itself is on the lines after it.
-  Allow rules still see the real text, so `allow` followed by the token excuses that token's hits — and, since a rule is matched against the path too, every hit in a file whose name holds it.
+- **Only an allow rule that names the credential rule excuses its hits**: `allow credential:<rule> <regex>`, or `allow credential:* <regex>` for every credential rule.
+  A plain `allow` never excuses a credential, so a location rule written for home paths (`allow ^fixtures/`) cannot hide a key beside them; when one would have, a last line on stderr says how many such hits were reported anyway.
+  A scoped rule still sees the real text, so `allow credential:github-token` followed by the token excuses that token's hits — and, since a rule is matched against the path too, every hit of that rule in a file whose name holds it.
   In `--json`, an allow rule that names a credential prints it masked.
 - **Deleting a credential does not undo its exposure.**
   Anyone who saw a pushed key can use it until it is revoked, so revoke and reissue it first; scrubbing it from the files and the history comes after, and is no substitute.
@@ -134,7 +136,7 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
   A stand-in does not excuse a real key beside it on the same line.
 - **The committed config is scanned for credentials**, though not for the patterns it lists: a key pasted into `.leakcheckrc` is published like any other.
 - **The rules are on by default.**
-  `no-credentials` turns them off, and the summary then says `credentials not scanned`; `no-defaults` turns off only the home-path patterns.
+  `disable credential:<rule>` turns one off, and the summary counts it (`1 credential rules disabled by config`); `no-credentials` turns them all off, and the summary then says `credentials not scanned`; `no-defaults` turns off only the home-path patterns.
 - **They cannot find a secret with no fixed shape**: a password, an AWS secret access key, a database URL with its password in it, or `api_key = "…"` for a service whose keys look like random text.
   Telling those from ordinary strings takes the keyword around them and a measure of their randomness, which these rules do not weigh, so for them run a dedicated secret scanner such as gitleaks or trufflehog as well.
 - **Every other hit prints as before**: a home-path or config-pattern hit on a line that also holds a credential prints that whole line, the credential included.
@@ -247,7 +249,7 @@ Your config is an inventory of exactly what you are trying to hide, which is why
 A *tracked* `.leakcheckrc.local` is reported as a finding of its own (`config:local-tracked`), whatever `--config` or a `skip` says, and unlike `.leakcheckrc` its content is scanned like any other file.
 `--config FILE` replaces both files with `FILE`.
 
-Both files are line-oriented and take five directives; blank lines and `#` comments are ignored:
+Both files are line-oriented and take six directives; blank lines and `#` comments are ignored:
 
 ```text
 # Add a pattern to the scan set.
@@ -261,12 +263,17 @@ pattern (?i)mybox
 allow /home/USERNAME/
 allow ^fixtures/
 
+# A plain allow never excuses a credential. Name the credential rule
+# (`leakcheck --list-rules`), or credential:* for every one of them.
+allow credential:jwt ^test/fixtures/
+
 # Skip paths: a git pathspec glob, relative to the repo top level.
 # `*` also matches `/`, so this skips everything under tests/fixtures/.
 skip tests/fixtures/*
 
-# Turn off the built-in home-path patterns, or the built-in credential
-# rules ([Credentials](#credentials)).
+# Turn off one built-in credential rule, the built-in home-path patterns,
+# or every built-in credential rule ([Credentials](#credentials)).
+# disable credential:mailchimp-key
 # no-defaults
 # no-credentials
 ```
@@ -288,13 +295,15 @@ How patterns behave — read this before you write one:
   It allows a hit when it matches the hit's whole `path:line:text` (`^f\.txt:1:/home/alice/x$`), or when it matches `path:line:` followed by each match of the hit's own pattern on that line.
   So `allow /home/USERNAME/` excuses the placeholder but not a `MYHOST`, or a real `/home/alice/`, further along the same line; `allow \.example\.com` still excuses the host name `x.example.com` it is part of; and a location rule such as `^fixtures/` allows everything under `fixtures/`.
   A rule that names text around a match, short of the whole line (`^a\.txt:1:see`), excuses nothing.
+- **An allow rule never excuses a credential hit unless it names the credential rule**: `allow credential:<rule> <regex>` excuses that rule's hits and nothing else, `allow credential:* <regex>` any credential rule's ([Credentials](#credentials)).
+  The regex after the rule is judged like any other allow rule's, and to write a plain rule that starts with the text `credential:`, write `[c]redential:`.
 - **Every allow rule's suppressions are counted**, per rule in `--json`, so an over-broad rule shows up instead of passing as a clean repo.
   When two rules excuse one hit, the first listed takes the count.
 
 leakcheck does not match its own config file's content against your patterns — otherwise every `pattern` line would match itself — and counts it under `skipped by config`.
 The credential rules still read it, and its name and symlink target are scanned like any other, because a clone publishes all three.
 
-Mistakes in the config stop the run with exit `2` rather than narrowing the scan: an empty `pattern`, `allow` or `skip` (an empty `allow` would allow everything), a `pattern` or `allow` that matches the empty string, anywhere or only beside a word (`MYHOST|`, `x*`, `\b`, `\b(docs|)\b`: such an allow rule would excuse every hit), a `pattern` or `allow` ending in whitespace (write `[ ]` for a space you mean) or beginning or ending in an invisible Unicode space (no-break, zero-width, a BOM), an unknown directive, an invalid regex, a backslash escape POSIX does not have, a `pattern` spelled like a credential rule's label (`credential:github-token`), or a config file that is missing or unreadable.
+Mistakes in the config stop the run with exit `2` rather than narrowing the scan: an empty `pattern`, `allow` or `skip` (an empty `allow` would allow everything), a `pattern` or `allow` that matches the empty string, anywhere or only beside a word (`MYHOST|`, `x*`, `\b`, `\b(docs|)\b`: such an allow rule would excuse every hit), a `pattern` or `allow` ending in whitespace (write `[ ]` for a space you mean) or beginning or ending in an invisible Unicode space (no-break, zero-width, a BOM), an unknown directive, an invalid regex, a backslash escape POSIX does not have, a `pattern` spelled like a credential rule's label (`credential:github-token`), an `allow credential:` or `disable` naming no built-in rule, an `allow credential:<rule>` with no regex after it, `disable credential:*` (write `no-credentials`), or a config file that is missing or unreadable.
 
 ## Usage
 
@@ -305,6 +314,7 @@ leakcheck --history           also scan every commit reachable from any ref
 leakcheck --history-range R   the same, over the commits in revision range R only
 leakcheck --json              machine-readable output
 leakcheck --list-patterns     print the effective pattern set
+leakcheck --list-rules        print each credential rule's label, tab, on or off
 leakcheck -c, --config FILE   use FILE instead of .leakcheckrc / .leakcheckrc.local
 leakcheck -C, --root DIR      run as if started in DIR
 leakcheck -V, --version
@@ -371,8 +381,8 @@ Here is the Quick start run, formatted for reading:
 - `source` says where a hit was found: `index`, `worktree` or `both` — or `history`, and then the hit also carries `commit` after `source`: the full commit id, or for a ref or tag hit the id of the object it names.
 - With `--history`, `history_scanned` is `true` and a final `history` object follows: `{"commits": 4, "binary": 0, "skipped": 0, "config_lines_exempt": 1, "range": null, "refs": 1, "tags": 0, "tagged_unscanned": 0}`.
   `range` is the `--history-range` value, or `null` when every ref was scanned.
-- `allowed` lists what each allow rule suppressed.
-- `credentials` counts the credential rules that ran and the stand-ins not reported; with `no-credentials`, `credentials_scanned` is `false` and the object is absent.
+- `allowed` lists what each allow rule suppressed, each rule as written, its `credential:` scope included.
+- `credentials` counts the credential rules that ran and the stand-ins not reported, then, when the config disables any, lists them: `"disabled": ["credential:mailchimp-key"]`; with `no-credentials`, `credentials_scanned` is `false` and the object is absent.
   A credential hit's `text` holds its masked matches, and its `file` masks any credential in the path.
 - Strings are JSON-escaped, and bytes that are not valid UTF-8 become U+FFFD.
 - The schema is a contract, and new fields are only ever appended.
@@ -433,7 +443,7 @@ To scan only what a pull request adds, pass its range; the shas go through `env`
 ./test/run-tests.sh
 ```
 
-The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean, and a Latin-1 username), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist — a rule excuses only what it names — and its counts, `(?i)` at every site a pattern reaches git, `--strict`, the JSON shape and its escaping, every credential rule against a stand-in for its own format (each hitting exactly once, never printed), credentials at every place a pattern reaches, the stand-in rule at its threshold, real keys whose structure looks like a stand-in, and the masking, file names holding spaces, colons and newlines, and `--history` — merges (under `log.diffMerges=combined` too, and a signed tag a merge carries), a big file under a small `core.bigFileThreshold`, metadata under another log encoding, a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, once-per-finding reporting, ref names and annotated tags (nested, holding NUL bytes, and in a repository with no commits) — and `--history-range`, in every pass, in a shallow clone, and over a tag on a blob or a tree.
+The suite covers every default shape (each hitting exactly once, in a UTF-8 and a C locale, with the placeholders clean, and a Latin-1 username), every config directive and its error paths (the refused escapes included), `.leakcheckrc.local`, internal aborts and the bash floor (both by running a modified copy), `--config` / `--root` resolution, index-versus-worktree coverage including symlink and submodule type changes, file-name and symlink-target hits, binary and submodule accounting (including UTF-16, a NUL past git's sniff window, and `.gitattributes` binary marks), the allowlist — a rule excuses only what it names, and a credential only when it names the credential rule — and its counts, `disable` and `--list-rules`, `(?i)` at every site a pattern reaches git, `--strict`, the JSON shape and its escaping, every credential rule against a stand-in for its own format (each hitting exactly once, never printed), credentials at every place a pattern reaches, the stand-in rule at its threshold, real keys whose structure looks like a stand-in, and the masking, file names holding spaces, colons and newlines, and `--history` — merges (under `log.diffMerges=combined` too, and a signed tag a merge carries), a big file under a small `core.bigFileThreshold`, metadata under another log encoding, a side branch hidden behind an `-s ours` merge, the root commit under `log.showRoot=false`, quoted path names, shallow clones, once-per-finding reporting, ref names and annotated tags (nested, holding NUL bytes, and in a repository with no commits) — and `--history-range`, in every pass, in a shallow clone, and over a tag on a blob or a tree.
 Each test runs in its own throwaway repo with your git hooks disabled.
 It needs bash 4.4+, git and python3 (for JSON round-trip checks; leakcheck itself never uses python3).
 `LEAKCHECK_BIN=/path/to/leakcheck ./test/run-tests.sh` runs the suite against another build.
