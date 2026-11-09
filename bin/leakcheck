@@ -90,7 +90,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.11.5"
+VERSION="0.11.6"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -439,6 +439,17 @@ unicode_blank_edge() { # text: does it begin or end in one of them?
   return 1
 }
 
+# A config error repeats the text after `credential:` only when it is a rule
+# id: a key typed where the id goes is what it would print (/qaa, v0.11.5).
+is_cred_id() {
+  local k
+  for (( k = 0; k < ${#CREDENTIALS[@]}; k += 2 )); do
+    if [[ "${CREDENTIALS[k]}" == "$1" ]]; then return 0; fi
+  done
+  return 1
+}
+NOT_AN_ID="names no built-in credential rule (the text after credential: is not repeated, in case it is a key; leakcheck --list-rules prints the ids)"
+
 parse_config() { # path name-for-messages
   local file=$1 name=$2 lineno=0 line keyword rest
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -468,7 +479,11 @@ parse_config() { # path name-for-messages
           rest="${rest#"${rest%%[![:space:]]*}"}"
           scope=${scope#credential:}
           [[ -n "$scope" ]] || die "$name:$lineno: allow credential: names no rule; write allow credential:<id> <regex>, or credential:* for every credential rule"
-          [[ -n "$rest" ]] || die "$name:$lineno: allow credential:$scope needs a regex after the rule; to turn the rule off, write: disable credential:$scope"
+          if [[ -z "$rest" ]]; then
+            [[ "$scope" != '*' ]] || die "$name:$lineno: allow credential:* needs a regex after the rule; to turn every credential rule off, write: no-credentials"
+            is_cred_id "$scope" || die "$name:$lineno: allow $NOT_AN_ID"
+            die "$name:$lineno: allow credential:$scope needs a regex after the rule; to turn the rule off, write: disable credential:$scope"
+          fi
         fi
         if [[ $keyword != skip && "$rest" == '(?i)' ]]; then
           die "$name:$lineno: empty $keyword directive after (?i)"
@@ -497,7 +512,7 @@ parse_config() { # path name-for-messages
         [[ ${#words[@]} -gt 0 ]] || die "$name:$lineno: empty disable directive"
         local w
         for w in "${words[@]}"; do
-          [[ "$w" == credential:?* ]] || die "$name:$lineno: disable takes a credential rule's label (credential:<id>), not '$w'"
+          [[ "$w" == credential:?* ]] || die "$name:$lineno: disable takes credential rule labels (credential:<id>) and nothing else"
           [[ "$w" != 'credential:*' ]] || die "$name:$lineno: disable credential:* — write no-credentials to turn every credential rule off"
           DISABLES+=("${w#credential:}" "$name:$lineno")
         done
@@ -526,13 +541,13 @@ done
 # renamed by a later version should fail loudly, not quietly change scope.
 for (( i = 0; i < ${#DISABLES[@]}; i += 2 )); do
   [[ -n "${CRED_RE["lcredential:${DISABLES[i]}"]+x}" ]] ||
-    die "${DISABLES[i + 1]}: disable names no built-in credential rule: credential:${DISABLES[i]} (leakcheck --list-rules prints them)"
+    die "${DISABLES[i + 1]}: disable $NOT_AN_ID"
   CRED_OFF["${DISABLES[i]}"]=1
 done
 for r in "${!ALLOWLIST[@]}"; do
   asc=${ALLOW_SCOPE[r]}
   [[ -z "$asc" || "$asc" == '*' || -n "${CRED_RE["lcredential:$asc"]+x}" ]] ||
-    die "${ALLOW_AT[r]}: allow names no built-in credential rule: credential:$asc (leakcheck --list-rules prints them)"
+    die "${ALLOW_AT[r]}: allow $NOT_AN_ID"
 done
 CRED_DISABLED=()
 for (( i = 0; i < ${#CREDENTIALS[@]}; i += 2 )); do
@@ -1808,6 +1823,30 @@ is_name_hit() { # hit
   [[ "${H_LINE[$1]}" == 0 ]] || return 1
   [[ "${H_FILE[$1]}" == "${H_TEXT[$1]}" || "${H_FILE[$1]}" == "(ref)" || "${H_FILE[$1]}" == "(tag)" ]]
 }
+# Every built-in rule over FILEs in $TMPD/subj, whatever this config runs:
+# `disable` and `no-credentials` choose which hits to look for, never which
+# keys may print. One rule per -o grep, since git resumes after a match and
+# with every rule in one grep a key swallowed the start of the key after it
+# (/qaa, v0.11.5); one grep with them all first says whether any is needed.
+# OUT gets <id>\0<file>\0<line>\0<match>\n per match.
+cred_matches_all() { # out label file...
+  local out=$1 label=$2 k f l m
+  shift 2
+  local -a cre=()
+  for (( k = 1; k < ${#CREDENTIALS[@]}; k += 2 )); do cre+=(-e "${CREDENTIALS[k]}"); done
+  : > "$out"
+  run_git "credential rules ($label)" "$TMPD/cmatch" \
+    in_c git -C "$TMPD/subj" grep --no-index -a -l -E "${cre[@]}" -- "$@"
+  [[ -s "$TMPD/cmatch" ]] || return 0
+  for (( k = 0; k < ${#CREDENTIALS[@]}; k += 2 )); do
+    run_git "credential rule ${CREDENTIALS[k]} ($label)" "$TMPD/cmatch" \
+      in_c git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E -e "${CREDENTIALS[k + 1]}" -- "$@"
+    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
+      printf '%s\0%s\0%s\0%s\n' "${CREDENTIALS[k]}" "$f" "$l" "$m"
+    done < "$TMPD/cmatch" >> "$out"
+  done
+}
+
 # Credentials in names, from the name hits; mask_names <string> -> REPLY.
 NAME_TOKS=()
 declare -A NAME_TOK_SEEN=()
@@ -1820,6 +1859,22 @@ for i in "${!H_FILE[@]}"; do
     done
   fi
 done
+# And from every name that prints, by every built-in rule: a disabled rule's
+# key printed whole in its file's path (/qaa, v0.11.5).
+if [[ ${#H_FILE[@]} -gt 0 ]]; then
+  NAMES=()
+  for i in "${!H_FILE[@]}"; do
+    NAMES+=("${H_FILE[$i]}")
+    if is_name_hit "$i"; then NAMES+=("${H_TEXT[$i]}"); fi
+  done
+  printf '%s\n' "${NAMES[@]}" > "$TMPD/subj/names"
+  cred_matches_all "$TMPD/nmatch" "names" names
+  while IFS= read -r -d '' _ && IFS= read -r -d '' _ && IFS= read -r -d '' _ && IFS= read -r tok; do
+    [[ -z "${NAME_TOK_SEEN["t$tok"]+x}" ]] || continue
+    NAME_TOK_SEEN["t$tok"]=1
+    NAME_TOKS+=("$tok")
+  done < "$TMPD/nmatch"
+fi
 mask_names() {
   local tok
   REPLY=$1
@@ -1928,21 +1983,27 @@ if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 ]]; then
     done
   }
   mask_allow_rules() {
-    local LC_ALL=C r f l m t o s e k n run
-    local -a lit=() maps=() map=() cre=()
+    local LC_ALL=C r f l m t o s e k n run cid marker
+    local -a lit=() maps=() map=()
     local -A hide=() touched=()
-    for (( k = 1; k < ${#CREDENTIALS[@]}; k += 2 )); do cre+=(-e "${CREDENTIALS[k]}"); done
     for r in "${!ALLOW_TEXT[@]}"; do
       literal_form "${ALLOW_TEXT[r]}"
       lit+=("$LIT"); maps+=("${LIT_MAP[*]}")
     done
     printf '%s\n' "${ALLOW_TEXT[@]}" > "$TMPD/subj/allow-rules"
     printf '%s\n' "${lit[@]}" > "$TMPD/subj/allow-literal"
-    run_git "credential rules (allow rules)" "$TMPD/rmatch" \
-      in_c git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E "${cre[@]}" -- allow-rules allow-literal
-    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
+    cred_matches_all "$TMPD/rmatch" "allow rules" allow-rules allow-literal
+    while IFS= read -r -d '' cid && IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
       [[ "$l" =~ ^[0-9]+$ && -n "${ALLOW_TEXT[l - 1]+x}" ]] || die "internal error: allow-rule mask returned line $l"
-      is_placeholder "$m" && continue
+      # A private-key header is never a placeholder, as for a hit, and the key
+      # after it runs to the end of the rule, not the 64 characters the rule
+      # reads: a one-line key printed whole after its header (/qaa, v0.11.5).
+      marker=0
+      if [[ -n "${CRED_MARKER["lcredential:$cid"]+x}" ]]; then
+        marker=1
+      elif is_placeholder "$m"; then
+        continue
+      fi
       r=$(( l - 1 ))
       case "$f" in
         allow-rules) t=${ALLOW_TEXT[r]}; map=() ;;
@@ -1955,6 +2016,7 @@ if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 ]]; then
       while [[ "${t:o}" == *"$m"* ]]; do
         s=${t:o}; s=${s%%"$m"*}; o=$(( o + ${#s} )); e=$(( o + ${#m} - 1 ))
         if [[ "$f" == allow-literal ]]; then s=${map[o]}; e=${map[e]}; else s=$o; fi
+        if [[ $marker -eq 1 ]]; then e=$(( ${#ALLOW_TEXT[r]} - 1 )); fi
         for (( k = s; k <= e; k++ )); do hide[$r:$k]=1; done
         touched[$r]=1; o=$(( o + 1 )); n=$(( n + 1 ))
       done

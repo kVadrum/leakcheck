@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.11.5*
+*README v0.11.6*
 
 ## Install
 
@@ -127,11 +127,13 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
 - **A credential hit never prints the credential.**
   Its label is `credential:<rule>`, and in place of the line it shows each match as its first four characters and its length.
   A credential in a file name, a ref name or a tag name is masked the same way wherever that name is printed: in the path of every hit in that file, and in a hit on the name itself.
+  Names are masked by every built-in credential rule, whatever `disable` or `no-credentials` says: those choose which hits to look for, not which keys may be printed.
   A private key header is printed as found, since the key itself is on the lines after it.
 - **Only an allow rule that names the credential rule excuses its hits**: `allow credential:<rule> <regex>`, or `allow credential:* <regex>` for every credential rule.
   A plain `allow` never excuses a credential, so a location rule written for home paths (`allow ^fixtures/`) cannot hide a key beside them; when one would have, a last line on stderr says how many such hits were reported anyway.
   A scoped rule still sees the real text, so `allow credential:github-token` followed by the token excuses that token's hits — and, since a rule is matched against the path too, every hit of that rule in a file whose name holds it.
   In `--json`, an allow rule that names a credential prints it masked, even written as a regex: with its punctuation escaped (`SG\.…`, `\/`), bracketed (`[.]`) or split by groups (`SG\.(…)\.(…)`), the rule is shown as written with the key's characters masked.
+  A private key header in such a rule is masked with everything after it, since a key's body follows its header.
   A key spelled with an alternation, a quantifier or a wider bracket cannot be read back out of a regex, so it is not recognised there and prints as written; keep a key in an allow rule literal, or excuse it by location instead.
 - **Deleting a credential does not undo its exposure.**
   Anyone who saw a pushed key can use it until it is revoked, so revoke and reissue it first; scrubbing it from the files and the history comes after, and is no substitute.

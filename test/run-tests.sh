@@ -2389,6 +2389,8 @@ PY
 t_allow_credential_scope_whole_line() {
   # A scoped rule naming a whole line excuses its own rule's hit on it and
   # nothing else there: not another credential rule's, not a home path.
+  # A guard (passes on v0.11.2): it pins the whole-line path of the scope
+  # check, which no other test reached (/qaa, v0.11.3).
   local gh np; gh=$(cred github-token); np=$(cred npm-token)
   seed a.txt "$gh $np /home/alice/x"
   rc_file 'allow credential:github-token ^a\.txt:1:.*$'
@@ -2422,7 +2424,7 @@ t_allow_credential_scope_errors() {
   commit init
   rc_file 'allow credential:no-such-rule x'
   assert_exit 2 "$BIN"
-  assert_contains ".leakcheckrc:1: allow names no built-in credential rule: credential:no-such-rule" "$LC_ERR"
+  assert_contains ".leakcheckrc:1: allow names no built-in credential rule" "$LC_ERR"
   rc_file 'allow credential:jwt'
   assert_exit 2 "$BIN"
   assert_contains "needs a regex after the rule; to turn the rule off, write: disable credential:jwt" "$LC_ERR"
@@ -2492,13 +2494,13 @@ PY
   # Refused: an unknown id, every rule, a bare id, nothing.
   rc_file 'disable credential:no-such-rule'
   assert_exit 2 "$BIN"
-  assert_contains "disable names no built-in credential rule: credential:no-such-rule" "$LC_ERR"
+  assert_contains ".leakcheckrc:1: disable names no built-in credential rule" "$LC_ERR"
   rc_file 'disable credential:*'
   assert_exit 2 "$BIN"
   assert_contains "write no-credentials" "$LC_ERR"
   rc_file 'disable github-token'
   assert_exit 2 "$BIN"
-  assert_contains "disable takes a credential rule's label" "$LC_ERR"
+  assert_contains "disable takes credential rule labels" "$LC_ERR"
   rc_file 'disable'
   assert_exit 2 "$BIN"
   assert_contains "empty disable directive" "$LC_ERR"
@@ -2513,7 +2515,9 @@ t_list_rules() {
   diff -u .git/want "$LC_OUT"
   rc_file 'no-credentials'
   assert_exit 0 "$BIN" --list-rules
-  [[ $(command grep -c $'\ton$' "$LC_OUT" || true) -eq 0 ]] || { echo "    expected every rule off"; cat "$LC_OUT"; return 1; }
+  # Every rule listed, each off: no rule on is also true of no output.
+  cut -f1 "$CRED_TSV" | sed 's/^/credential:/; s/$/\toff/' > .git/want
+  diff -u .git/want "$LC_OUT"
   # A broken config fails here too.
   rc_file 'disable credential:nope'
   assert_exit 2 "$BIN" --list-rules
@@ -2657,6 +2661,83 @@ import json, sys
 doc = json.load(open(sys.argv[1]))
 a = [(r["rule"], r["count"]) for r in doc["allowed"]]
 assert a == [("credential:* " + sys.argv[2], 0)], a' "$LC_OUT" "$(masked "$esg2")"
+}
+
+t_credential_allow_rule_private_key_is_masked_to_its_end() {
+  # A key pasted whole into an allow rule, header and body on one line: the
+  # header rule reads at most 64 characters past the header, and the rest of
+  # the body printed after them; eight blanks after the header read as a
+  # placeholder and none of it was masked (/qaa, v0.11.5).
+  local pk body
+  pk=$(cred private-key)
+  body=$(python3 -c 'import random, string; r = random.Random(5); print("".join(r.choice(string.ascii_letters + string.digits + "+/") for _ in range(1200)))')
+  seed c.txt "k=0"
+  rc_file "allow credential:private-key $pk\\\\n$body" \
+          "allow credential:private-key $pk        $body"
+  commit init
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${body:100:40}" "$LC_OUT"
+  assert_not_contains "${body:1100:40}" "$LC_OUT"
+  python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+a = [(r["rule"], r["count"]) for r in doc["allowed"]]
+assert a == [("credential:private-key " + sys.argv[2], 0), ("credential:private-key " + sys.argv[3], 0)], a' \
+    "$LC_OUT" "$(masked "$pk\\\\n$body")" "$(masked "$pk        $body")"
+}
+
+t_credential_allow_rule_back_to_back_keys_are_masked() {
+  # Two keys back to back in one rule: with every rule in one -o grep, git
+  # resumed after the first key's match, which ran into the second, so the
+  # second's rule never matched and its tail printed (/qaa, v0.11.5).
+  local ps gh
+  ps=$(cred planetscale-token); gh=$(cred github-token)
+  seed c.txt "k=0"
+  rc_file "allow credential:* $ps$gh"
+  commit init
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${gh: -16}" "$LC_OUT"
+  python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+a = [(r["rule"], r["count"]) for r in doc["allowed"]]
+assert a == [("credential:* " + sys.argv[2], 0)], a' "$LC_OUT" "$(masked "$ps$gh")"
+}
+
+t_credential_disabled_rule_still_masks_names() {
+  # `disable` and `no-credentials` choose which hits to look for, never which
+  # keys may print: a disabled rule's key in a path printed whole in every
+  # hit on that file (/qaa, v0.11.5).
+  local gh
+  gh=$(cred github-token)
+  seed "d$gh/a.txt" "see /home/alice/x"
+  rc_file 'disable credential:github-token'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "d$(masked "$gh")/a.txt:1: [" "$LC_OUT"
+  assert_not_contains "${gh:4:30}" "$LC_OUT"
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${gh:4:30}" "$LC_OUT"
+  rc_file 'no-credentials'
+  assert_exit 1 "$BIN"
+  assert_contains "d$(masked "$gh")/a.txt:1: [" "$LC_OUT"
+  assert_not_contains "${gh:4:30}" "$LC_OUT"
+}
+
+t_config_errors_never_echo_a_key_for_a_rule_id() {
+  # Until v0.11.0 a token was excused by `allow <token>`; one moved behind
+  # `credential:` lands where a rule id goes, and each error printed it
+  # (/qaa, v0.11.5).
+  local gh line
+  gh=$(cred github-token)
+  seed a.txt "x"
+  commit init
+  for line in "allow credential:$gh" "allow credential:$gh ^a\\.txt:" "disable credential:$gh" "disable $gh"; do
+    rc_file "$line"
+    assert_exit 2 "$BIN"
+    assert_not_contains "${gh:4:30}" "$LC_ERR"
+    assert_not_contains "${gh:4:30}" "$LC_OUT"
+  done
 }
 
 t_credential_rules_read_a_type_changed_config() {
@@ -3095,6 +3176,10 @@ lc_test "credentials: a key written as a regex"     t_credential_allow_rule_writ
 lc_test "credentials: a key split by regex groups"  t_credential_allow_rule_key_split_by_groups_is_masked
 lc_test "credentials: two keys, found two ways"     t_credential_allow_rule_keys_found_two_ways_are_both_masked
 lc_test "credentials: a key inside a key"           t_credential_allow_rule_key_inside_a_key_is_masked
+lc_test "credentials: a private key to its end"     t_credential_allow_rule_private_key_is_masked_to_its_end
+lc_test "credentials: keys back to back"            t_credential_allow_rule_back_to_back_keys_are_masked
+lc_test "credentials: a disabled rule masks names"  t_credential_disabled_rule_still_masks_names
+lc_test "config errors never echo a key"            t_config_errors_never_echo_a_key_for_a_rule_id
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
 lc_test "allow: a scope excuses only its rule"       t_allow_credential_scope_excuses_only_its_rule
