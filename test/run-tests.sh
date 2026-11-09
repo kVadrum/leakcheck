@@ -2559,10 +2559,10 @@ PY
 
 t_credential_allow_rule_written_as_regex_is_masked() {
   # A rule is a regex, so a key in one may have its punctuation escaped
-  # (`\.`, `\/`) or bracketed (`[.]`): still a key, masked in --json and
-  # shown unescaped. A backslash a rule's own class accepts (the JWT's) only
-  # matches as written, which is masked as written. A rule naming no key
-  # prints exactly as written.
+  # (`\.`, `\/`) or bracketed (`[.]`): still a key, masked in --json, the
+  # rule shown as written with the key's own bytes masked. A backslash a
+  # rule's own class accepts (the JWT's) only matches as written, which is
+  # masked as written. A rule naming no key prints exactly as written.
   local sg sw j seg1 seg2 jx esw
   sg=$(cred sendgrid-key); sw=$(cred slack-webhook); j=$(cred jwt)
   seg1=${j%%.*}; seg2=${j#*.}; seg2=${seg2%%.*}
@@ -2583,11 +2583,80 @@ t_credential_allow_rule_written_as_regex_is_masked() {
 import json, sys
 doc = json.load(open(sys.argv[1]))
 a = [(r["rule"], r["count"]) for r in doc["allowed"]]
-want = [("credential:sendgrid-key " + sys.argv[2], 1), ("credential:sendgrid-key " + sys.argv[2], 0),
-        ("credential:slack-webhook https://" + sys.argv[3], 0), ("credential:jwt " + sys.argv[4], 0),
+want = [("credential:sendgrid-key " + sys.argv[2], 1), ("credential:sendgrid-key " + sys.argv[3], 0),
+        ("credential:slack-webhook https:\\/\\/" + sys.argv[4], 0), ("credential:jwt " + sys.argv[5], 0),
         ("^c\\.txt:", 0)]
 assert a == want, a' \
-    "$LC_OUT" "$(masked "$sg")" "$(masked "$sw")" "$(masked "$jx")"
+    "$LC_OUT" "$(masked "${sg//./\\.}")" "$(masked "${sg//./[.]}")" "$(masked "$esw")" "$(masked "$jx")"
+}
+
+t_credential_allow_rule_key_split_by_groups_is_masked() {
+  # Groups split a key in a rule, `SG\.(<body>)\.(<body>)`: the literal form
+  # drops parentheses, so it is still found, and the mask covers the bytes it
+  # came from — the rule prints as written up to the key's last byte
+  # (/cxr, v0.11.4: the parentheses stayed in, and the bodies printed).
+  local sg b1 b2 g
+  sg=$(cred sendgrid-key); b1=${sg#SG.}; b1=${b1%%.*}; b2=${sg##*.}
+  g="SG\\.($b1)\\.($b2"
+  seed c.txt "k=$sg"
+  rc_file "allow credential:sendgrid-key $g)"
+  commit init
+  assert_exit 0 "$BIN" --json
+  assert_not_contains "${b1:4:12}" "$LC_OUT"
+  assert_not_contains "${b2:4:30}" "$LC_OUT"
+  python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+a = [(r["rule"], r["count"]) for r in doc["allowed"]]
+assert a == [("credential:sendgrid-key " + sys.argv[2] + ")", 1)], a' "$LC_OUT" "$(masked "$g")"
+}
+
+t_credential_allow_rule_keys_found_two_ways_are_both_masked() {
+  # One rule, two keys: one only its literal form shows (escaped dots), one
+  # only its as-written form shows (a backslash the JWT's class accepts).
+  # v0.11.4 printed the literal form, where the second key was no longer
+  # there to mask, so it printed whole (/cxr, v0.11.4).
+  local sg j seg1 seg2 jx esg
+  sg=$(cred sendgrid-key); j=$(cred jwt)
+  seg1=${j%%.*}; seg2=${j#*.}; seg2=${seg2%%.*}
+  jx="$seg1.ey${seg2:3:15}\\-."
+  esg=${sg//./\\.}
+  seed c.txt "k=$sg"
+  rc_file "allow credential:* $esg $jx"
+  commit init
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${sg:3:22}" "$LC_OUT"
+  assert_not_contains "${seg2:3:15}" "$LC_OUT"
+  python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+a = [(r["rule"], r["count"]) for r in doc["allowed"]]
+assert a == [("credential:* " + sys.argv[2] + " " + sys.argv[3], 0)], a' \
+    "$LC_OUT" "$(masked "$esg")" "$(masked "$jx")"
+}
+
+t_credential_allow_rule_key_inside_a_key_is_masked() {
+  # A key only the literal form shows can hold one the as-written form shows
+  # — a Twilio key inside an escaped SendGrid body. Both scans mark bytes of
+  # the one rule, so neither mask breaks the other's match: masking the
+  # as-written key first, then reading the literal form, printed the
+  # SendGrid body. v0.11.4 masked both too; it fails here only on the form
+  # it showed, the literal one.
+  local sg tw b1 b2 esg2
+  sg=$(cred sendgrid-key); tw=$(cred twilio-api-key)
+  b1=${sg#SG.}; b1=${b1%%.*}; b2=${sg##*.}
+  esg2="SG\\.$b1\\.$tw${b2:0:9}"
+  seed c.txt "k=0"
+  rc_file "allow credential:* $esg2"
+  commit init
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${b1:4:12}" "$LC_OUT"
+  assert_not_contains "${tw:4:20}" "$LC_OUT"
+  python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+a = [(r["rule"], r["count"]) for r in doc["allowed"]]
+assert a == [("credential:* " + sys.argv[2], 0)], a' "$LC_OUT" "$(masked "$esg2")"
 }
 
 t_credential_rules_read_a_type_changed_config() {
@@ -3023,6 +3092,9 @@ lc_test "credentials: masked in a JSON allow rule"    t_credential_in_an_allow_r
 lc_test "credentials: a type-changed config"          t_credential_rules_read_a_type_changed_config
 lc_test "credentials: JSON-escaped slashes"        t_credential_json_escaped_slashes
 lc_test "credentials: a key written as a regex"     t_credential_allow_rule_written_as_regex_is_masked
+lc_test "credentials: a key split by regex groups"  t_credential_allow_rule_key_split_by_groups_is_masked
+lc_test "credentials: two keys, found two ways"     t_credential_allow_rule_keys_found_two_ways_are_both_masked
+lc_test "credentials: a key inside a key"           t_credential_allow_rule_key_inside_a_key_is_masked
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
 lc_test "allow: a scope excuses only its rule"       t_allow_credential_scope_excuses_only_its_rule
