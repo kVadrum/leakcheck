@@ -2847,6 +2847,47 @@ t_error_masking_failure_prints_nothing_of_the_message() {
   assert_not_contains ".leakcheckrc:1" "$LC_ERR"
 }
 
+t_error_masking_runs_apart_from_the_callers_git() {
+  # GIT_TRACE makes every git call write to stderr, so the scan fails at
+  # its first call, and the masking's own grep failed with it: one fixed
+  # line printed, naming neither the call nor the cause (/qaa, v0.11.8).
+  # Now the error names both, every git line indented under it.
+  local gh line
+  gh=$(cred github-token)
+  seed a.txt "x"
+  commit init
+  GIT_TRACE=1 assert_exit 2 "$BIN"
+  assert_contains "leakcheck: scan error: " "$LC_ERR"
+  assert_contains "trace: built-in: git " "$LC_ERR"
+  while IFS= read -r line; do
+    [[ "$line" == leakcheck:* || "$line" == "  "* ]] || { echo "    a line past the error: $line"; return 1; }
+  done < "$LC_ERR"
+  # A config error quoting a key, under the same setting: masked, not withheld.
+  rc_file "pattern $gh\\d"
+  GIT_TRACE=1 assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc:1: pattern '$(masked "$gh")\\d'" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+  # And a trace2 target in the caller's global config, at either home.
+  mkdir -p .git/h .git/x/git
+  printf '[trace2]\n\tnormalTarget = true\n' | tee .git/h/.gitconfig > .git/x/git/config
+  HOME="$PWD/.git/h" assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc:1: pattern '$(masked "$gh")\\d'" "$LC_ERR"
+  XDG_CONFIG_HOME="$PWD/.git/x" assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc:1: pattern '$(masked "$gh")\\d'" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+}
+
+t_no_patterns_is_an_error() {
+  # Guard: with the defaults, the credential rules and the config all off
+  # there is nothing to scan, which is an error, never a clean verdict.
+  # Passes on v0.11.8 too: the message moved to die, unchanged.
+  seed a.txt "x"
+  rc_file 'no-defaults' 'no-credentials'
+  commit init
+  assert_exit 2 "$BIN"
+  assert_contains "leakcheck: no patterns to scan (defaults disabled and config empty)" "$LC_ERR"
+}
+
 t_credential_rules_read_a_type_changed_config() {
   # .leakcheckrc a symlink in the index and a file on disk: `git commit -a`
   # publishes the file, a token in it included. Its own pattern lines are
@@ -3290,6 +3331,8 @@ lc_test "config errors never echo a key"            t_config_errors_never_echo_a
 lc_test "config errors mask a key in the regex"     t_config_errors_mask_a_key_in_the_regex
 lc_test "scan errors mask a key in a path"          t_scan_errors_mask_a_key_in_a_path
 lc_test "a failed error mask prints nothing"        t_error_masking_failure_prints_nothing_of_the_message
+lc_test "error masking ignores the caller's git"    t_error_masking_runs_apart_from_the_callers_git
+lc_test "no patterns at all is an error"            t_no_patterns_is_an_error
 lc_test "credentials: overlapping keys in a name"   t_credential_overlapping_keys_in_a_name_are_masked
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
