@@ -90,7 +90,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.11.7"
+VERSION="0.11.8"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -100,7 +100,29 @@ LIST_ONLY=0
 CONFIG_FILE=""
 ROOT=""
 
-die() { echo "leakcheck: $*" >&2; exit 2; }
+# Every error leaves through fail, masked by every built-in rule once the
+# temp dir exists (mask_texts): an error quotes what it is about — a config
+# line, git's own message about a pattern, a path — and a key written there
+# printed whole (v0.11.6 §4). One exit, so a message added later is masked
+# without anyone remembering to. The temp dir is made before any config is
+# read, so a message before it quotes only the command line. A failure while
+# masking prints nothing of the message.
+ERR_BUSY=0
+fail() { # line... -> stderr, exit 2
+  if [[ $ERR_BUSY -eq 1 ]]; then
+    echo "leakcheck: error while checking an error message for credentials; it is not printed" >&2
+    exit 2
+  fi
+  ERR_BUSY=1
+  local fail_msg
+  local -a fail_lines=()
+  printf -v fail_msg '%s\n' "$@"
+  mapfile -t fail_lines <<< "${fail_msg%$'\n'}"
+  if [[ -n "$TMPD" ]]; then mask_texts fail_lines "error message"; fi
+  printf '%s\n' "${fail_lines[@]}" >&2
+  exit 2
+}
+die() { fail "leakcheck: $*"; }
 
 usage() {
   sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//; s/^#$//'
@@ -355,6 +377,200 @@ CREDENTIALS=(
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# ─── temp dir and error masking ───────────────────────────────────────
+TMPD="$(mktemp -d "${TMPDIR:-/tmp}/leakcheck.XXXXXX")" || die "cannot create a temp dir"
+# Scan the objects a push publishes, in every git call from here on: replace
+# refs and a local info/grafts file both rewrite what git shows, and a graft
+# that makes HEAD a root hid a leak from --history, exit 0 (found by /cxr,
+# reproduced). A graft file that does not exist turns grafts off with no
+# output; GIT_GRAFT_FILE=/dev/null also does, but prints the deprecation hint
+# in every repo, which run_git rightly reads as a scan error (both measured).
+export GIT_NO_REPLACE_OBJECTS=1
+export GIT_GRAFT_FILE="$TMPD/no-grafts"
+# Pathspec magic is the script's to choose: GIT_LITERAL_PATHSPECS=1 made
+# `:(literal).leakcheckrc.local` a filename matching nothing, and a committed
+# .leakcheckrc.local in history then read clean, exit 0 (measured).
+unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_ICASE_PATHSPECS
+mkdir "$TMPD/subj"
+
+in_c() { LC_ALL=C "$@"; } # pat_args says why the C locale
+
+# run_git <label> <out-file> <command...>: stdout to <out-file>. Exit 0 or
+# 1 is a result; any other status, or ANY stderr, is a scan error. git grep
+# reports an unreadable worktree file on stderr and still exits 1, which
+# would otherwise read as "no match" (measured, git 2.53).
+run_git() {
+  local label=$1 out=$2 rc=0
+  shift 2
+  "$@" > "$out" 2> "$TMPD/err" || rc=$?
+  if [[ $rc -gt 1 || -s "$TMPD/err" ]]; then
+    fail_err "leakcheck: scan error: $label (git exited $rc)"
+  fi
+  return 0
+}
+# fail_err <line>: fail with it, then the stderr in $TMPD/err, indented.
+fail_err() {
+  local -a fe=()
+  mapfile -t fe < "$TMPD/err"
+  fail "$1" "${fe[@]/#/  }"
+}
+
+# is_placeholder <match>: a stand-in, not a key. Each test is something a
+# random secret all but never does — 8 equal characters in a row, or 8
+# letters or digits counting up, is under one in a million even for a
+# 64-character hex key — and that docs and fixtures do all the time: an
+# X-filled key, an alphabet run, AWS's documented key ending in EXAMPLE.
+# A run of `A` does not count: it is base64 for zero bytes, and a format
+# holding zero-filled fields has one in every real key — OpenSSH's
+# unencrypted private key (measured: nine As in its first 64 characters),
+# and by its msgpack layout Fly.io's macaroon token.
+# A private-key header is never a placeholder: the body after it is base64
+# of a structured format, and the rule's key-after-the-header requirement is
+# what tells a fixture from a key.
+is_placeholder() { # match
+  local LC_ALL=C m=$1 i c o prev=-2 same=0 up=0
+  if [[ "$m" == *EXAMPLE* || "$m" == *example* ]]; then return 0; fi
+  for (( i = 0; i < ${#m}; i++ )); do
+    c=${m:i:1}
+    printf -v o '%d' "'$c"
+    if (( o == prev )) && [[ "$c" != A ]]; then same=$((same + 1)); else same=1; fi
+    if (( o == prev + 1 )) && [[ "$c" == [A-Za-z0-9] && "${m:i-1:1}" == [A-Za-z0-9] ]]; then
+      up=$((up + 1))
+    else
+      up=1
+    fi
+    if (( same >= 8 || up >= 8 )); then return 0; fi
+    prev=$o
+  done
+  return 1
+}
+
+# Every built-in rule over FILEs in $TMPD/subj, whatever this config runs:
+# `disable` and `no-credentials` choose which hits to look for, never which
+# keys may print. One rule per -o grep, since git resumes after a match and
+# with every rule in one grep a key swallowed the start of the key after it
+# (/qaa, v0.11.5); one grep with them all first says whether any is needed.
+# OUT gets <id>\0<file>\0<line>\0<match>\n per match.
+cred_matches_all() { # out label file...
+  local out=$1 label=$2 k f l m
+  shift 2
+  local -a cre=()
+  for (( k = 1; k < ${#CREDENTIALS[@]}; k += 2 )); do cre+=(-e "${CREDENTIALS[k]}"); done
+  : > "$out"
+  run_git "credential rules ($label)" "$TMPD/cmatch" \
+    in_c git -C "$TMPD/subj" grep --no-index -a -l -E "${cre[@]}" -- "$@"
+  [[ -s "$TMPD/cmatch" ]] || return 0
+  for (( k = 0; k < ${#CREDENTIALS[@]}; k += 2 )); do
+    run_git "credential rule ${CREDENTIALS[k]} ($label)" "$TMPD/cmatch" \
+      in_c git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E -e "${CREDENTIALS[k + 1]}" -- "$@"
+    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
+      printf '%s\0%s\0%s\0%s\n' "${CREDENTIALS[k]}" "$f" "$l" "$m"
+    done < "$TMPD/cmatch" >> "$out"
+  done
+}
+
+# TEXT with each run of hidden bytes shown as its first four and its length,
+# a hit's mask; HIDE names an associative array keyed PREFIX<byte offset>.
+render_masked() { # text hide-array prefix -> REPLY
+  local LC_ALL=C t=$1 pre=$3 k run=-1
+  local -n rm_hide=$2
+  REPLY=""
+  for (( k = 0; k <= ${#t}; k++ )); do
+    if [[ $k -lt ${#t} && -n "${rm_hide[$pre$k]+x}" ]]; then
+      if [[ $run -lt 0 ]]; then run=$k; fi
+      continue
+    fi
+    if [[ $run -ge 0 ]]; then
+      REPLY+="${t:run:4}[redacted, $(( k - run )) chars]"; run=-1
+    fi
+    if [[ $k -lt ${#t} ]]; then REPLY+=${t:k:1}; fi
+  done
+}
+
+# The literal form of a rule, for the key scan only, never printed: a `\`
+# before punctuation dropped, a one-character bracket such as `[.]`
+# unwrapped, and parentheses dropped, so `SG\.(<body>)\.(<body>)` reads as
+# the key it matches (/cxr, v0.11.4). LIT_MAP[i] is the offset in the rule
+# of the literal form's i-th byte. An alternation, a quantifier or a wider
+# bracket has no literal form; the README says so.
+literal_form() {
+  local LC_ALL=C s=$1 i=0 c d
+  LIT=""; LIT_MAP=()
+  while (( i < ${#s} )); do
+    c=${s:i:1}; d=${s:i+1:1}
+    if [[ "$c" == '\' && -n "$d" && "$d" != [A-Za-z0-9] ]]; then
+      LIT+=$d; LIT_MAP+=("$(( i + 1 ))"); i=$(( i + 2 ))
+    elif [[ "$c" == '[' && -n "$d" && "${s:i+2:1}" == ']' && "$d" != ']' && "$d" != '^' && "$d" != '\' && "$d" != '[' ]]; then
+      LIT+=$d; LIT_MAP+=("$(( i + 1 ))"); i=$(( i + 3 ))
+    elif [[ "$c" == '(' || "$c" == ')' ]]; then
+      i=$(( i + 1 ))
+    else
+      LIT+=$c; LIT_MAP+=("$i"); i=$(( i + 1 ))
+    fi
+  done
+}
+
+# mask_texts <array> <label>: each element masked in place by every built-in
+# rule, whatever this config runs: `disable` and `no-credentials` say which
+# hits to look for, not which keys may be printed, and an allow rule naming a
+# disabled rule's key printed it raw (/qaa, v0.11.2). An element may be a
+# regex — an allow rule, or an error message quoting a pattern — so a careful
+# writer's escaped punctuation (`SG\.<body>\.<body>`) matches no rule as
+# written: the rules also run over its literal form, and what they find there
+# masks the element's own bytes (literal_form's map). The as-written scan
+# stays for what the literal form loses — a backslash a rule's class accepts —
+# and both scans mark bytes of the one text, so neither can unmask the
+# other's key: v0.11.4 showed the literal form instead, and a key only the
+# as-written scan found was no longer there to mask (/cxr, v0.11.4).
+# Elements hold no newline.
+mask_texts() { # array label
+  local -n mt_text=$1
+  local LC_ALL=C r f l m t o s e k n cid marker
+  local -a lit=() maps=() map=()
+  local -A hide=() touched=()
+  [[ ${#mt_text[@]} -gt 0 ]] || return 0
+  for r in "${!mt_text[@]}"; do
+    literal_form "${mt_text[r]}"
+    lit+=("$LIT"); maps+=("${LIT_MAP[*]}")
+  done
+  printf '%s\n' "${mt_text[@]}" > "$TMPD/subj/as-written"
+  printf '%s\n' "${lit[@]}" > "$TMPD/subj/literal"
+  cred_matches_all "$TMPD/rmatch" "$2" as-written literal
+  while IFS= read -r -d '' cid && IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
+    [[ "$l" =~ ^[0-9]+$ && -n "${mt_text[l - 1]+x}" ]] || die "internal error: $2 mask returned line $l"
+    # A private-key header is never a placeholder, as for a hit, and the key
+    # after it runs to the end of the element, not the 64 characters the rule
+    # reads: a one-line key printed whole after its header (/qaa, v0.11.5).
+    marker=0
+    for k in "${CRED_MARKERS[@]}"; do
+      if [[ "$k" == "$cid" ]]; then marker=1; fi
+    done
+    if [[ $marker -eq 0 ]] && is_placeholder "$m"; then continue; fi
+    r=$(( l - 1 ))
+    case "$f" in
+      as-written) t=${mt_text[r]}; map=() ;;
+      literal) t=${lit[r]}; read -r -a map <<< "${maps[r]}" ;;
+      *) die "internal error: $2 mask returned file $f" ;;
+    esac
+    # Every occurrence, overlapping ones included; a key the scan found and
+    # this cannot place must not print, so that is a scan error.
+    o=0; n=0
+    while [[ "${t:o}" == *"$m"* ]]; do
+      s=${t:o}; s=${s%%"$m"*}; o=$(( o + ${#s} )); e=$(( o + ${#m} - 1 ))
+      if [[ "$f" == literal ]]; then s=${map[o]}; e=${map[e]}; else s=$o; fi
+      if [[ $marker -eq 1 ]]; then e=$(( ${#mt_text[r]} - 1 )); fi
+      for (( k = s; k <= e; k++ )); do hide[$r:$k]=1; done
+      touched[$r]=1; o=$(( o + 1 )); n=$(( n + 1 ))
+    done
+    (( n > 0 )) || die "internal error: $2 mask could not place a match in line $l"
+  done < "$TMPD/rmatch"
+  # Runs from two scans that touch are one run.
+  for r in "${!touched[@]}"; do
+    render_masked "${mt_text[r]}" hide "$r:"
+    mt_text[r]=$REPLY
+  done
+}
+
 PATTERNS=()
 ALLOWLIST=()
 ALLOW_SCOPE=()   # per allow rule: "" (no credential hit), a credential id, or *
@@ -580,7 +796,6 @@ fi
 # every byte: under UTF-8 a Latin-1 ë is no character at all, and a Latin-1
 # file's home path for user zoë read clean (measured). A config pattern
 # keeps the caller's locale.
-in_c() { LC_ALL=C "$@"; }
 declare -A DEFAULT_RE=()
 for p in "${DEFAULTS[@]}"; do DEFAULT_RE["l$p"]=1; done
 pat_args() {
@@ -634,20 +849,6 @@ case "$CONFIG_ABS" in
     ;;
 esac
 
-TMPD="$(mktemp -d "${TMPDIR:-/tmp}/leakcheck.XXXXXX")" || die "cannot create a temp dir"
-# Scan the objects a push publishes, in every git call from here on: replace
-# refs and a local info/grafts file both rewrite what git shows, and a graft
-# that makes HEAD a root hid a leak from --history, exit 0 (found by /cxr,
-# reproduced). A graft file that does not exist turns grafts off with no
-# output; GIT_GRAFT_FILE=/dev/null also does, but prints the deprecation hint
-# in every repo, which run_git rightly reads as a scan error (both measured).
-export GIT_NO_REPLACE_OBJECTS=1
-export GIT_GRAFT_FILE="$TMPD/no-grafts"
-# Pathspec magic is the script's to choose: GIT_LITERAL_PATHSPECS=1 made
-# `:(literal).leakcheckrc.local` a filename matching nothing, and a committed
-# .leakcheckrc.local in history then read clean, exit 0 (measured).
-unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_ICASE_PATHSPECS
-mkdir "$TMPD/subj"
 
 # Binary detection must depend on content alone. git grep -I otherwise
 # honours .gitattributes, and `*.svg binary` (a common line) would
@@ -663,21 +864,6 @@ g() {
     git -c core.attributesFile=/dev/null "$@"
 }
 
-# run_git <label> <out-file> <command...>: stdout to <out-file>. Exit 0 or
-# 1 is a result; any other status, or ANY stderr, is a scan error. git grep
-# reports an unreadable worktree file on stderr and still exits 1, which
-# would otherwise read as "no match" (measured, git 2.53).
-run_git() {
-  local label=$1 out=$2 rc=0
-  shift 2
-  "$@" > "$out" 2> "$TMPD/err" || rc=$?
-  if [[ $rc -gt 1 || -s "$TMPD/err" ]]; then
-    echo "leakcheck: scan error: $label (git exited $rc)" >&2
-    sed 's/^/  /' "$TMPD/err" >&2
-    exit 2
-  fi
-  return 0
-}
 
 GREP_FLAGS=(-z --no-color --no-column --no-textconv --no-recurse-submodules)
 
@@ -953,9 +1139,7 @@ if [[ ${#TC_PATHS[@]} -gt 0 ]]; then
   mkdir "$TMPD/tc"
   for k in "${!TC_PATHS[@]}"; do
     if ! cp -- "${TC_PATHS[$k]}" "$TMPD/tc/$k" 2>"$TMPD/err"; then
-      echo "leakcheck: scan error: cannot read ${TC_PATHS[$k]}" >&2
-      sed 's/^/  /' "$TMPD/err" >&2
-      exit 2
+      fail_err "leakcheck: scan error: cannot read ${TC_PATHS[$k]}"
     fi
   done
   gni() { GIT_ATTR_NOSYSTEM=1 git -c core.attributesFile=/dev/null -C "$TMPD/tc" grep --no-index "$@"; }
@@ -993,9 +1177,7 @@ for path in "${PATHS[@]}"; do
 done
 for i in "${!LINK_PATHS[@]}"; do
   if ! tgt="$(git cat-file blob "${LINK_OIDS[$i]}" 2>"$TMPD/err")"; then
-    echo "leakcheck: scan error: cannot read symlink ${LINK_PATHS[$i]}" >&2
-    sed 's/^/  /' "$TMPD/err" >&2
-    exit 2
+    fail_err "leakcheck: scan error: cannot read symlink ${LINK_PATHS[$i]}"
   fi
   S_PATH+=("${LINK_PATHS[$i]}"); S_SUBJ+=("$tgt"); S_TEXT+=("-> $tgt"); S_SRC+=("index")
 done
@@ -1774,35 +1956,8 @@ fi
 # path, a ref name or a tag name is masked wherever that name is printed — in
 # every hit's path, and in a hit whose text is the name — since it would
 # otherwise ride along in the location of every hit in that file.
-# A hit whose every match is a stand-in (is_placeholder) is not reported, and
-# is counted. Each test is something a random secret all but never does — 8
-# equal characters in a row, or 8 letters or digits counting up, is under one
-# in a million even for a 64-character hex key — and that docs and fixtures
-# do all the time: an X-filled key, an alphabet run, AWS's documented key
-# ending in EXAMPLE. A run of `A` does not count: it is base64 for zero bytes,
-# and a format holding zero-filled fields has one in every real key —
-# OpenSSH's unencrypted private key (measured: nine As in its first 64
-# characters), and by its msgpack layout Fly.io's macaroon token.
-# A private-key header is never a placeholder: the body after it is base64
-# of a structured format, and the rule's key-after-the-header requirement is
-# what tells a fixture from a key.
-is_placeholder() { # match
-  local LC_ALL=C m=$1 i c o prev=-2 same=0 up=0
-  if [[ "$m" == *EXAMPLE* || "$m" == *example* ]]; then return 0; fi
-  for (( i = 0; i < ${#m}; i++ )); do
-    c=${m:i:1}
-    printf -v o '%d' "'$c"
-    if (( o == prev )) && [[ "$c" != A ]]; then same=$((same + 1)); else same=1; fi
-    if (( o == prev + 1 )) && [[ "$c" == [A-Za-z0-9] && "${m:i-1:1}" == [A-Za-z0-9] ]]; then
-      up=$((up + 1))
-    else
-      up=1
-    fi
-    if (( same >= 8 || up >= 8 )); then return 0; fi
-    prev=$o
-  done
-  return 1
-}
+# A hit whose every match is a stand-in (is_placeholder, with the masking
+# helpers) is not reported, and is counted.
 # cred_show <label> <match>: a header as found; anything else as its first
 # four characters and its length.
 cred_show() {
@@ -1822,29 +1977,6 @@ cred_show() {
 is_name_hit() { # hit
   [[ "${H_LINE[$1]}" == 0 ]] || return 1
   [[ "${H_FILE[$1]}" == "${H_TEXT[$1]}" || "${H_FILE[$1]}" == "(ref)" || "${H_FILE[$1]}" == "(tag)" ]]
-}
-# Every built-in rule over FILEs in $TMPD/subj, whatever this config runs:
-# `disable` and `no-credentials` choose which hits to look for, never which
-# keys may print. One rule per -o grep, since git resumes after a match and
-# with every rule in one grep a key swallowed the start of the key after it
-# (/qaa, v0.11.5); one grep with them all first says whether any is needed.
-# OUT gets <id>\0<file>\0<line>\0<match>\n per match.
-cred_matches_all() { # out label file...
-  local out=$1 label=$2 k f l m
-  shift 2
-  local -a cre=()
-  for (( k = 1; k < ${#CREDENTIALS[@]}; k += 2 )); do cre+=(-e "${CREDENTIALS[k]}"); done
-  : > "$out"
-  run_git "credential rules ($label)" "$TMPD/cmatch" \
-    in_c git -C "$TMPD/subj" grep --no-index -a -l -E "${cre[@]}" -- "$@"
-  [[ -s "$TMPD/cmatch" ]] || return 0
-  for (( k = 0; k < ${#CREDENTIALS[@]}; k += 2 )); do
-    run_git "credential rule ${CREDENTIALS[k]} ($label)" "$TMPD/cmatch" \
-      in_c git -C "$TMPD/subj" grep --no-index -a -z -n -o --no-color --no-column -E -e "${CREDENTIALS[k + 1]}" -- "$@"
-    while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
-      printf '%s\0%s\0%s\0%s\n' "${CREDENTIALS[k]}" "$f" "$l" "$m"
-    done < "$TMPD/cmatch" >> "$out"
-  done
 }
 
 # Credentials in names, from the name hits; mask_names <string> -> REPLY.
@@ -1875,23 +2007,6 @@ if [[ ${#H_FILE[@]} -gt 0 ]]; then
     NAME_TOKS+=("$tok")
   done < "$TMPD/nmatch"
 fi
-# TEXT with each run of hidden bytes shown as its first four and its length,
-# a hit's mask; HIDE names an associative array keyed PREFIX<byte offset>.
-render_masked() { # text hide-array prefix -> REPLY
-  local LC_ALL=C t=$1 pre=$3 k run=-1
-  local -n rm_hide=$2
-  REPLY=""
-  for (( k = 0; k <= ${#t}; k++ )); do
-    if [[ $k -lt ${#t} && -n "${rm_hide[$pre$k]+x}" ]]; then
-      if [[ $run -lt 0 ]]; then run=$k; fi
-      continue
-    fi
-    if [[ $run -ge 0 ]]; then
-      REPLY+="${t:run:4}[redacted, $(( k - run )) chars]"; run=-1
-    fi
-    if [[ $k -lt ${#t} ]]; then REPLY+=${t:k:1}; fi
-  done
-}
 # Every occurrence of every token marks its bytes, and each run prints once:
 # replacing tokens one after another let a shorter match over a longer one's
 # bytes break it, and the longer one's tail printed (Codex, v0.11.6).
@@ -1978,87 +2093,8 @@ SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodule
 # a stand-in — and the JSON report prints every rule: each credential in one
 # that is not a placeholder is masked there, like a hit's.
 ALLOW_SHOW=("${ALLOW_TEXT[@]}")
-# Masked by EVERY built-in rule, whatever this config runs: `disable` and
-# `no-credentials` say which hits to look for, not which keys may be printed,
-# and an allow rule naming a disabled rule's key printed it raw (/qaa, v0.11.2).
-# A rule is a regex, so a careful writer escapes a key's punctuation, and
-# `SG\.<body>\.<body>` matches no credential rule as written: the rules also
-# run over a literal form, and what they find there masks the bytes of the
-# rule it came from (literal_form's map). The as-written scan stays for what
-# the literal form loses — a backslash a rule's class accepts — and both
-# scans mark bytes of the one text, so neither can unmask the other's key:
-# v0.11.4 showed the literal form instead, and a key only the as-written
-# scan found was no longer there to mask (/cxr, v0.11.4).
 if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 ]]; then
-  # The literal form of a rule, for the key scan only, never printed: a `\`
-  # before punctuation dropped, a one-character bracket such as `[.]`
-  # unwrapped, and parentheses dropped, so `SG\.(<body>)\.(<body>)` reads as
-  # the key it matches (/cxr, v0.11.4). LIT_MAP[i] is the offset in the rule
-  # of the literal form's i-th byte. An alternation, a quantifier or a wider
-  # bracket has no literal form; the README says so.
-  literal_form() {
-    local LC_ALL=C s=$1 i=0 c d
-    LIT=""; LIT_MAP=()
-    while (( i < ${#s} )); do
-      c=${s:i:1}; d=${s:i+1:1}
-      if [[ "$c" == '\' && -n "$d" && "$d" != [A-Za-z0-9] ]]; then
-        LIT+=$d; LIT_MAP+=("$(( i + 1 ))"); i=$(( i + 2 ))
-      elif [[ "$c" == '[' && -n "$d" && "${s:i+2:1}" == ']' && "$d" != ']' && "$d" != '^' && "$d" != '\' && "$d" != '[' ]]; then
-        LIT+=$d; LIT_MAP+=("$(( i + 1 ))"); i=$(( i + 3 ))
-      elif [[ "$c" == '(' || "$c" == ')' ]]; then
-        i=$(( i + 1 ))
-      else
-        LIT+=$c; LIT_MAP+=("$i"); i=$(( i + 1 ))
-      fi
-    done
-  }
-  mask_allow_rules() {
-    local LC_ALL=C r f l m t o s e k n cid marker
-    local -a lit=() maps=() map=()
-    local -A hide=() touched=()
-    for r in "${!ALLOW_TEXT[@]}"; do
-      literal_form "${ALLOW_TEXT[r]}"
-      lit+=("$LIT"); maps+=("${LIT_MAP[*]}")
-    done
-    printf '%s\n' "${ALLOW_TEXT[@]}" > "$TMPD/subj/allow-rules"
-    printf '%s\n' "${lit[@]}" > "$TMPD/subj/allow-literal"
-    cred_matches_all "$TMPD/rmatch" "allow rules" allow-rules allow-literal
-    while IFS= read -r -d '' cid && IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
-      [[ "$l" =~ ^[0-9]+$ && -n "${ALLOW_TEXT[l - 1]+x}" ]] || die "internal error: allow-rule mask returned line $l"
-      # A private-key header is never a placeholder, as for a hit, and the key
-      # after it runs to the end of the rule, not the 64 characters the rule
-      # reads: a one-line key printed whole after its header (/qaa, v0.11.5).
-      marker=0
-      if [[ -n "${CRED_MARKER["lcredential:$cid"]+x}" ]]; then
-        marker=1
-      elif is_placeholder "$m"; then
-        continue
-      fi
-      r=$(( l - 1 ))
-      case "$f" in
-        allow-rules) t=${ALLOW_TEXT[r]}; map=() ;;
-        allow-literal) t=${lit[r]}; read -r -a map <<< "${maps[r]}" ;;
-        *) die "internal error: allow-rule mask returned file $f" ;;
-      esac
-      # Every occurrence, overlapping ones included; a key the scan found and
-      # this cannot place must not print, so that is a scan error.
-      o=0; n=0
-      while [[ "${t:o}" == *"$m"* ]]; do
-        s=${t:o}; s=${s%%"$m"*}; o=$(( o + ${#s} )); e=$(( o + ${#m} - 1 ))
-        if [[ "$f" == allow-literal ]]; then s=${map[o]}; e=${map[e]}; else s=$o; fi
-        if [[ $marker -eq 1 ]]; then e=$(( ${#ALLOW_TEXT[r]} - 1 )); fi
-        for (( k = s; k <= e; k++ )); do hide[$r:$k]=1; done
-        touched[$r]=1; o=$(( o + 1 )); n=$(( n + 1 ))
-      done
-      (( n > 0 )) || die "internal error: allow-rule mask could not place a match in rule $l"
-    done < "$TMPD/rmatch"
-    # Runs from two scans that touch are one run.
-    for r in "${!touched[@]}"; do
-      render_masked "${ALLOW_TEXT[r]}" hide "$r:"
-      ALLOW_SHOW[r]=$REPLY
-    done
-  }
-  mask_allow_rules
+  mask_texts ALLOW_SHOW "allow rules"
 fi
 
 # ─── output ───────────────────────────────────────────────────────────

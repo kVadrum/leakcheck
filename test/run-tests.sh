@@ -2758,6 +2758,95 @@ t_config_errors_never_echo_a_key_for_a_rule_id() {
   done
 }
 
+t_config_errors_mask_a_key_in_the_regex() {
+  # An error quotes the rule it refuses, and git's own error quotes a
+  # pattern it cannot compile: a key written there printed whole (v0.11.6
+  # §4). Each error still names its line and its reason, the key masked;
+  # one escaped with `\.` is found in its literal form, and a private key
+  # header masks to the end of the line.
+  local gh sg pk body k nb=$'\xc2\xa0'
+  gh=$(cred github-token); sg=$(cred sendgrid-key); pk=$(cred private-key)
+  body=$(python3 -c 'import random, string; r = random.Random(7); print("".join(r.choice(string.ascii_letters + string.digits + "+/") for _ in range(200)))')
+  seed a.txt "x"
+  commit init
+  local -a cases=(   # config line, then what the error says
+    "pattern $gh\\d"            ".leakcheckrc:1: pattern '$(masked "$gh")\\d': '\\d' is a plain 'd'"
+    "allow [$gh\\d]"            ".leakcheckrc:1: allow '[$(masked "$gh")\\d]': inside [...] a backslash is literal"
+    "pattern $gh "              ".leakcheckrc:1: pattern '$(masked "$gh") ' ends in whitespace"
+    "allow $gh$nb"              ".leakcheckrc:1: allow '$(masked "$gh")$nb' begins or ends in an invisible Unicode space"
+    "allow $gh|"                ".leakcheckrc:1: allow '$(masked "$gh")|' matches the empty string"
+    "pattern $gh("              "scan error: pattern '$(masked "$gh")(' (git exited 128)"
+    "$gh"                       "unknown directive: $(masked "$gh")"
+    "allow ${sg//./\\.}\\d"     ".leakcheckrc:1: allow '$(masked "${sg//./\\.}")\\d': '\\d' is a plain 'd'"
+  )
+  for (( k = 0; k < ${#cases[@]}; k += 2 )); do
+    rc_file "${cases[k]}"
+    assert_exit 2 "$BIN"
+    assert_contains "${cases[k + 1]}" "$LC_ERR"
+    assert_not_contains "${gh:4:30}" "$LC_ERR"
+    assert_not_contains "${sg:6:20}" "$LC_ERR"
+  done
+  # git's own message quotes the pattern too.
+  rc_file "pattern $gh("
+  assert_exit 2 "$BIN"
+  assert_contains "  fatal: -e option, '$(masked "$gh")(': Unmatched" "$LC_ERR"
+  rc_file "pattern $pk$body\\d"
+  assert_exit 2 "$BIN"
+  assert_contains ".leakcheckrc:1: pattern '----[redacted, " "$LC_ERR"
+  assert_not_contains "${body:20:30}" "$LC_ERR"
+  assert_not_contains "${body:170:30}" "$LC_ERR"
+}
+
+t_scan_errors_mask_a_key_in_a_path() {
+  # A scan error names the file it could not read, in its own line and in
+  # git's or cp's message; a key in that file's name printed whole there,
+  # though every hit masks it.
+  [[ "$(id -u)" -ne 0 ]] || return 0   # root reads everything
+  local gh got
+  gh=$(cred github-token)
+  seed "d$gh.md" "ok"
+  ln -s elsewhere "t$gh"
+  git add -- "t$gh"
+  commit init
+  chmod 000 "d$gh.md"
+  got=0
+  "$BIN" >"$LC_OUT" 2>"$LC_ERR" || got=$?
+  chmod 644 "d$gh.md"
+  [[ "$got" -eq 2 ]] || { echo "    expected exit 2, got $got"; cat "$LC_ERR"; return 1; }
+  assert_contains "scan error" "$LC_ERR"
+  assert_contains "d$(masked "$gh").md" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+  # A type change copied out for its scan: an index symlink, now a file
+  # that cannot be read.
+  git rm -q --cached "d$gh.md"
+  rm -f "d$gh.md" "t$gh"
+  commit drop
+  printf 'ok\n' > "t$gh"
+  chmod 000 "t$gh"
+  got=0
+  "$BIN" >"$LC_OUT" 2>"$LC_ERR" || got=$?
+  chmod 644 "t$gh"
+  [[ "$got" -eq 2 ]] || { echo "    expected exit 2, got $got"; cat "$LC_ERR"; return 1; }
+  assert_contains "scan error: cannot read t$(masked "$gh")" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+}
+
+t_error_masking_failure_prints_nothing_of_the_message() {
+  # If the masking cannot run, the message is withheld rather than printed
+  # unchecked. Break the first git call of the masking in a copy.
+  local gh
+  gh=$(cred github-token)
+  seed a.txt "x"
+  rc_file "pattern $gh\\d"
+  commit init
+  sed 's/grep --no-index -a -l -E "\${cre\[@\]}"/grep --no-such-flag/' "$BIN" > .git/mutated.sh
+  grep -q -- '--no-such-flag' .git/mutated.sh
+  assert_exit 2 bash .git/mutated.sh
+  assert_contains "it is not printed" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+  assert_not_contains ".leakcheckrc:1" "$LC_ERR"
+}
+
 t_credential_rules_read_a_type_changed_config() {
   # .leakcheckrc a symlink in the index and a file on disk: `git commit -a`
   # publishes the file, a token in it included. Its own pattern lines are
@@ -3198,6 +3287,9 @@ lc_test "credentials: a private key to its end"     t_credential_allow_rule_priv
 lc_test "credentials: keys back to back"            t_credential_allow_rule_back_to_back_keys_are_masked
 lc_test "credentials: a disabled rule masks names"  t_credential_disabled_rule_still_masks_names
 lc_test "config errors never echo a key"            t_config_errors_never_echo_a_key_for_a_rule_id
+lc_test "config errors mask a key in the regex"     t_config_errors_mask_a_key_in_the_regex
+lc_test "scan errors mask a key in a path"          t_scan_errors_mask_a_key_in_a_path
+lc_test "a failed error mask prints nothing"        t_error_masking_failure_prints_nothing_of_the_message
 lc_test "credentials: overlapping keys in a name"   t_credential_overlapping_keys_in_a_name_are_masked
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
