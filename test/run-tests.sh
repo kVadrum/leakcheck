@@ -2888,6 +2888,48 @@ t_no_patterns_is_an_error() {
   assert_contains "leakcheck: no patterns to scan (defaults disabled and config empty)" "$LC_ERR"
 }
 
+t_command_line_errors_mask_a_key() {
+  # An error repeating an argument or a path printed before the masking
+  # existed: a CI log shows an expanded `--config "$X"` or `--root "$X"`, a
+  # key included, that the runner's echo of the command does not (Codex,
+  # /qaa of v0.11.8). Each still names its reason, exit 2, and a flag error
+  # is still followed by the usage.
+  local gh usage="leakcheck — scan a repo's tracked files"
+  gh=$(cred github-token)
+  seed a.txt "x"
+  commit init
+  assert_exit 2 "$BIN" --config "c$gh.rc"
+  assert_contains "leakcheck: config not found: c$(masked "$gh").rc" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+  assert_exit 2 "$BIN" --root "r$gh"
+  assert_contains "leakcheck: cannot cd to r$(masked "$gh")" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+  assert_exit 2 "$BIN" --history-range "--$gh"
+  assert_contains "leakcheck: --history-range takes a revision range, not an option: --$(masked "$gh")" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+  assert_exit 2 "$BIN" "--token=$gh"
+  assert_contains "leakcheck: unknown flag: --token=$(masked "$gh")" "$LC_ERR"
+  assert_contains "$usage" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+  assert_exit 2 "$BIN" --json "$gh"
+  assert_contains "leakcheck: unexpected arg: $(masked "$gh")" "$LC_ERR"
+  assert_contains "$usage" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+  # The repo's own path, in an error about a config at its top level.
+  mkdir "r$gh"
+  git -C "r$gh" init -q
+  ln -s nowhere "r$gh/.leakcheckrc"
+  assert_exit 2 "$BIN" --root "r$gh"
+  assert_contains "/r$(masked "$gh")/.leakcheckrc" "$LC_ERR"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+  # The temp dir now comes before the cds, so a relative TMPDIR names a place
+  # from where the run started, whatever --root or the top level says.
+  mkdir -p .git/rt sub
+  TMPDIR=.git/rt assert_exit 2 "$BIN" --root sub --config "c$gh.rc"
+  assert_contains "leakcheck: config not found: c$(masked "$gh").rc" "$LC_ERR"
+  (cd sub && TMPDIR=../.git/rt assert_exit 0 "$BIN")
+}
+
 t_credential_rules_read_a_type_changed_config() {
   # .leakcheckrc a symlink in the index and a file on disk: `git commit -a`
   # publishes the file, a token in it included. Its own pattern lines are
@@ -3333,6 +3375,7 @@ lc_test "scan errors mask a key in a path"          t_scan_errors_mask_a_key_in_
 lc_test "a failed error mask prints nothing"        t_error_masking_failure_prints_nothing_of_the_message
 lc_test "error masking ignores the caller's git"    t_error_masking_runs_apart_from_the_callers_git
 lc_test "no patterns at all is an error"            t_no_patterns_is_an_error
+lc_test "command-line errors mask a key"            t_command_line_errors_mask_a_key
 lc_test "credentials: overlapping keys in a name"   t_credential_overlapping_keys_in_a_name_are_masked
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder

@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.11.9*
+*README v0.11.10*
 
 ## Install
 
@@ -130,7 +130,7 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
   Names are masked by every built-in credential rule, whatever `disable` or `no-credentials` says: those choose which hits to look for, not which keys may be printed.
   A private key header is printed as found, since the key itself is on the lines after it.
 - **An error message masks a credential the same way.**
-  An error quotes what it is about — the config line it refuses, git's own message about a pattern it cannot compile, a file it cannot read — and every built-in rule masks a key there, a regex read in its literal form as in an allow rule below, with the same limit; a private key header is masked with the rest of its line.
+  An error quotes what it is about — an argument or a path given on the command line, the config line it refuses, git's own message about a pattern it cannot compile, a file it cannot read — and every built-in rule masks a key there, a regex read in its literal form as in an allow rule below, with the same limit; a private key header is masked with the rest of its line.
 - **Only an allow rule that names the credential rule excuses its hits**: `allow credential:<rule> <regex>`, or `allow credential:* <regex>` for every credential rule.
   A plain `allow` never excuses a credential, so a location rule written for home paths (`allow ^fixtures/`) cannot hide a key beside them; when one would have, a last line on stderr says how many such hits were reported anyway.
   A scoped rule still sees the real text, so `allow credential:github-token` followed by the token excuses that token's hits — and, since a rule is matched against the path too, every hit of that rule in a file whose name holds it.

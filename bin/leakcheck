@@ -90,7 +90,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.11.9"
+VERSION="0.11.10"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -99,15 +99,19 @@ HIST_RANGE=""
 LIST_ONLY=0
 CONFIG_FILE=""
 ROOT=""
+ARG_ERR=""
 
 # Every error leaves through fail, masked by every built-in rule once the
 # temp dir exists (mask_texts): an error quotes what it is about — a config
 # line, git's own message about a pattern, a path — and a key written there
 # printed whole (v0.11.6 §4). One exit, so a message added later is masked
-# without anyone remembering to. The temp dir is made before any config is
-# read, so a message before it quotes only the command line. A failure while
-# masking prints nothing of the message.
+# without anyone remembering to. Nothing the caller wrote is checked before
+# the masking exists — an argument, a path, a config — so a message before it
+# quotes none of it: a CI log shows an expanded `--config "$X"`, a key
+# included, where the runner's echo of the command does not (Codex, /qaa of
+# v0.11.8). A failure while masking prints nothing of the message.
 ERR_BUSY=0
+FAIL_USAGE=0 # the usage follows the message: a command-line error
 fail() { # line... -> stderr, exit 2
   if [[ $ERR_BUSY -eq 1 ]]; then
     echo "leakcheck: error while checking an error message for credentials; it is not printed" >&2
@@ -120,6 +124,7 @@ fail() { # line... -> stderr, exit 2
   mapfile -t fail_lines <<< "${fail_msg%$'\n'}"
   if [[ -n "$TMPD" ]]; then mask_texts fail_lines "error message"; fi
   printf '%s\n' "${fail_lines[@]}" >&2
+  if [[ $FAIL_USAGE -eq 1 ]]; then usage 2 >&2; fi
   exit 2
 }
 die() { fail "leakcheck: $*"; }
@@ -156,71 +161,11 @@ while [[ $# -gt 0 ]]; do
     -V|--version)      echo "leakcheck $VERSION"; exit 0 ;;
     -h|--help)         usage 0 ;;
     --)                shift; break ;;
-    -*)                echo "leakcheck: unknown flag: $1" >&2; usage 2 >&2 ;;
-    *)                 echo "leakcheck: unexpected arg: $1" >&2; usage 2 >&2 ;;
+    # Both repeat the argument, so they wait for the masking (fail).
+    -*)                ARG_ERR="unknown flag: $1"; break ;;
+    *)                 ARG_ERR="unexpected arg: $1"; break ;;
   esac
 done
-
-# The range reaches git as a revision argument, so an option-shaped value
-# (`--all`, `--since=…`, `--first-parent`) would change what the walk means
-# instead of naming commits.
-case "$HIST_RANGE" in
-  -*) die "--history-range takes a revision range, not an option: $HIST_RANGE" ;;
-esac
-
-if [[ -n "$ROOT" ]]; then
-  cd -- "$ROOT" 2>/dev/null || die "cannot cd to $ROOT"
-fi
-
-# An explicit --config resolves against the cwd as it stands now: after
-# --root ("run as if started in DIR", as `git -C` means it) and before the
-# move to the top level below, so a relative path typed in a subdirectory
-# still means what it says. A named config that is missing is an error —
-# proceeding on defaults alone is a confident clean pass over a repo that
-# nothing the caller asked for actually checked.
-CONFIG_ABS=""
-if [[ -n "$CONFIG_FILE" ]]; then
-  [[ -f "$CONFIG_FILE" ]] || die "config not found: $CONFIG_FILE"
-  [[ -r "$CONFIG_FILE" ]] || die "config not readable: $CONFIG_FILE"
-  cfg_dir="$(cd -- "$(dirname -- "$CONFIG_FILE")" && pwd -P)" \
-    || die "cannot resolve config path: $CONFIG_FILE"
-  CONFIG_ABS="$cfg_dir/$(basename -- "$CONFIG_FILE")"
-fi
-
-# Always scan from the top level. `git ls-files` and `git grep` are
-# cwd-relative, so a run from a subdirectory used to scan that subtree,
-# miss the root .leakcheckrc, and report clean with a plausible count.
-top="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git work tree"
-[[ -n "$top" ]] || die "not inside a git work tree"
-cd -- "$top" || die "cannot cd to $top"
-top="$(pwd -P)"
-
-# Config files, read in order. An explicit --config is the whole config.
-# Without one: .leakcheckrc, then .leakcheckrc.local — the gitignored home
-# for the tells you would rather not commit, since a committed config is an
-# inventory of exactly what you are hiding. Either may be absent; one that
-# exists but is not a readable regular file (a dangling symlink, a
-# directory) is a config that cannot be read, not "no config".
-CONFIG_FILES=()
-CONFIG_NAMES=()
-if [[ -n "$CONFIG_ABS" ]]; then
-  CONFIG_FILES=("$CONFIG_ABS")
-  CONFIG_NAMES=("$CONFIG_FILE")
-else
-  for name in .leakcheckrc .leakcheckrc.local; do
-    if [[ -f "$top/$name" ]]; then
-      [[ -r "$top/$name" ]] || die "config not readable: $top/$name"
-      CONFIG_FILES+=("$top/$name")
-      CONFIG_NAMES+=("$name")
-    elif [[ -e "$top/$name" || -L "$top/$name" ]]; then
-      die "config is not a regular file: $top/$name"
-    fi
-  done
-  # Only the committable .leakcheckrc has its content exempt from the scan.
-  # A TRACKED .leakcheckrc.local is the inventory published: its own
-  # pattern lines are left to report it.
-  if [[ -f "$top/.leakcheckrc" ]]; then CONFIG_ABS="$top/.leakcheckrc"; fi
-fi
 
 # Default patterns. Only the universally-bad shapes — absolute home paths
 # with a username, on each major OS. Tilde-prefixed paths (`~/...`,
@@ -378,7 +323,10 @@ CREDENTIALS=(
 # SOFTWARE.
 
 # ─── temp dir and error masking ───────────────────────────────────────
-TMPD="$(mktemp -d "${TMPDIR:-/tmp}/leakcheck.XXXXXX")" || die "cannot create a temp dir"
+# Absolute: the cds to --root and the top level come after it.
+tmp_base=${TMPDIR:-/tmp}
+[[ "$tmp_base" == /* ]] || tmp_base="$PWD/$tmp_base"
+TMPD="$(mktemp -d "$tmp_base/leakcheck.XXXXXX")" || die "cannot create a temp dir"
 # Scan the objects a push publishes, in every git call from here on: replace
 # refs and a local info/grafts file both rewrite what git shows, and a graft
 # that makes HEAD a root hid a leak from --history, exit 0 (found by /cxr,
@@ -581,6 +529,73 @@ mask_texts() { # array label
     mt_text[r]=$REPLY
   done
 }
+
+# ─── command line, repo and config paths ─────────────────────────────
+# Checked only now that an error is masked: each check below repeats what
+# the caller wrote (fail). First the argument the loop stopped at; usage
+# reads "$0", so before any cd.
+if [[ -n "$ARG_ERR" ]]; then FAIL_USAGE=1; die "$ARG_ERR"; fi
+
+# The range reaches git as a revision argument, so an option-shaped value
+# (`--all`, `--since=…`, `--first-parent`) would change what the walk means
+# instead of naming commits.
+case "$HIST_RANGE" in
+  -*) die "--history-range takes a revision range, not an option: $HIST_RANGE" ;;
+esac
+
+if [[ -n "$ROOT" ]]; then
+  cd -- "$ROOT" 2>/dev/null || die "cannot cd to $ROOT"
+fi
+
+# An explicit --config resolves against the cwd as it stands now: after
+# --root ("run as if started in DIR", as `git -C` means it) and before the
+# move to the top level below, so a relative path typed in a subdirectory
+# still means what it says. A named config that is missing is an error —
+# proceeding on defaults alone is a confident clean pass over a repo that
+# nothing the caller asked for actually checked.
+CONFIG_ABS=""
+if [[ -n "$CONFIG_FILE" ]]; then
+  [[ -f "$CONFIG_FILE" ]] || die "config not found: $CONFIG_FILE"
+  [[ -r "$CONFIG_FILE" ]] || die "config not readable: $CONFIG_FILE"
+  cfg_dir="$(cd -- "$(dirname -- "$CONFIG_FILE")" && pwd -P)" \
+    || die "cannot resolve config path: $CONFIG_FILE"
+  CONFIG_ABS="$cfg_dir/$(basename -- "$CONFIG_FILE")"
+fi
+
+# Always scan from the top level. `git ls-files` and `git grep` are
+# cwd-relative, so a run from a subdirectory used to scan that subtree,
+# miss the root .leakcheckrc, and report clean with a plausible count.
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git work tree"
+[[ -n "$top" ]] || die "not inside a git work tree"
+cd -- "$top" || die "cannot cd to $top"
+top="$(pwd -P)"
+
+# Config files, read in order. An explicit --config is the whole config.
+# Without one: .leakcheckrc, then .leakcheckrc.local — the gitignored home
+# for the tells you would rather not commit, since a committed config is an
+# inventory of exactly what you are hiding. Either may be absent; one that
+# exists but is not a readable regular file (a dangling symlink, a
+# directory) is a config that cannot be read, not "no config".
+CONFIG_FILES=()
+CONFIG_NAMES=()
+if [[ -n "$CONFIG_ABS" ]]; then
+  CONFIG_FILES=("$CONFIG_ABS")
+  CONFIG_NAMES=("$CONFIG_FILE")
+else
+  for name in .leakcheckrc .leakcheckrc.local; do
+    if [[ -f "$top/$name" ]]; then
+      [[ -r "$top/$name" ]] || die "config not readable: $top/$name"
+      CONFIG_FILES+=("$top/$name")
+      CONFIG_NAMES+=("$name")
+    elif [[ -e "$top/$name" || -L "$top/$name" ]]; then
+      die "config is not a regular file: $top/$name"
+    fi
+  done
+  # Only the committable .leakcheckrc has its content exempt from the scan.
+  # A TRACKED .leakcheckrc.local is the inventory published: its own
+  # pattern lines are left to report it.
+  if [[ -f "$top/.leakcheckrc" ]]; then CONFIG_ABS="$top/.leakcheckrc"; fi
+fi
 
 PATTERNS=()
 ALLOWLIST=()
