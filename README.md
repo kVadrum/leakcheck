@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.11.10*
+*README v0.11.11*
 
 ## Install
 
@@ -111,6 +111,7 @@ Built-in rules also find keys and tokens in the formats their issuers fixed, by 
 - keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana, Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare origin CA and Mapbox.
 
 A key or webhook URL is found with its slashes JSON-escaped, `\/`, as PHP's `json_encode` and others write them.
+A key is found inside a longer run of characters too, with one exception: a DeepSeek key, `sk-` and 32 hex digits, is also how generated names end (`task-…`, `desk-…`), so it is not found right after a lowercase letter.
 
 Most of these rules are derived from the default rules of [gitleaks](https://github.com/gitleaks/gitleaks) (MIT): the script names, beside each one, the gitleaks rule it follows, and carries gitleaks' license notice, as does [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
 

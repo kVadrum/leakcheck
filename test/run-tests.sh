@@ -2730,16 +2730,70 @@ t_credential_overlapping_keys_in_a_name_are_masked() {
   # characters printed in every hit on the file (Codex, v0.11.6). A legacy
   # openai-key is `sk-` and 40 characters; its first 32, if hex, are a
   # deepseek-key.
+  # The directory is `d-`, not `d`: since v0.11.11 a deepseek-key may not
+  # follow a lowercase letter, and the overlap is the point.
   local ds tok
   ds=$(cred deepseek-key); tok="$ds${ds:3:8}"
-  seed "d$tok/a.txt" "see /home/alice/x"
+  seed "d-$tok/a.txt" "see /home/alice/x"
   rc_file 'disable credential:openai-key'
   commit init
   assert_exit 1 "$BIN"
-  assert_contains "d$(masked "$tok")/a.txt:1: [" "$LC_OUT"
+  assert_contains "d-$(masked "$tok")/a.txt:1: [" "$LC_OUT"
   assert_not_contains "${tok: -8}" "$LC_OUT"
   assert_exit 1 "$BIN" --json
   assert_not_contains "${tok: -8}" "$LC_OUT"
+}
+
+t_credential_deepseek_key_has_a_left_edge() {
+  # `sk-` + 32 hex inside a name — desk-, task-, flask-, ask- — is no key
+  # (the corpus harness's three look-alikes, v0.11.1 to v0.11.10). A key
+  # after punctuation, at a line's start or after a JSON escape still hits,
+  # and prints from its `sk-`: the edge character is not part of the key.
+  local ds hex
+  ds=$(cred deepseek-key); hex=${ds:3}
+  seed a.txt "$(printf 'desk-%s\ntask-%s\nflask-%s\nAsk ask-%s' "$hex" "$hex" "$hex" "$hex")"
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 0 "$BIN"
+  seed b.txt "$(printf 'KEY=%s\n%s\n"x\\n%s"' "$ds" "$ds" "$ds")"
+  commit b
+  assert_exit 1 "$BIN"
+  local n
+  for n in 1 2 3; do
+    assert_contains "b.txt:$n: [credential:deepseek-key] $(masked "$ds")" "$LC_OUT"
+  done
+  assert_contains "leakcheck: 3 match(es)" "$LC_ERR"
+}
+
+t_credential_left_edge_is_not_masked_in_a_name() {
+  # Guard (passes on v0.11.10, which had no edge): the character before a
+  # deepseek-key in a path is not part of the key, so it prints; a mask
+  # spanning it would print `=sk-` and one character too many.
+  local ds
+  ds=$(cred deepseek-key)
+  seed "k=$ds/a.txt" "see /home/alice/x"
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "k=$(masked "$ds")/a.txt:1: [" "$LC_OUT"
+}
+
+t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form() {
+  # Guard for v0.11.10 (no edge there): `(?i)sk\-<hex>` names the key with
+  # an escape, so only the literal form finds it, and that form dropped the
+  # parentheses alone, leaving `?isk-<hex>` — an `i` the deepseek edge
+  # refuses, so the key printed. The literal form drops `(?i)` whole.
+  local ds
+  ds=$(cred deepseek-key)
+  seed c.txt "k=$ds"
+  rc_file "allow credential:deepseek-key (?i)sk\\-${ds:3}"
+  commit init
+  assert_exit 0 "$BIN" --json
+  assert_not_contains "${ds:3:28}" "$LC_OUT"
+  python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+a = [(r["rule"], r["count"]) for r in doc["allowed"]]
+assert a == [("credential:deepseek-key (?i)" + sys.argv[2], 1)], a' "$LC_OUT" "$(masked "sk\\-${ds:3}")"
 }
 
 t_config_errors_never_echo_a_key_for_a_rule_id() {
@@ -3377,6 +3431,9 @@ lc_test "error masking ignores the caller's git"    t_error_masking_runs_apart_f
 lc_test "no patterns at all is an error"            t_no_patterns_is_an_error
 lc_test "command-line errors mask a key"            t_command_line_errors_mask_a_key
 lc_test "credentials: overlapping keys in a name"   t_credential_overlapping_keys_in_a_name_are_masked
+lc_test "credentials: deepseek-key left edge"       t_credential_deepseek_key_has_a_left_edge
+lc_test "credentials: an edge is not in the mask"   t_credential_left_edge_is_not_masked_in_a_name
+lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
 lc_test "allow: a scope excuses only its rule"       t_allow_credential_scope_excuses_only_its_rule

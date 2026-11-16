@@ -90,7 +90,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.11.10"
+VERSION="0.11.11"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -225,7 +225,10 @@ DEFAULTS=(
 # matches may be written `\/`, as JSON serializers such as PHP's escape it:
 # a webhook URL or a base64 key in such JSON was missed (measured, v0.11.1).
 # A rule may match inside a longer run (a key pasted into a larger blob is
-# still a key).
+# still a key), except where a measured false positive needs a left edge:
+# such a rule is listed in CRED_KEYSTART with the literal its key begins
+# with, and every match of it is cut to start there, so the edge character
+# is never masked, judged or printed as part of the key.
 # The first two name a header, not the secret, and print it alone. A PEM
 # header counts only where a key can follow it: at the end of its line, or
 # before a body (64 base64 characters, or an armor header such as
@@ -253,7 +256,10 @@ CREDENTIALS=(
   anthropic-key               'sk-ant-[A-Za-z0-9_-]{20,}'  # gitleaks: anthropic-api-key
   openai-key                  'sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{40,}'  # gitleaks: openai-api-key
   openrouter-key              'sk-or-v1-[a-f0-9]{64}'
-  deepseek-key                'sk-[a-f0-9]{32}'
+  # A left edge: `desk-`, `task-`, `flask-` + 32 hex are names (the corpus
+  # harness's look-alikes), so `sk-` may not follow a lowercase letter, but
+  # may follow an escape such as `\n` in a JSON string.
+  deepseek-key                '(^|[^a-z]|\\[a-z])sk-[a-f0-9]{32}'
   groq-key                    'gsk_[A-Za-z0-9]{52}'
   perplexity-key              'pplx-[A-Za-z0-9]{48}'  # gitleaks: perplexity-api-key
   xai-key                     'xai-[A-Za-z0-9]{80}'
@@ -321,6 +327,15 @@ CREDENTIALS=(
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+# Rules with a left edge, and the literal each one's key begins with.
+declare -A CRED_KEYSTART=([deepseek-key]='sk-')
+# cred_key <id> <match>: the match cut to start at its key -> REPLY.
+cred_key() {
+  REPLY=$2
+  local ks=${CRED_KEYSTART[$1]:-}
+  if [[ -n "$ks" && "$REPLY" != "$ks"* ]]; then REPLY=$ks${REPLY#*"$ks"}; fi
+}
 
 # ─── temp dir and error masking ───────────────────────────────────────
 # Absolute: the cds to --root and the top level come after it.
@@ -423,7 +438,8 @@ cred_matches_all() { # out label file...
     run_git "credential rule ${CREDENTIALS[k]} ($label)" "$TMPD/cmatch" \
       mask_git grep --no-index -a -z -n -o --no-color --no-column -E -e "${CREDENTIALS[k + 1]}" -- "$@"
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
-      printf '%s\0%s\0%s\0%s\n' "${CREDENTIALS[k]}" "$f" "$l" "$m"
+      cred_key "${CREDENTIALS[k]}" "$m"
+      printf '%s\0%s\0%s\0%s\n' "${CREDENTIALS[k]}" "$f" "$l" "$REPLY"
     done < "$TMPD/cmatch" >> "$out"
   done
 }
@@ -449,7 +465,8 @@ render_masked() { # text hide-array prefix -> REPLY
 # The literal form of a rule, for the key scan only, never printed: a `\`
 # before punctuation dropped, a one-character bracket such as `[.]`
 # unwrapped, and parentheses dropped, so `SG\.(<body>)\.(<body>)` reads as
-# the key it matches (/cxr, v0.11.4). LIT_MAP[i] is the offset in the rule
+# the key it matches (/cxr, v0.11.4). `(?i)` is dropped whole: its `i` left
+# before a key would fail a rule's left edge (`(?i)sk\-<hex>`). LIT_MAP[i] is the offset in the rule
 # of the literal form's i-th byte. An alternation, a quantifier or a wider
 # bracket has no literal form; the README says so.
 literal_form() {
@@ -457,7 +474,9 @@ literal_form() {
   LIT=""; LIT_MAP=()
   while (( i < ${#s} )); do
     c=${s:i:1}; d=${s:i+1:1}
-    if [[ "$c" == '\' && -n "$d" && "$d" != [A-Za-z0-9] ]]; then
+    if [[ "${s:i:4}" == '(?i)' ]]; then
+      i=$(( i + 4 ))
+    elif [[ "$c" == '\' && -n "$d" && "$d" != [A-Za-z0-9] ]]; then
       LIT+=$d; LIT_MAP+=("$(( i + 1 ))"); i=$(( i + 2 ))
     elif [[ "$c" == '[' && -n "$d" && "${s:i+2:1}" == ']' && "$d" != ']' && "$d" != '^' && "$d" != '\' && "$d" != '[' ]]; then
       LIT+=$d; LIT_MAP+=("$(( i + 1 ))"); i=$(( i + 3 ))
@@ -1865,6 +1884,7 @@ if [[ "$NEED_MT" -eq 1 ]]; then
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
       i=${T_HIT[l]:-}
       [[ -n "$i" ]] || die "internal error: match pass returned line $l"
+      if [[ "$p" == credential:* ]]; then cred_key "${p#credential:}" "$m"; m=$REPLY; fi
       MT_OF[$i]+="${#MT_HIT[@]} "
       MT_HIT+=("$i"); MT_TXT+=("$m")
     done < "$TMPD/tmatch"
