@@ -143,11 +143,15 @@ def marker_cases(cid, r, n):
 def build_positives(r, per_rule):
     """{(group, rule): [(context, lines, hit index, stand-in)]}"""
     cases = {}
-    for cid, (before, spec) in specs.SPECS.items():
+    for cid in specs.SPECS:
         if cid in MARKER_RULES:
             cases[("plain", cid)] = [(ctx, lines, k, lines[k].strip()) for ctx, lines, k in marker_cases(cid, r, per_rule)]
             continue
-        for _ in range(per_rule):
+        # Every variant at least once, so a rule with more branches than
+        # --per-rule still has each one tested.
+        vs = specs.variants(cid)
+        for i in range(max(per_rule, len(vs))):
+            before, spec = vs[i % len(vs)]
             m = specs.gen(spec, r)
             v = value_for(cid, before, m)
             for ctx, f in PLAIN:
@@ -437,7 +441,7 @@ def main():
         git(probe, "init", "-q")
         rules = rule_ids(binary, rc, probe)
         missing = sorted(set(rules) - set(specs.SPECS))
-        extra = sorted(set(specs.SPECS) - set(rules))
+        extra = sorted((set(specs.SPECS) | set(specs.VARIANTS)) - set(rules))
         if missing or extra:
             die(f"rules without a stand-in spec: {missing}; specs for no rule: {extra}")
         syn = measure_synthetic(binary, rc, work, a.per_rule, a.seed)

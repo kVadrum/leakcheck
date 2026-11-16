@@ -20,6 +20,7 @@ CS = {
     "a": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
     "d": "0123456789",
     "hex": "0123456789abcdef",
+    "hexU": "0123456789ABCDEF",
     "b64": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
     "bech": "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L",
     "lan": "abcdefghijklmnopqrstuvwxyz0123456789",
@@ -105,6 +106,57 @@ SPECS = {
  "cloudflare-origin-ca-key": ("KEY=", ["v1", ".0-", ("hex", 24), "-", ("hex", 146)]),
  "mapbox-secret-token": ("KEY=", ["sk", ".eyJ1", ("an-_", 80)]),
 }
+
+
+# Every other branch of a rule's alternation, and every other prefix its
+# issuer hands out, one spec each: SPECS exercises one branch per rule, and a
+# branch nothing exercises can break silently (stage B, v0.11.1: `glc_`,
+# `sntrys_`, `fm1_` and `whsec_` with `/` went untested). The corpus harness
+# reads these; the suite reads SPECS alone, so its rows stay as they were.
+VARIANTS = {
+ "aws-access-key-id": [("KEY=", [p, ("UD", 16)]) for p in ("AS" "IA", "AB" "IA", "AC" "CA", "A3" "TX")],
+ "github-token": [("KEY=", ["gh", p + "_", ("an", 36)]) for p in "ousr"],
+ "gitlab-token": [("KEY=", ["gl", p + "-", ("an-_", 26)]) for p in
+                  ("ptt", "rt", "dt", "soat", "cbt", "ft", "imt", "agent", "oas")]
+                 + [("KEY=", ["GR13", "48941", ("an-_", 20)])],
+ "slack-token": [("KEY=", ["xo", "x" + p + "-", ("d", 12), "-", ("d", 13), "-", ("an", 32)]) for p in "paeors"]
+                + [("KEY=", ["xa", "pp-1-", ("UD", 11), "-", ("d", 13), "-", ("hex", 64)])],
+ "slack-webhook": [("URL=https://", ["hooks", ".slack.com/workflows/T", ("UD", 10), "/A", ("UD", 10), "/", ("d", 18), "/", ("an", 24)]),
+                   ("URL=https://", ["hooks", ".slack.com/triggers/T", ("UD", 10), "/", ("d", 13), "/", ("hex", 32)])],
+ "discord-webhook": [("URL=https://", ["discord", "app.com/api/webhooks/", ("d", 19), "/", ("an-_", 68)])],
+ "stripe-key": [("KEY=", ["rk", "_live_", ("an", 99)]), ("KEY=", ["sk", "_test_", ("an", 99)]),
+                ("KEY=", ["sk", "_prod_", ("an", 24)])],
+ "webhook-signing-secret": [("KEY=", ["wh", "sec_", ("b64", 43), "="])],
+ "openai-key": [("KEY=", ["sk-", "svcacct-", ("an-_", 74), "T3BlbkFJ", ("an-_", 74)]),
+                ("KEY=", ["sk-", "admin-", ("an-_", 74), "T3BlbkFJ", ("an-_", 74)]),
+                ("KEY=", ["sk-", ("an", 20), "T3BlbkFJ", ("an", 20)])],
+ "huggingface-token": [("KEY=", ["api", "_org_", ("a", 34)])],
+ "pypi-token": [("KEY=", ["pypi-", "AgENdGVzdC5weXBpLm9yZw", ("an-_", 70)])],
+ "brevo-key": [("KEY=", ["xsmtp", "sib-", ("hex", 64), "-", ("an", 16)])],
+ "digitalocean-token": [("KEY=", ["do", p + "_v1_", ("hex", 64)]) for p in "or"],
+ "shopify-token": [("KEY=", ["shp", p + "_", ("hex", 32)]) for p in ("ca", "pa", "ss")],
+ "jwt": [("KEY=", ["eyJhbGciOiJub25lIn0", ".", "eyJ", ("an", 40), "."])],
+ "vault-token": [("KEY=", ["hv", "b.", ("an-_", 138)])],
+ "doppler-token": [("KEY=", ["dp", "." + p + ".", ("an", 43)]) for p in ("st", "sa", "ct", "scim", "audit")],
+ "sentry-token": [("KEY=", ["sntr", "ys_eyJ", ("b64", 120)])],
+ "grafana-token": [("KEY=", ["gl", "c_", ("b64", 64), "=="])],
+ "databricks-token": [("KEY=", ["da", "pi", ("hex", 32), "-", ("d", 1)])],
+ "1password-token": [("KEY=", ["A3", "-", ("UD", 6), "-", ("UD", 11), "-", ("UD", 5), "-", ("UD", 5), "-", ("UD", 5)]),
+                     ("KEY=", ["A3", "-", ("UD", 6), "-", ("UD", 6), "-", ("UD", 5), "-", ("UD", 5), "-", ("UD", 5), "-", ("UD", 5)])],
+ "facebook-token": [("KEY=", ["EA", "AM", ("an", 120)])],
+ "square-token": [("KEY=", ["sq0", "atp-", ("an-_", 22)])],
+ "planetscale-token": [("KEY=", ["pscale", "_" + p + "_", ("an", 43)]) for p in ("oauth", "pw")],
+ "flyio-token": [("KEY=", ["f", "m" + p + "_", ("b64", 140)]) for p in ("1", "2", "1a", "2r")],
+ "tailscale-key": [("KEY=", ["tskey", "-" + p + "-", ("an", 14), "-", ("an", 32)]) for p in ("api", "client", "scim", "webhook")],
+ "supabase-key": [("KEY=", ["sb", "_secret_", ("an-_", 32)])],
+ "new-relic-key": [("KEY=", ["NR", "II-", ("an-_", 32)])],
+ "twilio-api-key": [("KEY=", ["S", "K", ("hexU", 32)])],
+}
+
+
+def variants(cid):
+    """Every spec of a rule, SPECS' first."""
+    return [SPECS[cid]] + VARIANTS.get(cid, [])
 
 
 def suite_rows():
