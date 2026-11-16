@@ -2795,6 +2795,82 @@ t_credential_webhook_urls_stop_at_their_segments() {
   assert_not_contains "${gh:4:20}" "$LC_OUT"
 }
 
+t_credential_issuer_variants() {
+  # Every format the issuers document that the rules missed until v0.12.0
+  # (re-sourced from the issuers, stage B′): each line holds one, and must
+  # hit its own rule exactly once, printed masked at its full length — an
+  # open maximum masks a longer key whole. A stateless GitHub installation
+  # token, `ghs_<app id>_<JWT>`, is found by `jwt` from its `ey`.
+  local vt="$PWD/.git/variants.tsv"
+  python3 -I "$SCRIPT_DIR/credential_specs.py" --variants > "$vt"
+  local -a ids=() ms=()
+  local id line m n=0
+  : > v.txt
+  while IFS=$'\t' read -r id line m; do
+    printf '%s\n' "$line" >> v.txt
+    ids+=("$id"); ms+=("$m")
+  done < "$vt"
+  git add v.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN"
+  for n in "${!ids[@]}"; do
+    m=${ms[n]}
+    if [[ "${ids[n]}" == jwt ]]; then m="ey${m#*_ey}"; fi
+    assert_contains "v.txt:$((n + 1)): [credential:${ids[n]}] $(masked "$m")" "$LC_OUT"
+  done
+  assert_contains "leakcheck: ${#ids[@]} match(es)" "$LC_ERR"
+  for m in "${ms[@]}"; do assert_not_contains "${m:6:24}" "$LC_OUT"; done
+}
+
+t_credential_zero_bytes_are_no_aws_or_facebook_key() {
+  # Base64 of mostly-zero binary (a font, a protobuf) is long runs of `A`, so
+  # `ACCA`, `ABIA` and `EAA` + more `A`s read as an AWS key id or a Facebook
+  # token (corpus harness, v0.12.0). In those two rules a match that is at
+  # least half (AWS) or an eighth (Facebook) `A`, or holds a run of eight, is
+  # a stand-in; the real-shaped stand-ins of both still hit.
+  local aws fb
+  aws=$(cred aws-access-key-id); fb=$(cred facebook-token)
+  # Lines 1 and 3 hold no run of eight, so only the share catches them;
+  # line 4 is random but for one run of eight, which only the run catches.
+  local q7
+  q7=$(printf 'AAAAAAAQ%.0s' {1..13})
+  seed z.txt "$(printf '%s\n' \
+    "src: url(data:font/ttf;base64,AAEAAAAKA""CCA""AAAAAQAAAAAAAGAAAAAAAAQAAAAAAAAAAAAZ8AAA);" \
+    "blob: AAAQ""ABIA""AAAAAAAUAAAAAAAAAAAAAAAAA" \
+    "pb: CAEQ""EAAM$q7" \
+    "one run: EA""AC${fb:4:110}AAAAAAAA${fb:4:110}")"
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 0 "$BIN"
+  assert_contains "credentials scanned, 4 placeholders not reported" "$LC_OUT"
+  seed k.txt "$(printf 'A=%s\nF=%s' "$aws" "$fb")"
+  commit k
+  assert_exit 1 "$BIN"
+  assert_contains "k.txt:1: [credential:aws-access-key-id]" "$LC_OUT"
+  assert_contains "k.txt:2: [credential:facebook-token]" "$LC_OUT"
+  assert_contains "leakcheck: 2 match(es)" "$LC_ERR"
+}
+
+t_credential_pgp_secret_and_ssh2_headers() {
+  # PGP 2's `SECRET KEY BLOCK`, which GnuPG still reads, and the ssh.com
+  # header PuTTYgen exports (four dashes, spaces inside) are private keys
+  # too. A hit prints the header alone: the SSH2 one, as a match running on
+  # into the body, printed that body's first 64 characters until its own
+  # branch in the display.
+  local body
+  body=$(cred github-token); body="${body:4:32}${body:4:32}"
+  seed k.txt "$(printf '%s\n' \
+    "-----BEGIN PGP SEC""RET KEY BLOCK-----" \
+    "---- BEGIN SSH2 ENCRYPTED PRIV""ATE KEY ---- $body")"
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "k.txt:1: [credential:private-key] -----BEGIN PGP SEC""RET KEY BLOCK-----" "$LC_OUT"
+  assert_contains "k.txt:2: [credential:private-key] ---- BEGIN SSH2 ENCRYPTED PRIV""ATE KEY ----" "$LC_OUT"
+  assert_not_contains "${body:0:24}" "$LC_OUT"
+  assert_contains "leakcheck: 2 match(es)" "$LC_ERR"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -3464,6 +3540,9 @@ lc_test "credentials: overlapping keys in a name"   t_credential_overlapping_key
 lc_test "credentials: deepseek-key left edge"       t_credential_deepseek_key_has_a_left_edge
 lc_test "credentials: an edge is not in the mask"   t_credential_left_edge_is_not_masked_in_a_name
 lc_test "credentials: webhook URLs stop at segments" t_credential_webhook_urls_stop_at_their_segments
+lc_test "credentials: issuer-documented variants"   t_credential_issuer_variants
+lc_test "credentials: zero bytes are no AWS/FB key" t_credential_zero_bytes_are_no_aws_or_facebook_key
+lc_test "credentials: PGP secret and SSH2 headers"  t_credential_pgp_secret_and_ssh2_headers
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder

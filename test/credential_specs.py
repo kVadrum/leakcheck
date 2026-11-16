@@ -24,6 +24,7 @@ CS = {
     "b64": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
     "bech": "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L",
     "lan": "abcdefghijklmnopqrstuvwxyz0123456789",
+    "hexh": "0123456789abcdefgh",
 }
 
 
@@ -160,9 +161,54 @@ VARIANTS = {
 }
 
 
+# Formats each issuer documents that the rules missed until v0.12.0 (stage
+# B′, re-sourced from the issuers): the suite reads these too
+# (`credential_specs.py --variants`), one line each, and each must hit its own
+# rule exactly once.
+ISSUER_VARIANTS = {
+ "github-token": [("KEY=", ["gh", "r_", ("an", 76)])],
+ "npm-token": [("KEY=", ["np", "m_", ("an", 40)])],
+ "groq-key": [("KEY=", ["gs", "k_", ("an", 56)])],
+ "perplexity-key": [("KEY=", ["pp", "lx-", ("an", 52)])],
+ "xai-key": [("KEY=", ["xa", "i-", ("an", 84)])],
+ "gitlab-token": [("KEY=", ["gl", p + "-", ("an-_", 26)]) for p in ("rtr", "rct", "ffct", "wt", "iamrt", "iamac")],
+ "slack-token": [("KEY=", ["xw", "fp-", ("d", 12), "-", ("d", 13), "-", ("an", 32)])],
+ "stripe-key": [("KEY=", ["sk", "_org_", ("an", 40)])],
+ "webhook-signing-secret": [("KEY=", ["wh", "sk_", ("b64", 86), "=="])],
+ "google-api-key": [("KEY=", ["AQ", ".Ab8R", ("an-_", 46)])],
+ "pypi-token": [("KEY=", ["pypi-", "AgEObG9jYWxob3N0", ("an-_", 90)])],
+ "shopify-token": [("KEY=", ["shp", "at_", ("an", 32)])],
+ "jwt": [("KEY=", ["gh", "s_", ("d", 7), "_", "eyJhbGciOiJSUzI1NiJ9", ".", "eyJ", ("an", 200), ".", ("an-_", 342)])],
+ "age-secret-key": [("KEY=", ["AGE-", "SECRET-KEY-PQ-1", ("bech", 58)])],
+ "vault-token": [("KEY=", ["hv", "r.", ("an", 24)]), ("KEY=", ["hv", "s.", ("an", 24)])],
+ "terraform-cloud-token": [("KEY=", [("an", 14), ".hc", "p.", ("an-_", 50)])],
+ "doppler-token": [("KEY=", ["dp", ".said.", ("an", 43)]), ("KEY=", ["dp", ".st.", ("lan", 10), ".", ("an", 43)])],
+ "linear-api-key": [("KEY=", ["lin", "_oauth_", ("an", 40)])],
+ "sentry-token": [("KEY=", ["sntr", "yc_", ("b64", 120), "_", ("b64", 43)]),
+                  ("KEY=", ["sntr", "ys_", ("b64", 120), "_", ("b64", 43)]),
+                  ("KEY=", ["sntr", "yh_", ("an-_", 43)])]
+                 + [("KEY=", ["sntr", "y" + p + "_", ("hex", 64)]) for p in "ai"],
+ "databricks-token": [("KEY=", [p, ("hexh", 32)]) for p in ("do" "se", "dsa" "pi", "dk" "ea")],
+ "atlassian-token": [("KEY=", ["ATA", "TT3", ("an-_", 102)])],
+ "notion-token": [("KEY=", ["nt", "n_", ("an", 46)]), ("KEY=", ["sec", "ret_", ("an", 43)])],
+ "1password-token": [("KEY=", ["ops", "_eyJ", ("an-_", 140)])],
+ "dynatrace-token": [("KEY=", ["dt0", "s01.", ("UD", 24), ".", ("UD", 64)])],
+ "heroku-key": [("KEY=", ["HRKU", "-"] + GUID), ("KEY=", ["HRKU", "-", ("an-_", 60)])],
+ "supabase-key": [("KEY=", ["sb", "p_" + p + "_", ("hex", 40)]) for p in ("oauth", "v0")],
+ "azure-storage-key": [("X;", ["Storage", "Key = ", ("b64", 86), "=="]), ("X;", ["account", "key=", ("b64", 86), "=="]),
+                       ("KEY=", [("b64", 76), "+AS", "t", ("b64", 5), "Q=="])],
+ "azure-ad-client-secret": [("KEY=", ["a-", ("an", 1), "8", "Q", "~", ("an", 34)])],
+ "new-relic-key": [("KEY=", ["NR", "AK-", ("an", 27)]), ("KEY=", ["NR", "AA-", ("UD", 27)]),
+                   ("KEY=", ["NR", "IQ-", ("an-_", 32)]), ("KEY=", ["NR", "RA-", ("hex", 42)]),
+                   ("KEY=", ["NR", "SP-", ("a", 2), ("hex", 33)]), ("KEY=", [("hex", 36), "NR", "AL"]),
+                   ("KEY=", ["eu01", "xx", ("hex", 30), "NR", "AL"])],
+ "mapbox-secret-token": [("KEY=", ["tk", ".eyJ", ("an-_", 80)]), ("KEY=", ["sk", ".eyJh", ("an-_", 80)])],
+}
+
+
 def variants(cid):
     """Every spec of a rule, SPECS' first."""
-    return [SPECS[cid]] + VARIANTS.get(cid, [])
+    return [SPECS[cid]] + VARIANTS.get(cid, []) + ISSUER_VARIANTS.get(cid, [])
 
 
 def suite_rows():
@@ -175,6 +221,17 @@ def suite_rows():
         yield cid, before + m, m
 
 
+def issuer_rows():
+    """(rule id, line, match), one per ISSUER_VARIANTS spec, seeded."""
+    r = random.Random(20261116)
+    for cid, vs in ISSUER_VARIANTS.items():
+        for before, spec in vs:
+            m = gen(spec, r)
+            yield cid, before + m, m
+
+
 if __name__ == "__main__":
-    for cid, line, m in suite_rows():
+    import sys
+    rows = issuer_rows() if sys.argv[1:] == ["--variants"] else suite_rows()
+    for cid, line, m in rows:
         print(cid, line, m, sep="\t")

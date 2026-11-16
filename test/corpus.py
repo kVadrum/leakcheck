@@ -129,6 +129,17 @@ def marker_cases(cid, r, n):
                 ("yaml-block", ["key: |", "  " + head] + ["  " + b for b in body] + ["  " + foot], 1),
                 ("one-line", [head + " " + " ".join(body) + " " + foot], 0),
             ]
+        # PGP 2's label, which GnuPG still reads, and the ssh.com header
+        # PuTTYgen exports (four dashes, spaces inside).
+        for i in range(n):
+            body = [b64_body(r) for _ in range(3)]
+            pgp = "-----BEGIN PGP SEC" + "RET KEY BLOCK-----"
+            ssh2 = "---- BEGIN SSH2 ENCRYPTED PRIV" + "ATE KEY ----"
+            out += [
+                ("pgp-secret", [pgp, "", *body, "-----END PGP SEC" + "RET KEY BLOCK-----"], 0),
+                ("ssh2", [ssh2, 'Comment: "deploy"', *body, "---- END SSH2 ENCRYPTED PRIV" + "ATE KEY ----"], 0),
+                ("ssh2-json", ['  "key": "' + ssh2 + "\\n" + 'Comment: \\"deploy\\"\\n' + "\\n".join(body) + '",'], 0),
+            ]
     elif cid == "putty-private-key":
         for i in range(n):
             ver, alg = (("3", "ssh-ed25519"), ("2", "ssh-rsa"))[i % 2]
@@ -206,6 +217,11 @@ def lookalike_kinds(r):
         "base64": lambda: b64(r.randint(12, 300)),
         "base64url": lambda: b64(r.randint(12, 300), urlsafe=True, pad=False),
         "data-uri": lambda: "data:image/png;base64," + b64(r.randint(60, 400)),
+        # Binary that is mostly zero bytes (padding, sparse tables, protobuf
+        # defaults) is base64 with long runs of `A`, which a rule whose prefix
+        # ends in `A` can read as a key's start.
+        "base64-zeros": lambda: base64.b64encode(bytes(r.getrandbits(8) if r.random() < 0.15 else 0
+                                                        for _ in range(r.randint(60, 400)))).decode(),
         "alnum": lambda: specs.gen([("an", r.randint(20, 90))], r),
         "identifier": lambda: camel(r.randint(3, 6)),
         "constant": lambda: words(r.randint(2, 4), "_").upper() + "_" + str(r.randint(0, 999)),
@@ -441,7 +457,7 @@ def main():
         git(probe, "init", "-q")
         rules = rule_ids(binary, rc, probe)
         missing = sorted(set(rules) - set(specs.SPECS))
-        extra = sorted((set(specs.SPECS) | set(specs.VARIANTS)) - set(rules))
+        extra = sorted((set(specs.SPECS) | set(specs.VARIANTS) | set(specs.ISSUER_VARIANTS)) - set(rules))
         if missing or extra:
             die(f"rules without a stand-in spec: {missing}; specs for no rule: {extra}")
         syn = measure_synthetic(binary, rc, work, a.per_rule, a.seed)

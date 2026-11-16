@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.11.12*
+*README v0.12.0*
 
 ## Install
 
@@ -101,19 +101,23 @@ pattern -(home|Users)-[A-Za-z0-9_][A-Za-z0-9_.]*-
 
 Built-in rules also find keys and tokens in the formats their issuers fixed, by a prefix or a shape that ordinary text does not have:
 
-- private key headers: PEM, OpenSSH, PGP and PuTTY;
-- AWS access key ids, Google API keys and OAuth client secrets, and Azure storage keys and Entra client secrets;
+- private key headers: PEM, OpenSSH, PGP (PGP 2's secret key blocks too), ssh.com and PuTTY;
+- AWS access key ids, Google API keys (AI Studio's `AQ.` keys too) and OAuth client secrets, and Azure storage keys (Microsoft's identifiable keys too) and Entra client secrets;
 - GitHub, GitLab, npm, PyPI, RubyGems and Clojars tokens;
 - Anthropic, OpenAI, OpenRouter, DeepSeek, Groq, Perplexity, xAI and Hugging Face keys;
-- Slack tokens, and Slack, Discord and Teams webhook URLs;
-- Stripe keys and webhook signing secrets, and Square, Shopify and Facebook tokens;
+- Slack tokens (workflow tokens too), and Slack (GovSlack too), Discord and Teams webhook URLs;
+- Stripe keys (organization keys too) and webhook signing secrets (Stripe's, and the Standard Webhooks spec's secret keys), and Square, Shopify and Facebook tokens;
 - JSON Web Tokens;
 - keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana, Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare origin CA and Mapbox.
 
 A key or webhook URL is found with its slashes JSON-escaped, `\/`, as PHP's `json_encode` and others write them.
 A key is found inside a longer run of characters too, with one exception: a DeepSeek key, `sk-` and 32 hex digits, is also how generated names end (`task-…`, `desk-…`), so it is not found right after a lowercase letter.
 
-Most of these rules are derived from the default rules of [gitleaks](https://github.com/gitleaks/gitleaks) (MIT): the script names, beside each one, the gitleaks rule it follows, and carries gitleaks' license notice, as does [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
+Each rule follows its issuer: the issuer's own documentation where it publishes the format, the issuer's own code (an SDK, a CLI, its scanner) where the documentation says nothing, and the shape real keys show where neither does; the script names that source above each rule.
+Where the issuer leaves a length open, so does the rule, and a longer key is masked whole.
+A token whose body is a JSON Web Token behind a prefix, such as GitHub's stateless installation tokens (`ghs_` and an app id, since 2026), is reported as `credential:jwt`.
+
+Most of these rules were first derived from the default rules of [gitleaks](https://github.com/gitleaks/gitleaks) (MIT): the script names, beside each one, the gitleaks rule it came from, and carries gitleaks' license notice, as does [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
 
 `leakcheck --list-rules` prints each rule's label and whether your config runs it; `leakcheck --list-patterns` prints each rule's regex, after your own patterns.
 
@@ -143,6 +147,7 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
 - **Obvious stand-ins are counted, not reported**: a match holding eight equal characters in a row, eight letters or digits counting up, or `EXAMPLE` or `example` — an X-filled `ghp_XXXX…`, an alphabet run, AWS's documented example key.
   A random key does any of those well under one time in a million.
   A run of `A` does not count, because it is base64 for zero bytes, which real keys in some formats always hold; nor is a private key header with a key after it ever a stand-in.
+  An AWS key id and a Facebook token hold no zero bytes, so there a run of `A` does count, and so does a match that is half `A` (AWS) or an eighth `A` (Facebook): it is base64 of mostly-zero binary, such as an embedded font.
   A stand-in does not excuse a real key beside it on the same line.
 - **The committed config is scanned for credentials**, though not for the patterns it lists: a key pasted into `.leakcheckrc` is published like any other.
 - **The rules are on by default.**
