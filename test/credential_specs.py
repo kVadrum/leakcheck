@@ -232,6 +232,14 @@ PATH_SPECS = {
 }
 
 
+# One stand-in per rule whose body takes `/` (bin/leakcheck's CRED_SLASH),
+# from the branch that takes it: rule id -> its index in variants(), or a
+# spec. glc_ unpadded: a padded key's match ends at its `==`, before any
+# tail, so the padded variant tests nothing here.
+SLASH = {"webhook-signing-secret": 1, "grafana-token": ["gl", "c_", ("b64", 64)], "sentry-token": 3,
+         "1password-token": 0, "flyio-token": 2, "jwt": 0}
+
+
 def variants(cid):
     """Every spec of a rule, SPECS' first."""
     return [SPECS[cid]] + VARIANTS.get(cid, []) + ISSUER_VARIANTS.get(cid, [])
@@ -247,6 +255,13 @@ def suite_rows():
         yield cid, before + m, m
 
 
+def slash_rows():
+    """(rule id, stand-in), one per SLASH rule, seeded."""
+    r = random.Random(20261117)
+    for cid, i in SLASH.items():
+        yield cid, gen(variants(cid)[i][1] if isinstance(i, int) else i, r)
+
+
 def issuer_rows():
     """(rule id, line, match), one per ISSUER_VARIANTS spec, seeded."""
     r = random.Random(20261116)
@@ -258,6 +273,10 @@ def issuer_rows():
 
 if __name__ == "__main__":
     import sys
+    if sys.argv[1:] == ["--slash"]:
+        for cid, m in slash_rows():
+            print(cid, m, sep="\t")
+        sys.exit(0)
     if sys.argv[1:] == ["--paths"]:
         for cid, names in PATH_SPECS.items():
             for name in names:

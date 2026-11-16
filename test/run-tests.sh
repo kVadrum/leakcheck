@@ -2982,6 +2982,37 @@ t_credential_pkcs12_file() {
   assert_not_contains "notes.txt" "$LC_OUT"
 }
 
+t_credential_tail_after_a_slash_in_a_body() {
+  # Six rules take `/` as a body character, so text after a key joins its
+  # match: a key followed by `/XXXXXXXX` read as a stand-in and was set
+  # aside, exit 0. Each is judged up to its first `/`: a key with a tail is
+  # reported, after `/`, `\/` and a second `/`. Guards: a stand-in shaped
+  # before any `/` is still set aside, and a webhook, whose `/` ends a
+  # segment, is still judged whole, its secret segment the stand-in.
+  local vt="$PWD/.git/slash.tsv" id m sw
+  python3 -I "$SCRIPT_DIR/credential_specs.py" --slash > "$vt"
+  sw=$(cred slack-webhook)
+  : > s.txt
+  while IFS=$'\t' read -r id m; do
+    printf '%s\n' "k=$m/XXXXXXXX" "k=$m\\/XXXXXXXX" "k=$m/XXXXXXXX/x" >> s.txt
+  done < "$vt"
+  printf '%s\n' "k=wh""sec_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" "k=${sw%/*}/XXXXXXXXXXXXXXXXXXXXXXXX" >> s.txt
+  git add s.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "$vt" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
+assert len(rows) == 6, rows
+want = sorted((3 * k + j + 1, "credential:" + cid) for k, (cid, m) in enumerate(rows) for j in range(3))
+got = sorted((h["line"], h["pattern"]) for h in doc["hits"])
+assert got == want, (got, want)
+assert doc["credentials"]["placeholders"] == 2, doc["credentials"]
+PY
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -3656,6 +3687,7 @@ lc_test "credentials: zero bytes are no AWS/FB key" t_credential_zero_bytes_are_
 lc_test "credentials: PGP secret and SSH2 headers"  t_credential_pgp_secret_and_ssh2_headers
 lc_test "credentials: GitHub's checksum"            t_credential_github_checksum
 lc_test "credentials: pkcs12-file, by name only"    t_credential_pkcs12_file
+lc_test "credentials: a tail after a body's slash"  t_credential_tail_after_a_slash_in_a_body
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder

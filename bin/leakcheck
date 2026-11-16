@@ -91,7 +91,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.14.0"
+VERSION="0.14.1"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -535,8 +535,18 @@ checksum_fails() { # match
 }
 B62=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 declare -A CRED_ARUN=([aws-access-key-id]=2 [facebook-token]=8)
+# CRED_SLASH: the rules whose body takes `/` (or `\/`) as a body character,
+# so text after a key joins its match: a real key followed by `/XXXXXXXX`
+# read as a stand-in and was set aside, exit 0. In these the test judges
+# the match up to its first `/` alone: a prefix holds a stand-in's shape
+# only if the whole match does, so this sets nothing more aside. A rule
+# whose body is widened to take `/` belongs here; the webhook rules never
+# do: their `/` ends a segment, and their stand-in is the secret segment.
+declare -A CRED_SLASH=([webhook-signing-secret]=1 [grafana-token]=1 [sentry-token]=1
+  [1password-token]=1 [flyio-token]=1 [jwt]=1)
 is_placeholder() { # match [rule id]
   local LC_ALL=C m=$1 i c o prev=-2 same=0 up=0 arun=0 zs share
+  if [[ -n "${2:-}" && -n "${CRED_SLASH[$2]+x}" ]]; then m=${m%%/*}; fi
   if [[ "$m" == *EXAMPLE* || "$m" == *example* ]]; then return 0; fi
   if [[ -n "${2:-}" && -n "${CRED_ARUN[$2]+x}" ]]; then
     arun=1; share=${CRED_ARUN[$2]}; zs=${m//[!A]/}
