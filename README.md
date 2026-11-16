@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.12.0*
+*README v0.13.0*
 
 ## Install
 
@@ -148,6 +148,7 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
   A random key does any of those well under one time in a million.
   A run of `A` does not count, because it is base64 for zero bytes, which real keys in some formats always hold; nor is a private key header with a key after it ever a stand-in.
   An AWS key id and a Facebook token hold no zero bytes, so there a run of `A` does count, and so does a match that is half `A` (AWS) or an eighth `A` (Facebook): it is base64 of mostly-zero binary, such as an embedded font.
+  A classic GitHub token, `ghp_`, `gho_`, `ghu_`, `ghs_` or `ghr_` and 36 characters, whose last six are not GitHub's checksum of the 30 before them is a stand-in too, since no real one fails it; it is masked all the same wherever it prints.
   A stand-in does not excuse a real key beside it on the same line.
 - **The committed config is scanned for credentials**, though not for the patterns it lists: a key pasted into `.leakcheckrc` is published like any other.
 - **The rules are on by default.**

@@ -2003,8 +2003,9 @@ import json, sys
 doc = json.load(open(sys.argv[1]))
 assert doc["credentials"]["placeholders"] == 6, doc["credentials"]
 PY
-  # Seven in a row, equal or counting up, is not a placeholder.
-  printf '%s\n' "g=gh""p_${r:4:29}XXXXXXX" "h=np""m_${r:4:29}1234567" > q.txt
+  # Seven in a row, equal or counting up, is not a placeholder. The GitHub
+  # one is 41 long: at 40 its last six would have to be its checksum.
+  printf '%s\n' "g=gh""p_${r:4:30}XXXXXXX" "h=np""m_${r:4:29}1234567" > q.txt
   git add q.txt
   commit seven
   assert_exit 1 "$BIN"
@@ -2871,6 +2872,34 @@ t_credential_pgp_secret_and_ssh2_headers() {
   assert_contains "leakcheck: 2 match(es)" "$LC_ERR"
 }
 
+t_credential_github_checksum() {
+  # A classic GitHub token's last six are the base62 CRC-32 of the 30 before
+  # them (GitHub; the byte-level scheme confirmed on a real token). One that
+  # fails is a stand-in, counted; the same body under another prefix passes
+  # (the prefix is not in the sum); a longer run, or an npm_ token, gets no
+  # checksum and is reported; a failing token is masked all the same.
+  local gh last bad np
+  gh=$(cred github-token); np=$(cred npm-token)
+  last=${gh: -1}; if [[ "$last" == 0 ]]; then last=1; else last=0; fi
+  bad="${gh:0:39}$last"
+  printf '%s\n' "A=$gh" "B=$bad" "C=${bad}Z" "D=gh""o_${gh:4}" "E=gh""u_${bad:4}" "F=$np" > c.txt
+  git add c.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "c.txt:1: [credential:github-token] $(masked "$gh")" "$LC_OUT"
+  assert_contains "c.txt:3: [credential:github-token] $(masked "${bad}Z")" "$LC_OUT"
+  assert_contains "c.txt:4: [credential:github-token]" "$LC_OUT"
+  assert_contains "c.txt:6: [credential:npm-token]" "$LC_OUT"
+  assert_not_contains "c.txt:2:" "$LC_OUT"
+  assert_not_contains "c.txt:5:" "$LC_OUT"
+  assert_contains "leakcheck: 4 match(es)" "$LC_ERR"
+  assert_contains "credentials scanned, 2 placeholders not reported" "$LC_ERR"
+  rc_file 'no-defaults' "allow credential:github-token $bad"
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${bad:4:30}" "$LC_OUT"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -3543,6 +3572,7 @@ lc_test "credentials: webhook URLs stop at segments" t_credential_webhook_urls_s
 lc_test "credentials: issuer-documented variants"   t_credential_issuer_variants
 lc_test "credentials: zero bytes are no AWS/FB key" t_credential_zero_bytes_are_no_aws_or_facebook_key
 lc_test "credentials: PGP secret and SSH2 headers"  t_credential_pgp_secret_and_ssh2_headers
+lc_test "credentials: GitHub's checksum"            t_credential_github_checksum
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder

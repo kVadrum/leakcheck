@@ -11,6 +11,7 @@ A stand-in never has a placeholder's shape (stand_in_ok): those are set aside,
 and tested on their own.
 """
 import random
+import zlib
 
 CS = {
     "an": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
@@ -37,9 +38,27 @@ def stand_in_ok(s):
     return "EXAMPLE" not in s and "example" not in s
 
 
+B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+def part(p, r):
+    if isinstance(p, str):
+        return p
+    s = "".join(r.choice(CS["an" if p[0] == "an-crc" else p[0]]) for _ in range(p[1]))
+    if p[0] == "an-crc":
+        # GitHub's checksum: the last six are the base62 CRC-32 of the rest.
+        # Drawn at full length first, so every later stand-in is unchanged.
+        n, c = zlib.crc32(s[:-6].encode()), ""
+        for _ in range(6):
+            n, d = divmod(n, 62)
+            c = B62[d] + c
+        s = s[:-6] + c
+    return s
+
+
 def gen(spec, r):
     while True:
-        s = "".join(p if isinstance(p, str) else "".join(r.choice(CS[p[0]]) for _ in range(p[1])) for p in spec)
+        s = "".join(part(p, r) for p in spec)
         if stand_in_ok(s):
             return s
 
@@ -50,7 +69,7 @@ SPECS = {
  "private-key": ("KEY=", ["-----BEGIN RSA ", "PRIVATE KEY-----"]),
  "putty-private-key": ("", ["PuTTY-User-", "Key-File-3:"]),
  "aws-access-key-id": ("KEY=", ["AK", "IA", ("UD", 16)]),
- "github-token": ("KEY=", ["gh", "p_", ("an", 36)]),
+ "github-token": ("KEY=", ["gh", "p_", ("an-crc", 36)]),
  "github-fine-grained-token": ("KEY=", ["github", "_pat_", ("an_", 82)]),
  "gitlab-token": ("KEY=", ["gl", "pat-", ("an-_", 20)]),
  "slack-token": ("KEY=", ["xo", "xb-", ("d", 12), "-", ("d", 13), "-", ("an", 24)]),
@@ -116,7 +135,7 @@ SPECS = {
 # reads these; the suite reads SPECS alone, so its rows stay as they were.
 VARIANTS = {
  "aws-access-key-id": [("KEY=", [p, ("UD", 16)]) for p in ("AS" "IA", "AB" "IA", "AC" "CA", "A3" "TX")],
- "github-token": [("KEY=", ["gh", p + "_", ("an", 36)]) for p in "ousr"],
+ "github-token": [("KEY=", ["gh", p + "_", ("an-crc", 36)]) for p in "ousr"],
  "gitlab-token": [("KEY=", ["gl", p + "-", ("an-_", 26)]) for p in
                   ("ptt", "rt", "dt", "soat", "cbt", "ft", "imt", "agent", "oas")]
                  + [("KEY=", ["GR13", "48941", ("an-_", 20)])],

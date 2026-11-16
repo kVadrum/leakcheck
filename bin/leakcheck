@@ -90,7 +90,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.12.0"
+VERSION="0.13.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -254,7 +254,7 @@ CREDENTIALS=(
   putty-private-key           'PuTTY-User-Key-File-[0-9]+:'
   # source: docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html (AKIA, ASIA, ABIA, ACCA; A3T is not AWS's)
   aws-access-key-id           '(A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}'  # gitleaks: aws-access-token
-  # source: github.blog/engineering/platform-security/behind-githubs-new-authentication-token-formats/; github.blog/changelog/2021-03-04-authentication-token-format-updates/ (up to 255 characters)
+  # source: github.blog/engineering/platform-security/behind-githubs-new-authentication-token-formats/ (a CRC32 checksum in the last six; checksum_fails); github.blog/changelog/2021-03-04-authentication-token-format-updates/ (up to 255 characters)
   github-token                'gh[pousr]_[A-Za-z0-9]{36,}'  # gitleaks: github-pat, github-oauth, github-app-token, github-refresh-token
   # source: docs.github.com/en/organizations/managing-programmatic-access-to-your-organization/github-credential-types
   github-fine-grained-token   'github_pat_[A-Za-z0-9_]{22,}'  # gitleaks: github-fine-grained-pat
@@ -484,6 +484,44 @@ fail_err() {
 # A private-key header is never a placeholder: the body after it is base64
 # of a structured format, and the rule's key-after-the-header requirement is
 # what tells a fixture from a key.
+# A classic GitHub token whose checksum fails is a stand-in too
+# (checksum_fails, at the hit), though never left unmasked for it.
+# checksum_fails <match>: a classic GitHub token, `gh[pousr]_` and exactly
+# 36 more, whose last six are not the CRC-32 (IEEE, zlib's) of the 30 before
+# them in base62 (0-9A-Za-z), zero-padded — GitHub's checksum, "in the last
+# 6 digits of each token" (GitHub engineering blog, 2021). The byte-level
+# scheme (body alone, that alphabet order) is third-party, and was confirmed
+# on a real gho_ token, pass/fail only, with the operator's consent
+# (v0.13.0): of four candidate schemes exactly this one passed. A longer run
+# is no classic token whose checksum is known (GitHub plans for 255
+# characters; the stateless ghs_ carry a JWT), so it never fails here; nor
+# does an npm_ token, whose scheme npm states but nothing here confirmed.
+# It judges hits only: masking still hides a token whose checksum fails, so
+# a scheme confirmed on one token type can cost a report, never a print.
+CRC_T=()
+checksum_fails() { # match
+  local LC_ALL=C m=$1 i k c o crc=4294967295 sum=""
+  [[ ${#m} -eq 40 ]] || return 1
+  if [[ ${#CRC_T[@]} -eq 0 ]]; then
+    for (( i = 0; i < 256; i++ )); do
+      c=$i
+      for (( k = 0; k < 8; k++ )); do
+        if (( c & 1 )); then c=$(( 0xEDB88320 ^ (c >> 1) )); else c=$(( c >> 1 )); fi
+      done
+      CRC_T[i]=$c
+    done
+  fi
+  for (( i = 4; i < 34; i++ )); do
+    printf -v o '%d' "'${m:i:1}"
+    crc=$(( CRC_T[(crc ^ o) & 255] ^ (crc >> 8) ))
+  done
+  crc=$(( crc ^ 4294967295 ))
+  for (( k = 0; k < 6; k++ )); do
+    sum=${B62:crc % 62:1}$sum; crc=$(( crc / 62 ))
+  done
+  [[ "$sum" != "${m:34:6}" ]]
+}
+B62=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 declare -A CRED_ARUN=([aws-access-key-id]=2 [facebook-token]=8)
 is_placeholder() { # match [rule id]
   local LC_ALL=C m=$1 i c o prev=-2 same=0 up=0 arun=0 zs share
@@ -2188,7 +2226,10 @@ for i in "${!H_FILE[@]}"; do
     [[ -z "${CRED_MARKER["l${H_PAT[$i]}"]+x}" ]] || ph=0
     SHOW[$i]=""
     for j in ${MT_OF[$i]}; do
-      is_placeholder "${MT_TXT[j]}" "${H_PAT[$i]#credential:}" || ph=0
+      if ! is_placeholder "${MT_TXT[j]}" "${H_PAT[$i]#credential:}" &&
+         ! { [[ "${H_PAT[$i]}" == credential:github-token ]] && checksum_fails "${MT_TXT[j]}"; }; then
+        ph=0
+      fi
       cred_show "${H_PAT[$i]}" "${MT_TXT[j]}"
       SHOW[$i]+="${SHOW[$i]:+ }$REPLY"
     done
