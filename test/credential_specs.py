@@ -121,9 +121,15 @@ VARIANTS = {
                  + [("KEY=", ["GR13", "48941", ("an-_", 20)])],
  "slack-token": [("KEY=", ["xo", "x" + p + "-", ("d", 12), "-", ("d", 13), "-", ("an", 32)]) for p in "paeors"]
                 + [("KEY=", ["xa", "pp-1-", ("UD", 11), "-", ("d", 13), "-", ("hex", 64)])],
- "slack-webhook": [("URL=https://", ["hooks", ".slack.com/workflows/T", ("UD", 10), "/A", ("UD", 10), "/", ("d", 18), "/", ("an", 24)]),
+ "slack-webhook": [("URL=https://", ["hooks", ".slack-gov.com/services/T", ("UD", 10), "/B", ("UD", 10), "/", ("an", 24)]),
+                   ("URL=https://", ["hooks", ".slack.com/workflows/T", ("UD", 10), "/A", ("UD", 10), "/", ("d", 18), "/", ("an", 24)]),
                    ("URL=https://", ["hooks", ".slack.com/triggers/T", ("UD", 10), "/", ("d", 13), "/", ("hex", 32)])],
- "discord-webhook": [("URL=https://", ["discord", "app.com/api/webhooks/", ("d", 19), "/", ("an-_", 68)])],
+ "discord-webhook": [("URL=https://", ["discord", "app.com/api/webhooks/", ("d", 19), "/", ("an-_", 68)]),
+                     ("URL=https://", ["discord", ".com/api/v10/webhooks/", ("d", 19), "/", ("an-_", 68)])],
+ "teams-webhook": [("URL=https://acme", [".webhook", ".office.com/webhookb2/"] + GUID + ["@"] + GUID
+                    + ["/IncomingWebhook/", ("hex", 32), "/"] + GUID + ["/V2", ("an-_", 44)]),
+                   ("URL=https://", ["outlook", ".office.com/webhook/"] + GUID + ["@"] + GUID
+                    + ["/IncomingWebhook/", ("hex", 32), "/"] + GUID)],
  "stripe-key": [("KEY=", ["rk", "_live_", ("an", 99)]), ("KEY=", ["sk", "_test_", ("an", 99)]),
                 ("KEY=", ["sk", "_prod_", ("an", 24)])],
  "webhook-signing-secret": [("KEY=", ["wh", "sec_", ("b64", 43), "="])],

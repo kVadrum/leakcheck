@@ -90,7 +90,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.11.11"
+VERSION="0.11.12"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -246,9 +246,12 @@ CREDENTIALS=(
   github-fine-grained-token   'github_pat_[A-Za-z0-9_]{22,}'  # gitleaks: github-fine-grained-pat
   gitlab-token                'gl(pat|ptt|rt|dt|soat|cbt|ft|imt|agent|oas)-[A-Za-z0-9_-]{20,}|GR1348941[A-Za-z0-9_-]{20}'  # gitleaks: gitlab-pat and the other gitlab-* token rules
   slack-token                 'xox[abeoprs]-[A-Za-z0-9-]{10,}|xapp-[0-9]-[A-Za-z0-9-]{10,}'  # gitleaks: slack-bot-token, slack-user-token, slack-app-token
-  slack-webhook               'hooks\.slack\.com\\?/(services|workflows|triggers)\\?/([A-Za-z0-9+]|\\?/){43,}'  # gitleaks: slack-webhook-url
-  discord-webhook             'discord(app)?\.com\\?/api\\?/webhooks\\?/[0-9]{17,20}\\?/[A-Za-z0-9_-]{60,}'
-  teams-webhook               '\.webhook\.office\.com\\?/webhookb2\\?/([A-Za-z0-9@-]|\\?/){60,}'  # gitleaks: microsoft-teams-webhook
+  # Webhook URLs match their issuer's segments and stop: a body running
+  # across `/` took in what followed the secret, and `<url>/XXXXXXXX` was set
+  # aside as a stand-in (v0.11.3 §7). Each segment's class excludes `/`.
+  slack-webhook               'hooks\.slack(-gov)?\.com\\?/(services(\\?/[A-Za-z0-9]{8,}){2}|workflows(\\?/[A-Za-z0-9]{8,}){3}|triggers(\\?/[A-Za-z0-9]{8,}){2})\\?/[A-Za-z0-9]{20,}'  # gitleaks: slack-webhook-url
+  discord-webhook             'discord(app)?\.com\\?/api(\\?/v[0-9]+)?\\?/webhooks\\?/[0-9]{17,20}\\?/[A-Za-z0-9_-]{60,}'
+  teams-webhook               '(\.webhook\.office\.com\\?/webhookb2|outlook\.office(365)?\.com\\?/webhook)\\?/[A-Za-z0-9-]{20,}@[A-Za-z0-9-]{20,}\\?/[A-Za-z0-9]+\\?/[A-Za-z0-9]{20,}\\?/[A-Za-z0-9-]{20,}(\\?/V2[A-Za-z0-9_-]{20,})?'  # gitleaks: microsoft-teams-webhook
   stripe-key                  '[rs]k_(live|test|prod)_[A-Za-z0-9]{24,}'  # gitleaks: stripe-access-token
   webhook-signing-secret      'whsec_([A-Za-z0-9+=]|\\?/){24,}'
   google-api-key              'AIza[A-Za-z0-9_-]{35}'  # gitleaks: gcp-api-key

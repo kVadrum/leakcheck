@@ -2765,6 +2765,36 @@ t_credential_deepseek_key_has_a_left_edge() {
   assert_contains "leakcheck: 3 match(es)" "$LC_ERR"
 }
 
+t_credential_webhook_urls_stop_at_their_segments() {
+  # A webhook rule's body ran across `/`, so what followed the secret joined
+  # the match: `<url>/XXXXXXXX` was set aside as a stand-in, exit 0 (v0.11.3
+  # §7); and a Teams URL's `V2…` segment holds `_`, which ended the match, so
+  # the rest of it printed where an allow rule names the URL. Each rule now
+  # matches its issuer's segments and stops; GovSlack, Discord's versioned
+  # path and the old Outlook host are found too.
+  local sw ds tw gh v2 esw
+  sw=$(cred slack-webhook); ds=$(cred discord-webhook); tw=$(cred teams-webhook); gh=$(cred github-token)
+  v2="V2${gh:4:20}_${gh:24:12}"
+  esw=${sw//\//\\/}
+  seed a.txt "$(printf 'A=https://%s/XXXXXXXX\nB="https:\\/\\/%s\\/XXXXXXXX"\nC=https://%s\nD=https://%s\nE=https://acme%s/%s\nF=https://outlook.office.com/webhook/%s\nG=https://outlook.office365.com/webhook/%s' \
+    "$sw" "$esw" "${sw/.slack./.slack-gov.}" "${ds/api\/webhooks/api/v10/webhooks}" "$tw" "$v2" "${tw#*webhookb2/}" "${tw#*webhookb2/}")"
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [credential:slack-webhook] $(masked "$sw")" "$LC_OUT"
+  assert_contains "a.txt:2: [credential:slack-webhook] $(masked "$esw")" "$LC_OUT"
+  assert_contains "a.txt:3: [credential:slack-webhook] $(masked "${sw/.slack./.slack-gov.}")" "$LC_OUT"
+  assert_contains "a.txt:4: [credential:discord-webhook] $(masked "${ds/api\/webhooks/api/v10/webhooks}")" "$LC_OUT"
+  assert_contains "a.txt:5: [credential:teams-webhook] $(masked "$tw/$v2")" "$LC_OUT"
+  assert_contains "a.txt:6: [credential:teams-webhook] $(masked "outlook.office.com/webhook/${tw#*webhookb2/}")" "$LC_OUT"
+  assert_contains "a.txt:7: [credential:teams-webhook] $(masked "outlook.office365.com/webhook/${tw#*webhookb2/}")" "$LC_OUT"
+  assert_contains "leakcheck: 7 match(es)" "$LC_ERR"
+  assert_contains "0 placeholders not reported" "$LC_ERR"
+  rc_file "allow credential:teams-webhook ${tw//./\\.}/$v2"
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${gh:24:12}" "$LC_OUT"
+  assert_not_contains "${gh:4:20}" "$LC_OUT"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -3433,6 +3463,7 @@ lc_test "command-line errors mask a key"            t_command_line_errors_mask_a
 lc_test "credentials: overlapping keys in a name"   t_credential_overlapping_keys_in_a_name_are_masked
 lc_test "credentials: deepseek-key left edge"       t_credential_deepseek_key_has_a_left_edge
 lc_test "credentials: an edge is not in the mask"   t_credential_left_edge_is_not_masked_in_a_name
+lc_test "credentials: webhook URLs stop at segments" t_credential_webhook_urls_stop_at_their_segments
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
