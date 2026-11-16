@@ -376,6 +376,9 @@ def report(out, prev):
     print()
     print(f"{'rule':28} {'plain':>9} {'escaped':>9} {'encoded':>9} {'look-alike':>10} {'repos':>6}")
     for cid in rules:
+        if cid in specs.PATH_SPECS:
+            print(f"{cid:28} {'names only, tested by the suite':>40} {repo_by_rule.get(cid, 0):>6}")
+            continue
         row = syn["per_rule"].get(cid, {g: [0, 0] for g in ("plain", "escaped", "encoded")})
         flag = "" if row["plain"][0] == row["plain"][1] and row["plain"][1] else "  ✗"
         print(f"{cid:28} {pct(*row['plain']):>9} {pct(*row['escaped']):>9} {pct(*row['encoded']):>9} "
@@ -385,7 +388,9 @@ def report(out, prev):
     print(f"{'total':28} {pct(*tot['plain']):>9} {pct(*tot['escaped']):>9} {pct(*tot['encoded']):>9} "
           f"{len(syn['lookalike_hits']):>10} {sum(repo_by_rule.values()):>6}")
     if syn["placeholders"]:
-        print(f"\n{syn['placeholders']} synthetic matches set aside as placeholders (a generator bug: stand-ins avoid those shapes)")
+        # The zero-byte look-alikes are built to be set aside; a plain or
+        # escaped stand-in set aside is also a miss, reported above.
+        print(f"\n{syn['placeholders']} synthetic matches set aside as placeholders (look-alikes built of zero bytes are meant to be; a stand-in set aside shows as a miss)")
 
     def section(title, items, fmt, limit=40):
         if not items:
@@ -456,8 +461,10 @@ def main():
         os.makedirs(probe)
         git(probe, "init", "-q")
         rules = rule_ids(binary, rc, probe)
-        missing = sorted(set(rules) - set(specs.SPECS))
-        extra = sorted((set(specs.SPECS) | set(specs.VARIANTS) | set(specs.ISSUER_VARIANTS)) - set(rules))
+        # A path rule matches names, never content: the suite tests it.
+        missing = sorted(set(rules) - set(specs.SPECS) - set(specs.PATH_SPECS))
+        extra = sorted((set(specs.SPECS) | set(specs.VARIANTS) | set(specs.ISSUER_VARIANTS)
+                        | set(specs.PATH_SPECS)) - set(rules))
         if missing or extra:
             die(f"rules without a stand-in spec: {missing}; specs for no rule: {extra}")
         syn = measure_synthetic(binary, rc, work, a.per_rule, a.seed)

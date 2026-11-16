@@ -225,6 +225,13 @@ ISSUER_VARIANTS = {
 }
 
 
+# Path rules match a tracked file's NAME, never content: each stand-in is a
+# path that rule alone finds, as an empty file.
+PATH_SPECS = {
+    "pkcs12-file": ["certs/client.p12", "Server.PFX", "deploy/keys/signing.Pfx", "a b/key.P12"],
+}
+
+
 def variants(cid):
     """Every spec of a rule, SPECS' first."""
     return [SPECS[cid]] + VARIANTS.get(cid, []) + ISSUER_VARIANTS.get(cid, [])
@@ -251,6 +258,11 @@ def issuer_rows():
 
 if __name__ == "__main__":
     import sys
+    if sys.argv[1:] == ["--paths"]:
+        for cid, names in PATH_SPECS.items():
+            for name in names:
+                print(cid, name, sep="\t")
+        sys.exit(0)
     rows = issuer_rows() if sys.argv[1:] == ["--variants"] else suite_rows()
     for cid, line, m in rows:
         print(cid, line, m, sep="\t")

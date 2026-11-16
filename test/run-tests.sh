@@ -29,9 +29,15 @@ LC_ERR="$(mktemp -t lc-err.XXXXXX)"
 # builds them at run time from a fixed seed (this file is public and scanned,
 # so it holds no token). Each row: rule id, a line holding the stand-in, the
 # exact match.
+# CRED_PATHS: one row per path-rule stand-in, a file name (rule id, name);
+# CRED_IDS: every rule id in --list-rules order, the content rules first.
 CRED_TSV="$(mktemp -t lc-cred.XXXXXX)"
-trap 'rm -f "$LC_OUT" "$LC_ERR" "$CRED_TSV"' EXIT
+CRED_PATHS="$(mktemp -t lc-credp.XXXXXX)"
+CRED_IDS="$(mktemp -t lc-credi.XXXXXX)"
+trap 'rm -f "$LC_OUT" "$LC_ERR" "$CRED_TSV" "$CRED_PATHS" "$CRED_IDS"' EXIT
 python3 -I "$SCRIPT_DIR/credential_specs.py" > "$CRED_TSV" || { echo "stand-in generator failed" >&2; exit 2; }
+python3 -I "$SCRIPT_DIR/credential_specs.py" --paths > "$CRED_PATHS" || { echo "stand-in generator failed" >&2; exit 2; }
+{ cut -f1 "$CRED_TSV"; cut -f1 "$CRED_PATHS" | uniq; } > "$CRED_IDS"
 
 # cred <id>: that rule's stand-in. masked <match>: how leakcheck prints it.
 cred() {
@@ -1882,26 +1888,34 @@ t_ignorecase_only_at_the_start() {
 t_credential_every_rule_finds_its_own_format() {
   local id line m
   while IFS=$'\t' read -r id line m; do printf '%s\n' "$line" > "$id.txt"; done < "$CRED_TSV"
+  while IFS=$'\t' read -r id name; do mkdir -p "$(dirname "$name")"; : > "$name"; done < "$CRED_PATHS"
   git add .
   commit init
   assert_exit 1 "$BIN" --json
   cp "$LC_OUT" .git/cred.json
-  # Each file is one hit, of its own rule only, printed masked; the count of
-  # rules is the count of stand-ins, so a rule added without one fails here.
-  python3 - .git/cred.json "$CRED_TSV" <<'PY'
+  # Each file is one hit, of its own rule only, printed masked — a path
+  # rule's stand-in, an empty file, one hit on its name — and the count of
+  # rules is the count of rules with stand-ins, so a rule added without one
+  # fails here.
+  python3 - .git/cred.json "$CRED_TSV" "$CRED_PATHS" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
+paths = [l.rstrip("\n").split("\t") for l in open(sys.argv[3])]
 markers = {"private-key", "putty-private-key"}
 by = {}
 for h in doc["hits"]:
     by.setdefault(h["file"], []).append(h)
-assert doc["credentials_scanned"] is True and doc["credentials"] == {"rules": len(rows), "placeholders": 0}, doc["credentials"]
+nrules = len(rows) + len({cid for cid, _ in paths})
+assert doc["credentials_scanned"] is True and doc["credentials"] == {"rules": nrules, "placeholders": 0}, doc["credentials"]
 assert list(doc)[-2:] == ["credentials_scanned", "credentials"], list(doc)
 for cid, line, m in rows:
     hs = by.pop(cid + ".txt", [])
     want = m if cid in markers else "%s[redacted, %d chars]" % (m[:4], len(m))
     assert [(h["pattern"], h["text"]) for h in hs] == [("credential:" + cid, want)], (cid, hs)
+for cid, name in paths:
+    hs = by.pop(name, [])
+    assert [(h["pattern"], h["line"], h["text"]) for h in hs] == [("credential:" + cid, 0, name)], (cid, hs)
 assert not by, by
 PY
   assert_exit 1 "$BIN"
@@ -2057,9 +2071,9 @@ t_credential_list_patterns_appends_the_rules() {
   rc_file 'pattern MYHOST'
   commit init
   assert_exit 0 "$BIN" --list-patterns
-  local n; n=$(wc -l < "$CRED_TSV")
-  # Defaults, then the config's patterns, then one ERE per credential rule:
-  # what earlier versions printed stays a prefix.
+  local n; n=$(wc -l < "$CRED_IDS")
+  # Defaults, then the config's patterns, then one ERE per credential rule,
+  # the path rules last: what earlier versions printed stays a prefix.
   python3 - "$LC_OUT" "$n" <<'PY'
 import sys
 lines = open(sys.argv[1]).read().splitlines()
@@ -2445,7 +2459,7 @@ t_allow_credential_scope_errors() {
 
 t_disable_one_credential_rule() {
   local gh np n; gh=$(cred github-token); np=$(cred npm-token)
-  n=$(wc -l < "$CRED_TSV")
+  n=$(wc -l < "$CRED_IDS")
   seed a.txt "k=$gh"
   seed b.txt "k=$np"
   rc_file 'disable credential:github-token'
@@ -2474,15 +2488,15 @@ PY
   assert_contains "2 credential rules disabled by config" "$LC_OUT"
   # Every rule turned off one by one is counted, not read as no-credentials;
   # with no-credentials too, it is no-credentials.
-  cut -f1 "$CRED_TSV" | sed 's/^/disable credential:/' > .leakcheckrc
+  sed 's/^/disable credential:/' "$CRED_IDS" > .leakcheckrc
   git add .leakcheckrc
   assert_exit 0 "$BIN"
   assert_contains "credentials not scanned, $n credential rules disabled by config)" "$LC_OUT"
   assert_exit 0 "$BIN" --json
-  python3 - "$LC_OUT" "$CRED_TSV" <<'PY'
+  python3 - "$LC_OUT" "$CRED_IDS" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
-ids = ["credential:" + ln.split("\t")[0] for ln in open(sys.argv[2])]
+ids = ["credential:" + ln.rstrip("\n") for ln in open(sys.argv[2])]
 assert doc["credentials_scanned"] is False, doc
 assert doc["credentials"] == {"rules": 0, "placeholders": 0, "disabled": ids}, doc["credentials"]
 PY
@@ -2512,12 +2526,12 @@ t_list_rules() {
   commit init
   assert_exit 0 "$BIN" --list-rules
   # Every rule, in table order, each the id a stand-in was made for.
-  cut -f1 "$CRED_TSV" | sed 's/^/credential:/; s/$/\ton/' > .git/want
+  sed 's/^/credential:/; s/$/\ton/' "$CRED_IDS" > .git/want
   diff -u .git/want "$LC_OUT"
   rc_file 'no-credentials'
   assert_exit 0 "$BIN" --list-rules
   # Every rule listed, each off: no rule on is also true of no output.
-  cut -f1 "$CRED_TSV" | sed 's/^/credential:/; s/$/\toff/' > .git/want
+  sed 's/^/credential:/; s/$/\toff/' "$CRED_IDS" > .git/want
   diff -u .git/want "$LC_OUT"
   # A broken config fails here too.
   rc_file 'disable credential:nope'
@@ -2898,6 +2912,74 @@ t_credential_github_checksum() {
   rc_file 'no-defaults' "allow credential:github-token $bad"
   assert_exit 1 "$BIN" --json
   assert_not_contains "${bad:4:30}" "$LC_OUT"
+}
+
+t_credential_pkcs12_file() {
+  # A PKCS #12 bundle is binary, so its name is the only tell: pkcs12-file
+  # runs over tracked path names, any case, anchored at the end — never over
+  # content, a symlink target, or a name it then masks; its hit's text is
+  # the name, masked only for a key in it; never a stand-in.
+  local gh first; gh=$(cred github-token)
+  mkdir -p certs keys
+  printf '\x30\x82\x00\x01' > certs/client.p12
+  : > Server.PFX
+  : > example.p12
+  : > "keys/$gh.p12"
+  printf '%s\n' "at /home/alice/x" > bundle.pfx
+  printf '%s\n' "see certs/client.p12" "key.pfx" > notes.txt
+  : > doc.p12.md
+  : > p12.txt
+  ln -s certs/client.p12 link
+  ln -s other.pfx dangling
+  git add .
+  commit init
+  first=$(sha_of)
+  assert_exit 1 "$BIN"
+  assert_contains "certs/client.p12:0: [credential:pkcs12-file] certs/client.p12" "$LC_OUT"
+  assert_contains "Server.PFX:0: [credential:pkcs12-file] Server.PFX" "$LC_OUT"
+  assert_contains "example.p12:0: [credential:pkcs12-file] example.p12" "$LC_OUT"
+  assert_contains "bundle.pfx:0: [credential:pkcs12-file] bundle.pfx" "$LC_OUT"
+  assert_contains "bundle.pfx:1: [" "$LC_OUT"
+  assert_contains "keys/$(masked "$gh").p12:0: [credential:pkcs12-file] keys/$(masked "$gh").p12" "$LC_OUT"
+  assert_contains "keys/$(masked "$gh").p12:0: [credential:github-token]" "$LC_OUT"
+  assert_not_contains "$gh" "$LC_OUT"
+  assert_not_contains "notes.txt" "$LC_OUT"
+  assert_not_contains "doc.p12.md" "$LC_OUT"
+  assert_not_contains "p12.txt" "$LC_OUT"
+  assert_not_contains "link" "$LC_OUT"
+  assert_not_contains "dangling" "$LC_OUT"
+  assert_contains "leakcheck: 7 match(es)" "$LC_ERR"
+  assert_contains "1 binary skipped" "$LC_ERR"
+  assert_contains "0 placeholders not reported" "$LC_ERR"
+  # Scoped like any credential rule: its own allow scope excuses it, an
+  # unscoped rule never does and says so; disable turns it off, counted.
+  rc_file 'allow credential:pkcs12-file ^certs/' 'allow ^Server\.PFX:'
+  assert_exit 1 "$BIN"
+  assert_not_contains "certs/client.p12:0:" "$LC_OUT"
+  assert_contains "Server.PFX:0: [credential:pkcs12-file]" "$LC_OUT"
+  assert_contains "1 of them matched an allow rule that names no credential rule" "$LC_ERR"
+  rc_file 'disable credential:pkcs12-file'
+  assert_exit 1 "$BIN"
+  assert_not_contains "[credential:pkcs12-file]" "$LC_OUT"
+  assert_contains "keys/$(masked "$gh").p12:0: [credential:github-token]" "$LC_OUT"
+  assert_contains "1 credential rules disabled by config" "$LC_ERR"
+  # Every content rule off, the path rule on: credentials are still scanned,
+  # and a key in a bundle's name still masked.
+  cut -f1 "$CRED_TSV" | sed 's/^/disable credential:/' > .leakcheckrc
+  git add .leakcheckrc
+  assert_exit 1 "$BIN"
+  assert_contains "keys/$(masked "$gh").p12:0: [credential:pkcs12-file] keys/$(masked "$gh").p12" "$LC_OUT"
+  assert_not_contains "$gh" "$LC_OUT"
+  assert_contains "credentials scanned, 0 placeholders not reported, $(wc -l < "$CRED_TSV") credential rules disabled by config" "$LC_ERR"
+  # History: a removed bundle is still published by the commit that added it.
+  rc_file 'no-defaults'
+  git rm -q -r certs keys bundle.pfx example.p12 Server.PFX
+  commit gone
+  assert_exit 0 "$BIN"
+  assert_exit 1 "$BIN" --history
+  assert_contains "$first:Server.PFX:0: [credential:pkcs12-file] Server.PFX" "$LC_OUT"
+  assert_contains "$first:certs/client.p12:0: [credential:pkcs12-file] certs/client.p12" "$LC_OUT"
+  assert_not_contains "notes.txt" "$LC_OUT"
 }
 
 t_credential_left_edge_is_not_masked_in_a_name() {
@@ -3573,6 +3655,7 @@ lc_test "credentials: issuer-documented variants"   t_credential_issuer_variants
 lc_test "credentials: zero bytes are no AWS/FB key" t_credential_zero_bytes_are_no_aws_or_facebook_key
 lc_test "credentials: PGP secret and SSH2 headers"  t_credential_pgp_secret_and_ssh2_headers
 lc_test "credentials: GitHub's checksum"            t_credential_github_checksum
+lc_test "credentials: pkcs12-file, by name only"    t_credential_pkcs12_file
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
