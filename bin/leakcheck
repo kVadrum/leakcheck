@@ -73,6 +73,15 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] ||
   exit 2
 fi
 
+# The caller's shell settings never reach the scan (measured, /cxr 00b04d9):
+# a compatibility level of 4.2 or lower (BASH_COMPAT, or compat31 from
+# BASHOPTS or BASH_ENV) reads a quoted `=~` needle as a regex, so a key's
+# `.` matched a near-copy of an allowed key and a real secret yielded to it,
+# exit 0, and breaks the JSON escaping; `nocasematch` from BASH_ENV dropped the
+# same secret. Unsetting BASH_COMPAT resets the level and its compat options.
+unset BASH_COMPAT
+shopt -u nocasematch
+
 set -eEuo pipefail
 # An unexpected failure must never surface as exit 1, which means "matches
 # found" — map every abort onto the error code.
@@ -93,7 +102,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.16.3"
+VERSION="0.16.4"
 
 OUTPUT_MODE="text"
 STRICT=0

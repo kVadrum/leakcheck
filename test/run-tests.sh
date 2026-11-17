@@ -3368,6 +3368,31 @@ assert got == [(1, "credential:generic-secret"), (1, "credential:github-token"),
 PY
 }
 
+t_caller_shell_settings_do_not_reach_the_scan() {
+  # A compatibility level of 4.2 or lower read a quoted `=~` needle as a
+  # regex: a near-copy of an allowed JWT (a `.` changed) was taken for it,
+  # and the real secret behind `SECRET=` yielded, exit 0 (Codex, /cxr
+  # 00b04d9); the JSON escaping broke too (v0.16.2 as well), and
+  # `nocasematch` from BASH_ENV dropped the same secret. Each way in, the
+  # secret is reported.
+  local j f e
+  j=$(cred jwt); f=${j/./X}
+  printf '%s\n' "$j SECRET=$f" > s.txt
+  git add s.txt
+  rc_file 'no-defaults' 'allow credential:jwt ^s\.txt:1:'
+  commit init
+  printf 'shopt -s nocasematch\n' > .git/nocase.sh
+  for e in BASH_COMPAT=3.1 BASH_COMPAT=4.2 BASHOPTS=compat31 "BASH_ENV=$PWD/.git/nocase.sh"; do
+    assert_exit 1 env "$e" "$BIN" --json
+    python3 - "$LC_OUT" "$e" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = sorted(h["pattern"] for h in doc["hits"])
+assert got == ["credential:generic-secret"], (sys.argv[2], got)
+PY
+  done
+}
+
 t_kv_values_are_masked_where_they_print() {
   # An allow rule naming a keyword rule's value prints it masked, keyword
   # included (a masked run shows its first four bytes, which for a value
@@ -4143,6 +4168,7 @@ lc_test "keyword rules: yield to a key run into"  t_kv_rules_yield_to_a_key_they
 lc_test "keyword rules: yield by position"       t_kv_rules_yield_by_position_not_text
 lc_test "keyword rules: a crowded line, quickly"  t_kv_overlaps_on_a_crowded_line_are_quick
 lc_test "keyword rules: overlaps judged in place" t_kv_overlap_edges_are_judged_at_their_place
+lc_test "a caller's shell settings stay outside"  t_caller_shell_settings_do_not_reach_the_scan
 lc_test "keyword rules: masked where they print"  t_kv_values_are_masked_where_they_print
 lc_test "keyword rules: URL sub-delims"          t_kv_url_password_takes_rfc3986_sub_delims
 lc_test "keyword rules: a dotted token is no name" t_kv_dotted_token_is_no_name
