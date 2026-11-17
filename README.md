@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.16.0*
+*README v0.16.1*
 
 ## Install
 
@@ -153,6 +153,7 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
   An AWS key id and a Facebook token hold no zero bytes, so there a run of `A` does count, and so does a match that is half `A` (AWS) or an eighth `A` (Facebook): it is base64 of mostly-zero binary, such as an embedded font.
   A classic GitHub token, `ghp_`, `gho_`, `ghu_`, `ghs_` or `ghr_` and 36 characters, whose last six are not GitHub's checksum of the 30 before them is a stand-in too, since no real one fails it; it is masked all the same wherever it prints.
   Where a key may hold `/` (webhook signing secrets, Grafana Cloud, Sentry, 1Password and Fly.io tokens, JSON Web Tokens), text after the key can join the match, so only the part before the match's first `/` is judged: `<key>/XXXXXXXX` is reported.
+  Where a key has one stated length but the rule takes longer ones (GitHub's classic tokens, npm, Groq, Perplexity, xAI, Atlassian, Heroku and Terraform Cloud tokens), letters and digits glued after the key join the match too, so the key's shortest length must look like a stand-in as well: `<key>12345678` is reported.
   A stand-in does not excuse a real key beside it on the same line.
 - **The committed config is scanned for credentials**, though not for the patterns it lists: a key pasted into `.leakcheckrc` is published like any other.
 - **The rules are on by default.**
@@ -180,7 +181,7 @@ leakcheck: 2 credential(s) among these: revoke and reissue any that has left thi
 ```
 
 - **The value is judged, and a weak one is counted, not reported.**
-  Weak is a stand-in's shape (as above), or too little entropy — 3.5 bits per character for the generic rule, 3 for a URL's password, 4 for an AWS key — or, for the generic and URL rules, no digit or no letter, a word people write into stand-ins (`example`, `changeme`, `your`, `test`, `xxxx`, …), a dotted name (`settings.SECRET_KEY`) or an environment variable's name (`MY_API_TOKEN`).
+  Weak is a stand-in's shape (as above), or too little entropy — 3.5 bits per character for the generic rule, 3 for a URL's password, 4 for an AWS key — or, for the generic and URL rules, no digit or no letter, a word people write into stand-ins (`example`, `changeme`, `your`, `test`, `xxxx`, …), a dotted name (`settings.SECRET_KEY`, though not one with a part of 16 or more characters mixing upper case, lower case and digits, as a token's parts do) or an environment variable's name (`MY_API_TOKEN`).
   The summary counts these apart from the stand-ins, at the end of its line (`1 weak keyword values not reported`, above: `TOKEN = "your-token-here-…"`), and `--json` adds `"weak"` to `credentials`.
   So a password shorter than 12 characters, or one made of words, is not found; nor is a value a template fills in (`${DB_PASSWORD}`, `os.environ[…]`), which is no secret.
 - **A key a fixed-format rule finds is that rule's.**

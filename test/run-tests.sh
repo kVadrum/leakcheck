@@ -2788,6 +2788,17 @@ t_credential_deepseek_key_has_a_left_edge() {
     assert_contains "b.txt:$n: [credential:deepseek-key] $(masked "$ds")" "$LC_OUT"
   done
   assert_contains "leakcheck: 3 match(es)" "$LC_ERR"
+  # An `=` or `/` a writer escaped — JSON's `\u` and four hex digits, `\x`
+  # and two, a URL's `%` and two — ends in a lowercase letter, and the edge
+  # refused the key after it, exit 0 (v0.11.11 to v0.16.0).
+  printf '"u":"k\\u%s%s"\nk=\\x3d%s\nq?k=a%%3d%s\nr%%2f%s\n' 003d "$ds" "$ds" "$ds" "$ds" > c.txt
+  git add c.txt
+  commit c
+  assert_exit 1 "$BIN"
+  for n in 1 2 3 4; do
+    assert_contains "c.txt:$n: [credential:deepseek-key] $(masked "$ds")" "$LC_OUT"
+  done
+  assert_contains "leakcheck: 7 match(es)" "$LC_ERR"
 }
 
 t_credential_webhook_urls_stop_at_their_segments() {
@@ -3023,6 +3034,40 @@ assert doc["credentials"]["placeholders"] == 2, doc["credentials"]
 PY
 }
 
+t_credential_glued_tail_is_no_stand_in() {
+  # v0.12.0 opened eight fixed lengths at their end (`{36}` to `{36,}`), so
+  # letters and digits glued after a key joined the match: a key followed by
+  # `12345678` read as a stand-in, set aside, exit 0, and printed whole in an
+  # error (to v0.16.0). Those rules' stand-in test also judges the shortest
+  # start of the match the rule matches, so each key with that tail is
+  # reported, once. Guard: a key X-filled from its start is still a stand-in
+  # with the tail.
+  local id line m gh
+  gh=$(cred github-token)
+  : > g.txt
+  while IFS=$'\t' read -r id line m; do
+    case "$id" in
+      github-token|npm-token|groq-key|perplexity-key|xai-key|atlassian-token|heroku-key|terraform-cloud-token)
+        printf '%s\n' "${line%%"$m"*}${m}12345678${line#*"$m"}" >> g.txt ;;
+    esac
+  done < "$CRED_TSV"
+  printf '%s\n' "k=gh""p_$(printf 'X%.0s' {1..36})12345678" >> g.txt
+  git add g.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "$(wc -l < g.txt)" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+n = int(sys.argv[2])
+got = sorted(h["line"] for h in doc["hits"])
+assert n == 9 and got == list(range(1, n)), (got, n)
+assert doc["credentials"]["placeholders"] == 1, doc["credentials"]
+PY
+  assert_exit 2 "$BIN" "--x=${gh}12345678"
+  assert_not_contains "${gh:4:30}" "$LC_ERR"
+}
+
 t_long_line_hit_is_quick() {
   # A hit on a very long line took minutes: counting a record's lines and
   # splitting it into subject lines grew with the square of its length in
@@ -3193,6 +3238,28 @@ PY
   assert_not_contains "${gh:4:30}" "$LC_OUT"
 }
 
+t_kv_rules_yield_to_a_key_they_run_into() {
+  # A keyword rule's value is capped at 100 and may start before a fixed
+  # rule's key: in `ab12_<JWT>` it neither holds the key whole nor is held
+  # by it, and was reported beside the key (corpus harness, v0.16.1; v0.16.0
+  # set such a value aside as a dotted name instead). Holding the key's
+  # first 16 bytes, it overlaps the key and is the key's rule's.
+  local j
+  j=$(cred jwt)
+  printf '%s\n' "SECRET=ab12_$j" > o.txt
+  git add o.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = [(h["line"], h["pattern"]) for h in doc["hits"]]
+assert got == [(1, "credential:jwt")], got
+assert "weak" not in doc["credentials"] and doc["credentials"]["placeholders"] == 0, doc["credentials"]
+PY
+}
+
 t_kv_values_are_masked_where_they_print() {
   # An allow rule naming a keyword rule's value prints it masked, keyword
   # included (a masked run shows its first four bytes, which for a value
@@ -3220,6 +3287,57 @@ PY
   assert_not_contains "${v:2:14}" "$LC_ERR"
   assert_exit 2 "$BIN" "--token=$gh"
   assert_contains "leakcheck: unknown flag: --token=$(masked "$gh")" "$LC_ERR"
+  # A name holding `example` is no stand-in's value: masked as a whole
+  # match, the value printed (v0.16.0).
+  assert_exit 2 "$BIN" "--password_example=$v"
+  assert_not_contains "${v:2:14}" "$LC_ERR"
+}
+
+t_kv_url_password_takes_rfc3986_sub_delims() {
+  # RFC 3986's userinfo takes the sub-delims `$&'(),;` unescaped, in the user
+  # and the password, and a password holding one was no match at all, exit 0
+  # (v0.16.0).
+  local v
+  v=$(python3 -I -c 'import random; r = random.Random(47); a = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"; p = lambda n: "".join(r.choice(a) for _ in range(n)); print(p(6) + "$&'"'"'(" + p(6) + "),;" + p(2) + "7")')
+  printf '%s\n' "DATABASE_URL=postgres://app:$v@db:5432/app" "amqp://o'brien,ops:$v@mq" > u.txt
+  git add u.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "${#v}" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+n = int(sys.argv[2])
+got = sorted((h["line"], h["pattern"], h["text"]) for h in doc["hits"])
+assert got == [(1, "credential:url-password", "postgres://[redacted, %d chars]" % n),
+               (2, "credential:url-password", "amqp://[redacted, %d chars]" % n)], got
+PY
+  assert_not_contains "${v:0:6}" "$LC_OUT"
+}
+
+t_kv_dotted_token_is_no_name() {
+  # A dotted name is weak (settings.SECRET_KEY; the weak-values test is its
+  # guard), but a part of 16 or more mixing upper case, lower case and
+  # digits that splits into no words is a token's — a Vault `s.` token, a
+  # Discord bot token — and such a value was set aside as a name, exit 0
+  # (v0.16.0). Guard: a camel-case part with digits is still a name's.
+  local a b
+  a=$(python3 -I -c 'import random; r = random.Random(53); x = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz"; p = lambda n: "".join(r.choice(x) for _ in range(n)); print("s." + p(22) + "7q")')
+  b=$(python3 -I -c 'import random; r = random.Random(59); x = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz"; p = lambda n: "".join(r.choice(x) for _ in range(n)); print(p(23) + "5." + p(5) + "8." + p(26) + "3")')
+  printf '%s\n' "export VAULT_TOKEN=$a" "bot_token = '$b'" '"privateKey": privData.base64EncodedString()' > d.txt
+  git add d.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "${#a}" "${#b}" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+na, nb = int(sys.argv[2]), int(sys.argv[3])
+got = sorted((h["line"], h["pattern"], h["text"]) for h in doc["hits"])
+assert got == [(1, "credential:generic-secret", "TOKEN[redacted, %d chars]" % na),
+               (2, "credential:generic-secret", "token[redacted, %d chars]" % nb)], got
+assert doc["credentials"]["weak"] == 1, doc["credentials"]
+PY
 }
 
 t_credential_left_edge_is_not_masked_in_a_name() {
@@ -3897,12 +4015,16 @@ lc_test "credentials: PGP secret and SSH2 headers"  t_credential_pgp_secret_and_
 lc_test "credentials: GitHub's checksum"            t_credential_github_checksum
 lc_test "credentials: pkcs12-file, by name only"    t_credential_pkcs12_file
 lc_test "credentials: a tail after a body's slash"  t_credential_tail_after_a_slash_in_a_body
+lc_test "credentials: a glued tail is no stand-in"  t_credential_glued_tail_is_no_stand_in
 lc_test "a hit on a 1.2 MB line, quickly"         t_long_line_hit_is_quick
 lc_test "a 400 KB credential match, quickly"     t_long_credential_match_is_quick
 lc_test "keyword rules: unprefixed secrets"       t_kv_rules_find_unprefixed_secrets
 lc_test "keyword rules: weak values counted"      t_kv_weak_values_are_counted
 lc_test "keyword rules: yield to a fixed rule"    t_kv_rules_yield_to_a_fixed_format_rule
+lc_test "keyword rules: yield to a key run into"  t_kv_rules_yield_to_a_key_they_run_into
 lc_test "keyword rules: masked where they print"  t_kv_values_are_masked_where_they_print
+lc_test "keyword rules: URL sub-delims"          t_kv_url_password_takes_rfc3986_sub_delims
+lc_test "keyword rules: a dotted token is no name" t_kv_dotted_token_is_no_name
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
