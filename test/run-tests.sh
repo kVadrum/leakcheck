@@ -3003,6 +3003,34 @@ t_credential_pkcs12_file() {
   assert_not_contains "notes.txt" "$LC_OUT"
 }
 
+t_credential_pkcs12_file_ends_a_whole_name() {
+  # A name holding a newline spans several lines of the names pass, and the
+  # rule's `$` matched each line's end: `looks.p12`, a newline and `but.txt`
+  # read as a bundle (Codex, the /qaa of v0.16.1). A match counts only on a
+  # name's last line, in the tree and in history; a name that ends in `.p12`
+  # after a newline is still one.
+  printf 'x' > "$(printf 'looks.p12\nbut.txt')"
+  printf 'x' > "$(printf 'a\nb.p12')"
+  git add .
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = sorted((h["file"], h["pattern"]) for h in doc["hits"])
+assert got == [("a\nb.p12", "credential:pkcs12-file")], got
+PY
+  git rm -q -r .
+  commit gone
+  assert_exit 1 "$BIN" --history --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = sorted((h["file"], h["pattern"], h["source"]) for h in doc["hits"])
+assert got == [("a\nb.p12", "credential:pkcs12-file", "history")], got
+PY
+}
+
 t_credential_tail_after_a_slash_in_a_body() {
   # Six rules take `/` as a body character, so text after a key joins its
   # match: a key followed by `/XXXXXXXX` read as a stand-in and was set
@@ -3260,6 +3288,32 @@ assert "weak" not in doc["credentials"] and doc["credentials"]["placeholders"] =
 PY
 }
 
+t_kv_rules_yield_by_position_not_text() {
+  # A partial overlap is judged by position. A client secret opening like an
+  # allowed JWT on its line shares the JWT's first 16 bytes but none of its
+  # place, and v0.16.1, comparing text, dropped it, exit 0 (Codex, the /qaa
+  # of v0.16.1). Every place a match sits must touch the key: a second
+  # `SECRET=` holding the JWT's start alone also sits where the first does,
+  # and is still reported for the place it does not touch one.
+  local j r
+  j=$(cred jwt)
+  r=$(python3 -I -c 'import random; r = random.Random(61); a = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"; print("".join(r.choice(a) for _ in range(29)) + "7")')
+  printf '%s\n' "{\"id_token\":\"$j\",\"client_secret\":\"${j:0:16}$r\"}" "SECRET=ab12_$j;SECRET=ab12_${j:0:60}" > p.txt
+  git add p.txt
+  rc_file 'no-defaults' 'allow credential:jwt ^p\.txt:1:'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "$(( 16 + ${#r} ))" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = sorted((h["line"], h["pattern"]) for h in doc["hits"])
+assert got == [(1, "credential:generic-secret"), (2, "credential:generic-secret"), (2, "credential:jwt")], got
+one = [h["text"] for h in doc["hits"] if h["line"] == 1]
+assert one == ["secret[redacted, %s chars]" % sys.argv[2]], one
+assert [a["count"] for a in doc["allowed"]] == [1], doc["allowed"]
+PY
+}
+
 t_kv_values_are_masked_where_they_print() {
   # An allow rule naming a keyword rule's value prints it masked, keyword
   # included (a masked run shows its first four bytes, which for a value
@@ -3291,28 +3345,37 @@ PY
   # match, the value printed (v0.16.0).
   assert_exit 2 "$BIN" "--password_example=$v"
   assert_not_contains "${v:2:14}" "$LC_ERR"
+  # A value that runs into a key yields to it at the hit, but here only when
+  # one holds the other: v0.16.1 yielded to a partial overlap and printed
+  # the value's bytes before the key.
+  assert_exit 2 "$BIN" "--secret=ab12_$(cred jwt)"
+  assert_not_contains "ab12_" "$LC_ERR"
 }
 
 t_kv_url_password_takes_rfc3986_sub_delims() {
   # RFC 3986's userinfo takes the sub-delims `$&'(),;` unescaped, in the user
-  # and the password, and a password holding one was no match at all, exit 0
-  # (v0.16.0).
-  local v
+  # and the password, and `:` past the first; a password holding one was no
+  # match at all, exit 0 (v0.16.0; the colon, Codex, the /qaa of v0.16.1).
+  # Guard: a port and a path are no password, `@` in a query or not.
+  local v c
   v=$(python3 -I -c 'import random; r = random.Random(47); a = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"; p = lambda n: "".join(r.choice(a) for _ in range(n)); print(p(6) + "$&'"'"'(" + p(6) + "),;" + p(2) + "7")')
-  printf '%s\n' "DATABASE_URL=postgres://app:$v@db:5432/app" "amqp://o'brien,ops:$v@mq" > u.txt
+  c=$(python3 -I -c 'import random; r = random.Random(67); a = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"; p = lambda n: "".join(r.choice(a) for _ in range(n)); print(p(9) + ":" + p(8) + "7")')
+  printf '%s\n' "DATABASE_URL=postgres://app:$v@db:5432/app" "amqp://o'brien,ops:$v@mq" "redis://app:$c@cache" "http://host:8080/x?u=a@b" > u.txt
   git add u.txt
   rc_file 'no-defaults'
   commit init
   assert_exit 1 "$BIN" --json
-  python3 - "$LC_OUT" "${#v}" <<'PY'
+  python3 - "$LC_OUT" "${#v}" "${#c}" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
-n = int(sys.argv[2])
+n, nc = int(sys.argv[2]), int(sys.argv[3])
 got = sorted((h["line"], h["pattern"], h["text"]) for h in doc["hits"])
 assert got == [(1, "credential:url-password", "postgres://[redacted, %d chars]" % n),
-               (2, "credential:url-password", "amqp://[redacted, %d chars]" % n)], got
+               (2, "credential:url-password", "amqp://[redacted, %d chars]" % n),
+               (3, "credential:url-password", "redis://[redacted, %d chars]" % nc)], got
 PY
   assert_not_contains "${v:0:6}" "$LC_OUT"
+  assert_not_contains "${c:0:6}" "$LC_OUT"
 }
 
 t_kv_dotted_token_is_no_name() {
@@ -4014,6 +4077,7 @@ lc_test "credentials: zero bytes are no AWS/FB key" t_credential_zero_bytes_are_
 lc_test "credentials: PGP secret and SSH2 headers"  t_credential_pgp_secret_and_ssh2_headers
 lc_test "credentials: GitHub's checksum"            t_credential_github_checksum
 lc_test "credentials: pkcs12-file, by name only"    t_credential_pkcs12_file
+lc_test "credentials: pkcs12-file, a whole name"   t_credential_pkcs12_file_ends_a_whole_name
 lc_test "credentials: a tail after a body's slash"  t_credential_tail_after_a_slash_in_a_body
 lc_test "credentials: a glued tail is no stand-in"  t_credential_glued_tail_is_no_stand_in
 lc_test "a hit on a 1.2 MB line, quickly"         t_long_line_hit_is_quick
@@ -4022,6 +4086,7 @@ lc_test "keyword rules: unprefixed secrets"       t_kv_rules_find_unprefixed_sec
 lc_test "keyword rules: weak values counted"      t_kv_weak_values_are_counted
 lc_test "keyword rules: yield to a fixed rule"    t_kv_rules_yield_to_a_fixed_format_rule
 lc_test "keyword rules: yield to a key run into"  t_kv_rules_yield_to_a_key_they_run_into
+lc_test "keyword rules: yield by position"       t_kv_rules_yield_by_position_not_text
 lc_test "keyword rules: masked where they print"  t_kv_values_are_masked_where_they_print
 lc_test "keyword rules: URL sub-delims"          t_kv_url_password_takes_rfc3986_sub_delims
 lc_test "keyword rules: a dotted token is no name" t_kv_dotted_token_is_no_name

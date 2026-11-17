@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.16.1*
+*README v0.16.2*
 
 ## Install
 
@@ -186,6 +186,7 @@ leakcheck: 2 credential(s) among these: revoke and reissue any that has left thi
   So a password shorter than 12 characters, or one made of words, is not found; nor is a value a template fills in (`${DB_PASSWORD}`, `os.environ[…]`), which is no secret.
 - **A key a fixed-format rule finds is that rule's.**
   `GITHUB_TOKEN=ghp_…` is reported once, as `github-token`, and set aside or excused by that rule alone; a URL whose password is such a key is that rule's too, and the generic rule yields to the other two keyword rules as well.
+  So is a value that runs into such a key where the key sits; a separate value that only opens with the same characters is reported on its own.
   With the fixed-format rule disabled, the keyword rule reports the key itself.
 - **Where a keyword rule's match prints in an allow rule or an error, it is masked with its keyword**, since the first four characters a masked run shows would otherwise be the value's.
 - **The grammar and the stopwords are leakcheck's own**; the rules run in history like every other, and `disable` and `allow credential:` name them as any rule.

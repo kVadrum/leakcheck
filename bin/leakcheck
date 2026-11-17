@@ -93,7 +93,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.16.1"
+VERSION="0.16.2"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -405,7 +405,10 @@ CREDENTIALS=(
 # tell. Run over tracked path names alone, in the tree and in history —
 # never over content, a symlink target, a ref or a tag name — and never used
 # to mask: what it matches is a file extension, not a secret. A hit's text
-# is its path, printed as every name is.
+# is its path, printed as every name is. A path rule ends in `$`, the end of
+# the whole name: a name holding a newline spans several lines of the names
+# pass, so a match counts only on a name's last line — `looks.p12`, a
+# newline and `but.txt` read as a bundle (Codex, the /qaa of v0.16.1).
 PATH_CREDENTIALS=(
   # source: IANA media type application/pkcs12 ("File extension(s): .p12, .pfx"; "primarily used for the exchange of private keys"); RFC 7292
   pkcs12-file                 '\.[Pp]([Ff][Xx]|12)$'  # gitleaks: pkcs12-file
@@ -454,9 +457,10 @@ KV_CREDENTIALS=(
   # source: docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html (a secret access key, wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY: 40 characters); docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html (AWS_SECRET_ACCESS_KEY)
   aws-secret-access-key   'aws[_.-]?secret[_.-]?(access[_.-]?)?key'  '([A-Za-z0-9+]|\\?/){40}'  ''  4000
   # source: RFC 3986 §3.2.1 (userinfo: "user:password" is deprecated, and "applications should not render as clear text any data after the first colon")
-  # RFC 3986's userinfo: unreserved, percent-encoded and every sub-delim
-  # (`!$&'()*+,;=`); a password holding `$&'(),;` was no match (v0.16.0).
-  url-password            '[A-Za-z][A-Za-z0-9+.-]{1,30}:(\\?/){2}[A-Za-z0-9._~!$&'"'"'()*+,;=%-]{0,64}:'  '[A-Za-z0-9._~!$&'"'"'()*+,;=%-]{8,128}'  '@'  3000
+  # RFC 3986's userinfo: unreserved, percent-encoded, every sub-delim
+  # (`!$&'()*+,;=`) and, past the first, `:`; a password holding `$&'(),;`
+  # or a `:` was no match (v0.16.0; the colon, Codex, the /qaa of v0.16.1).
+  url-password            '[A-Za-z][A-Za-z0-9+.-]{1,30}:(\\?/){2}[A-Za-z0-9._~!$&'"'"'()*+,;=%-]{0,64}:'  '[A-Za-z0-9._~!$&'"'"'()*+,;=%:-]{8,128}'  '@'  3000
   # source: none (the generic rule every scanner carries, its grammar and stopwords ours)
   generic-secret          'passw(or)?d|pass|pwd|secret|token|credential|api[_.-]?key|apikey|access[_.-]?key|auth[_.-]?key|private[_.-]?key'  '[A-Za-z0-9_+/=~.!@#%^*-]{12,100}'  ''  3500
 )
@@ -575,19 +579,46 @@ kv_weak() {
   if [[ "$v" =~ ^[A-Z0-9_]+$ && "$v" == *_* ]]; then return 0; fi
   return 1
 }
-# kv_overlaps <id> <match> <keys, one per line>: the match's value and one
-# of the keys overlap, so it is that key's rule's (kv_yields): one holds the
-# other, or one holds the other's first 16 bytes — a value capped at 100
-# that starts before a key and ends inside it (`ghs_<n>_<JWT>`) holds
-# neither whole, and was reported beside the key (corpus harness, v0.16.1).
+# kv_overlaps <id> <match> <keys, one per line> [text]: the match's value
+# and one of the keys hold one another, so it is that key's rule's
+# (kv_yields). Given the text the match came from, a partial overlap counts
+# too: a value capped at 100 that starts before a key and ends inside it
+# (`ghs_<n>_<JWT>`) holds neither whole, and was reported beside the key
+# (corpus harness, v0.16.1). That one is judged by position, never by text:
+# every place the match sits in the text must have its value touch the key
+# there — v0.16.1 compared their first 16 bytes, and a client secret that
+# opened like an allowed JWT on its line was dropped, exit 0 (Codex, the
+# /qaa of v0.16.1). Holding one another stays a text test: a key held in a
+# value lies in the value's own bytes. The masking passes no text, so a
+# value's bytes outside a key never print for a partial overlap.
 kv_overlaps() {
-  local v t
-  if kv_value "$1" "$2"; then v=$REPLY; else v=$2; fi
+  local v t vs=0 m=$2 txt=${4-} o rest s e k hit found=0
+  local -a part=() ks=() ke=()
+  if kv_value "$1" "$2"; then v=$REPLY; vs=${#BASH_REMATCH[1]}; else v=$2; fi
   while IFS= read -r t; do
     [[ -n "$t" ]] || continue
-    if [[ "$v" == *"$t"* || "$t" == *"$v"* || "$v" == *"${t:0:16}"* || "$t" == *"${v:0:16}"* ]]; then return 0; fi
+    if [[ "$v" == *"$t"* || "$t" == *"$v"* ]]; then return 0; fi
+    if [[ -n "${4+x}" && ( "$v" == *"${t:0:16}"* || "$t" == *"${v:0:16}"* ) ]]; then part+=("$t"); fi
   done <<< "$3"
-  return 1
+  [[ ${#part[@]} -gt 0 ]] || return 1
+  for t in "${part[@]}"; do
+    o=0
+    while rest=${txt:o}; [[ "$rest" == *"$t"* ]]; do
+      rest=${rest%%"$t"*}; o=$(( o + ${#rest} ))
+      ks+=("$o"); ke+=("$(( o + ${#t} ))"); o=$(( o + 1 ))
+    done
+  done
+  o=0
+  while rest=${txt:o}; [[ "$rest" == *"$m"* ]]; do
+    rest=${rest%%"$m"*}; o=$(( o + ${#rest} ))
+    found=1; hit=0; s=$(( o + vs )); e=$(( o + vs + ${#v} ))
+    for k in "${!ks[@]}"; do
+      if (( s < ke[k] && ks[k] < e )); then hit=1; break; fi
+    done
+    [[ "$hit" -eq 1 ]] || return 1
+    o=$(( o + 1 ))
+  done
+  [[ "$found" -eq 1 ]]
 }
 # kv_show <id> <match> -> REPLY: what a keyword rule's hit prints.
 kv_show() {
@@ -1700,6 +1731,7 @@ for p in "${PATH_PATS[@]}"; do
     i="${SUBJ_OF_LINE[$l]:-}"
     [[ -n "$i" ]] || die "internal error: names pass returned line $l"
     [[ $i -lt ${#PATHS[@]} ]] || continue
+    [[ "${SUBJ_OF_LINE[$((l + 1))]:-}" != "$i" ]] || continue
     add_hit "$p" "${S_PATH[$i]}" 0 "${S_TEXT[$i]}" "${S_SRC[$i]}"
   done < "$TMPD/shits"
 done
@@ -1982,6 +2014,7 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       e="${HN_OF_LINE[l]-}"
       [[ -n "$e" ]] || die "internal error: history names pass returned line $l"
+      [[ "${HN_OF_LINE[l + 1]-}" != "$e" ]] || continue
       fc=${HN_FC[e]}
       hist_hit n "$p" "${FC_PATH[fc]}" 0 "${FC_PATH[fc]}" "${FC_SHA[fc]}"
     done < "$TMPD/hhits"
@@ -2562,7 +2595,7 @@ kv_yields() {
   while IFS= read -r t; do
     if [[ -n "$t" && "${t:0:1}" -le "$top" ]]; then keys+="${t:1}"$'\n'; fi
   done <<< "${CRED_ON_LINE[$lk]}"
-  kv_overlaps "$cid" "$2" "$keys"
+  kv_overlaps "$cid" "$2" "$keys" "${H_TEXT[$1]}"
 }
 
 KEEP=()
