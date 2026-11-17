@@ -91,7 +91,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.14.1"
+VERSION="0.14.2"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -446,6 +446,16 @@ mkdir "$TMPD/subj"
 
 in_c() { LC_ALL=C "$@"; } # pat_args says why the C locale
 
+# lines_of <string>: how many lines a record takes in a subject file (a path
+# or text may hold a newline) -> REPLY. By length difference, in C: bash's
+# `${1//[!$'\n']/}` grows with the square of the length, and a hit on a
+# 200 KB line took 19 s, a 1.8 MB one minutes; deleting a literal is linear.
+lines_of() {
+  local LC_ALL=C
+  local nl=${1//$'\n'/}
+  REPLY=$(( ${#1} - ${#nl} + 1 ))
+}
+
 # mask_git <git args...>: git over the masking's own files in $TMPD/subj,
 # with no GIT_* variable and no global or system config of the caller's. A
 # setting that makes every git call write to stderr (GIT_TRACE, a trace2
@@ -544,25 +554,31 @@ declare -A CRED_ARUN=([aws-access-key-id]=2 [facebook-token]=8)
 # do: their `/` ends a segment, and their stand-in is the secret segment.
 declare -A CRED_SLASH=([webhook-signing-secret]=1 [grafana-token]=1 [sentry-token]=1
   [1password-token]=1 [flyio-token]=1 [jwt]=1)
+# The walk goes by 256-byte chunks: `${m:i:1}` measures all of m each time,
+# so one character at a time grew with the square of the match's length (a
+# 200 KB match took 20 s); `pc` carries the previous character across.
 is_placeholder() { # match [rule id]
-  local LC_ALL=C m=$1 i c o prev=-2 same=0 up=0 arun=0 zs share
+  local LC_ALL=C m=$1 i c o prev=-2 same=0 up=0 arun=0 zs share off ch pc=""
   if [[ -n "${2:-}" && -n "${CRED_SLASH[$2]+x}" ]]; then m=${m%%/*}; fi
   if [[ "$m" == *EXAMPLE* || "$m" == *example* ]]; then return 0; fi
   if [[ -n "${2:-}" && -n "${CRED_ARUN[$2]+x}" ]]; then
-    arun=1; share=${CRED_ARUN[$2]}; zs=${m//[!A]/}
-    if (( ${#zs} * share >= ${#m} )); then return 0; fi
+    arun=1; share=${CRED_ARUN[$2]}; zs=${m//A/}
+    if (( (${#m} - ${#zs}) * share >= ${#m} )); then return 0; fi
   fi
-  for (( i = 0; i < ${#m}; i++ )); do
-    c=${m:i:1}
-    printf -v o '%d' "'$c"
-    if (( o == prev )) && [[ "$c" != A || $arun -eq 1 ]]; then same=$((same + 1)); else same=1; fi
-    if (( o == prev + 1 )) && [[ "$c" == [A-Za-z0-9] && "${m:i-1:1}" == [A-Za-z0-9] ]]; then
-      up=$((up + 1))
-    else
-      up=1
-    fi
-    if (( same >= 8 || up >= 8 )); then return 0; fi
-    prev=$o
+  for (( off = 0; off < ${#m}; off += 256 )); do
+    ch=${m:off:256}
+    for (( i = 0; i < ${#ch}; i++ )); do
+      c=${ch:i:1}
+      printf -v o '%d' "'$c"
+      if (( o == prev )) && [[ "$c" != A || $arun -eq 1 ]]; then same=$((same + 1)); else same=1; fi
+      if (( o == prev + 1 )) && [[ "$c" == [A-Za-z0-9] && "$pc" == [A-Za-z0-9] ]]; then
+        up=$((up + 1))
+      else
+        up=1
+      fi
+      if (( same >= 8 || up >= 8 )); then return 0; fi
+      prev=$o; pc=$c
+    done
   done
   return 1
 }
@@ -1393,8 +1409,8 @@ done
 SUBJ_OF_LINE=()
 n=0
 for i in "${!S_SUBJ[@]}"; do
-  nl="${S_SUBJ[$i]//[!$'\n']/}"
-  for (( k = 0; k <= ${#nl}; k++ )); do
+  lines_of "${S_SUBJ[$i]}"
+  for (( k = 0; k < REPLY; k++ )); do
     n=$((n + 1))
     SUBJ_OF_LINE[$n]=$i
   done
@@ -1682,8 +1698,8 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
     e=${#HN_FC[@]}
     HN_FC+=("$fc")
     printf '%s\n' "$path" >&5
-    nl="${path//[!$'\n']/}"
-    for (( k = 0; k <= ${#nl}; k++ )); do
+    lines_of "$path"
+    for (( k = 0; k < REPLY; k++ )); do
       n=$((n + 1))
       HN_OF_LINE[n]=$e
     done
@@ -2026,9 +2042,6 @@ ALLOW_COUNTS=()
 declare -A UNSCOPED_HINT=()
 for i in "${!H_FILE[@]}"; do ALLOWED[$i]=0; done
 for r in "${!ALLOWLIST[@]}"; do ALLOW_COUNTS[$r]=0; done
-# lines_of <string>: how many lines a record takes in a subject file (a
-# path or text may hold a newline).
-lines_of() { local nl=${1//[!$'\n']/}; REPLY=$(( ${#nl} + 1 )); }
 # The matches are needed by the allow rules, and by every credential hit,
 # which prints them masked and is judged on them by the placeholder check.
 NEED_MT=0
@@ -2087,11 +2100,13 @@ if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then
   for i in "${!H_FILE[@]}"; do
     rec="${H_FILE[$i]}:${H_LINE[$i]}:${H_TEXT[$i]}"
     printf '%s\n' "$rec" >&7
-    lines_of "$rec"; A_LINES[$i]=$REPLY
-    for (( k = 0; k < REPLY; k++ )); do
+    # mapfile splits it in one pass: `${rec#*$'\n'}` per line grows with
+    # the square of the record's length.
+    mapfile -t REC_LINES <<< "$rec"
+    A_LINES[$i]=${#REC_LINES[@]}
+    for (( k = 0; k < A_LINES[$i]; k++ )); do
       na=$((na + 1)); A_OF[na]=$i
-      A_TXT[na]=${rec%%$'\n'*}
-      rec=${rec#*$'\n'}
+      A_TXT[na]=${REC_LINES[k]}
     done
   done
   for j in "${!MT_HIT[@]}"; do

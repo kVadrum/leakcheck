@@ -3013,6 +3013,54 @@ assert doc["credentials"]["placeholders"] == 2, doc["credentials"]
 PY
 }
 
+t_long_line_hit_is_quick() {
+  # A hit on a very long line took minutes: counting a record's lines and
+  # splitting it into subject lines grew with the square of its length in
+  # bash (a 200 KB line, one hit, one allow rule: 19 s; 1.2 MB: minutes in
+  # any locale). A 1.2 MB line holding a home path and a key, under an allow
+  # rule, so every per-hit pass runs; reported within the bound.
+  local k
+  k=$(cred anthropic-key)
+  python3 -I - "$k" <<'PY'
+import base64, random, sys
+random.seed(7)
+b = base64.b64encode(random.randbytes(900000)).decode()
+open("big.svg", "w").write('<svg><image href="data:image/png;base64,' + b[:600000]
+                           + " /home/alice/x k=" + sys.argv[1] + " " + b[600000:] + '"/></svg>\n')
+PY
+  git add big.svg
+  rc_file 'allow ^docs/'
+  commit init
+  assert_exit 1 timeout 30 "$BIN" --json
+  python3 - "$LC_OUT" "$(masked "$k")" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert [(h["file"], h["line"]) for h in doc["hits"]] == [("big.svg", 1)] * 2, len(doc["hits"])
+cred = [h for h in doc["hits"] if h["pattern"] == "credential:anthropic-key"]
+home = [h for h in doc["hits"] if not h["pattern"].startswith("credential:")]
+assert len(cred) == 1 and len(home) == 1, [h["pattern"] for h in doc["hits"]]
+assert cred[0]["text"] == sys.argv[2], cred[0]["text"][:80]
+assert "/home/alice/x" in home[0]["text"]
+PY
+}
+
+t_long_credential_match_is_quick() {
+  # The stand-in check walked a match one character at a time, and each
+  # `${m:i:1}` measures the whole match: 200 KB took 17 s, 400 KB 66 s. A
+  # 400 KB match, not a stand-in, is reported within the bound.
+  python3 -I - <<'PY'
+import random
+random.seed(11)
+abc = "abcdefghijkmnpqrstuvwxyzBCDEFGHJKLMNPQRSTUVWXYZ23456789"
+open("long.txt", "w").write("t=" + "EA" + "AM" + "".join(random.choice(abc) for _ in range(400000)) + "\n")
+PY
+  git add long.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 timeout 30 "$BIN"
+  assert_contains "long.txt:1: [credential:facebook-token] EAAM[redacted, 400004 chars]" "$LC_OUT"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -3688,6 +3736,8 @@ lc_test "credentials: PGP secret and SSH2 headers"  t_credential_pgp_secret_and_
 lc_test "credentials: GitHub's checksum"            t_credential_github_checksum
 lc_test "credentials: pkcs12-file, by name only"    t_credential_pkcs12_file
 lc_test "credentials: a tail after a body's slash"  t_credential_tail_after_a_slash_in_a_body
+lc_test "a hit on a 1.2 MB line, quickly"         t_long_line_hit_is_quick
+lc_test "a 400 KB credential match, quickly"     t_long_credential_match_is_quick
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
