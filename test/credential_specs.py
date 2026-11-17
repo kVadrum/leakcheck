@@ -26,6 +26,13 @@ CS = {
     "bech": "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L",
     "lan": "abcdefghijklmnopqrstuvwxyz0123456789",
     "hexh": "0123456789abcdefgh",
+ "AL": "ABCDEFGHIJKL",
+ "AP": "ABCDEFGHIJKLMNOP",
+ "AD": "ABCD",
+ "AQgw": "AQgw",
+ "b32": "abcdefghijklmnopqrstuvwxyz234567",
+ "b32U": "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",
+ "b58": "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz",
 }
 
 
@@ -125,6 +132,14 @@ SPECS = {
  "new-relic-key": ("KEY=", ["NR", "AK-", ("UD", 27)]),
  "cloudflare-origin-ca-key": ("KEY=", ["v1", ".0-", ("hex", 24), "-", ("hex", 146)]),
  "mapbox-secret-token": ("KEY=", ["sk", ".eyJ1", ("an-_", 80)]),
+ "azure-cask-key": ("KEY=", [("an", 52), "JQ", "QJ99", ("an", 1), ("AL", 1), ("an", 16), ("a", 1), ("an", 7)]),
+ "azure-identifiable-key": ("KEY=", [("b64", 33), "+AE", "h", ("AP", 1), ("b64", 5), "="]),
+ "nuget-key": ("KEY=", ["oy", "2", ("b32", 43)]),
+ "cloudflare-api-token": ("KEY=", ["cf", "ut_", ("an", 48)]),
+ "circleci-token": ("KEY=", ["CCIP", "AT_", ("b58", 22), "_", ("hex", 40)]),
+ "replicate-token": ("KEY=", ["r8", "_", ("an", 37)]),
+ "sourcegraph-token": ("KEY=", ["sg", "p_", ("hex", 16), "_", ("hex", 40)]),
+ "docker-swarm-token": ("KEY=", ["SWM", "TKN-1-", ("lan", 50), "-", ("lan", 25)]),
 }
 
 
@@ -181,9 +196,9 @@ VARIANTS = {
 
 
 # Formats each issuer documents that the rules missed until v0.12.0 (stage
-# B′, re-sourced from the issuers): the suite reads these too
-# (`credential_specs.py --variants`), one line each, and each must hit its own
-# rule exactly once.
+# B′, re-sourced from the issuers), and every other branch of a rule added
+# since: the suite reads these too (`credential_specs.py --variants`), one
+# line each, and each must hit its own rule exactly once.
 ISSUER_VARIANTS = {
  "github-token": [("KEY=", ["gh", "r_", ("an", 76)])],
  "npm-token": [("KEY=", ["np", "m_", ("an", 40)])],
@@ -222,6 +237,22 @@ ISSUER_VARIANTS = {
                    ("KEY=", ["NR", "SP-", ("a", 2), ("hex", 33)]), ("KEY=", [("hex", 36), "NR", "AL"]),
                    ("KEY=", ["eu01", "xx", ("hex", 30), "NR", "AL"])],
  "mapbox-secret-token": [("KEY=", ["tk", ".eyJ", ("an-_", 80)]), ("KEY=", ["sk", ".eyJh", ("an-_", 80)])],
+ "azure-cask-key": [("KEY=", [("an", 52), "JQ", "QJ9" + c, ("an", 1), ("AL", 1), ("an", 16), ("a", 1), ("an", 9), "=="])
+                    for c in "9DH"],
+ "azure-identifiable-key": [("KEY=", [("b64", 76), s[:2], s[2:], ("b64", 5), ("AQgw", 1), "=="])
+                            for s in ("ACDb", "+ABa", "+AMC", "APIM")]
+                           + [("KEY=", [("b64", 33), s[:2], s[2:], ("AP", 1), ("b64", 5), "="])
+                              for s in ("+ASb", "+ARm", "AIoT", "AzCa", "AZEG")]
+                           + [("KEY=", [("b64", 42), "+A", "CR", ("AD", 1), ("b64", 5)]),
+                              ("KEY=", [("an", 42), "Az", "Se", ("AD", 1), ("an", 5)]),
+                              ("KEY=", [("an-_", 44), "Az", "Fu", ("an-_", 5), ("AQgw", 1), "=="])],
+ "nuget-key": [("KEY=", ["OY", "2", ("b32U", 43)])],
+ "cloudflare-api-token": [("KEY=", ["cf", p + "_", ("an", 48)]) for p in ("at", "k", "ast")],
+ "circleci-token": [("KEY=", ["CCIP", "RJ_", ("b58", 21), "_", ("hex", 40)])],
+ "sourcegraph-token": [("KEY=", ["sg", "p_lo" "cal_", ("hex", 40)]), ("KEY=", ["sg", "p_", ("hex", 40)])]
+                      + [("KEY=", [p[0], p[1:] + "_", ("hex", 64)]) for p in ("sgd", "slk", "sgs")],
+ "docker-swarm-token": [("KEY=", ["SWM", "TKN-2-1-", ("lan", 50), "-", ("lan", 25)]),
+                        ("KEY=", ["SWM", "KEY-1-", ("b64", 43)])],
 }
 
 

@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.14.2*
+*README v0.15.0*
 
 ## Install
 
@@ -102,14 +102,14 @@ pattern -(home|Users)-[A-Za-z0-9_][A-Za-z0-9_.]*-
 Built-in rules also find keys and tokens in the formats their issuers fixed, by a prefix or a shape that ordinary text does not have:
 
 - private key headers: PEM, OpenSSH, PGP (PGP 2's secret key blocks too), ssh.com and PuTTY;
-- AWS access key ids, Google API keys (AI Studio's `AQ.` keys too) and OAuth client secrets, and Azure storage keys (Microsoft's identifiable keys too) and Entra client secrets;
-- GitHub, GitLab, npm, PyPI, RubyGems and Clojars tokens;
-- Anthropic, OpenAI, OpenRouter, DeepSeek, Groq, Perplexity, xAI and Hugging Face keys;
+- AWS access key ids, Google API keys (AI Studio's `AQ.` keys too) and OAuth client secrets, and Azure storage keys, Entra client secrets and Microsoft's identifiable keys (Cosmos DB, Event Hubs, Service Bus, API Management, Azure AI and the rest, by the signature each carries);
+- GitHub, GitLab, npm, PyPI, NuGet, RubyGems and Clojars tokens;
+- Anthropic, OpenAI, OpenRouter, DeepSeek, Groq, Perplexity, xAI, Hugging Face and Replicate keys;
 - Slack tokens (workflow tokens too), and Slack (GovSlack too), Discord and Teams webhook URLs;
 - Stripe keys (organization keys too) and webhook signing secrets (Stripe's, and the Standard Webhooks spec's secret keys), and Square, Shopify and Facebook tokens;
 - JSON Web Tokens;
 - PKCS #12 key bundles, by their file names alone (`.p12`, `.pfx`, any case): their content is binary, so a tracked name is the only tell, and the rule runs over tracked path names and nothing else;
-- keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana, Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare origin CA and Mapbox.
+- keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana, Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare (API tokens and origin CA keys), CircleCI, Sourcegraph, Docker Swarm (join tokens and unlock keys) and Mapbox.
 
 A key or webhook URL is found with its slashes JSON-escaped, `\/`, as PHP's `json_encode` and others write them.
 A key is found inside a longer run of characters too, with one exception: a DeepSeek key, `sk-` and 32 hex digits, is also how generated names end (`task-…`, `desk-…`), so it is not found right after a lowercase letter.

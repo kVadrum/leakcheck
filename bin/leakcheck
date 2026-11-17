@@ -91,7 +91,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.14.2"
+VERSION="0.15.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -378,6 +378,22 @@ CREDENTIALS=(
   cloudflare-origin-ca-key    'v1\.0-[a-f0-9]{24}-[a-f0-9]{146}'  # gitleaks: cloudflare-origin-ca-key
   # source: docs.mapbox.com/api/accounts/tokens (sk. secret, tk. temporary; a base64url JSON payload)
   mapbox-secret-token         '[st]k\.eyJ[A-Za-z0-9._-]{51,}'
+  # source: github.com/microsoft/security-utilities, GeneratedRegexPatterns/PreciselyClassifiedSecurityKeys.json (SEC101/200, the common annotated security key: JQQJ9 at offset 52 of an 84- or 88-character key; SEC101/177 and 197–245 name the service from its later bytes)
+  azure-cask-key              '[A-Za-z0-9]{52}JQQJ9[9DH][A-Za-z0-9][A-L][A-Za-z0-9]{16}[A-Za-z][A-Za-z0-9]{7}([A-Za-z0-9]{2}==)?'
+  # source: the same file (SEC101/154, 158, 160, 163, 166, 167, 170–173, 176, 178–184, 199: a service's signature at a fixed offset of a 44-, 52-, 56- or 88-character key; storage's +ASt is azure-storage-key's)
+  azure-identifiable-key      '([A-Za-z0-9+]|\\?/){76}(ACDb|\+ABa|\+AMC|APIM)([A-Za-z0-9+]|\\?/){5}[AQgw]==|([A-Za-z0-9+]|\\?/){33}(\+AEh|\+ASb|\+ARm|AIoT|AzCa|AZEG)[A-P]([A-Za-z0-9+]|\\?/){5}=|([A-Za-z0-9+]|\\?/){42}\+ACR[A-D]([A-Za-z0-9+]|\\?/){5}|[A-Za-z0-9]{42}AzSe[A-D][A-Za-z0-9]{5}|[A-Za-z0-9_-]{44}AzFu[A-Za-z0-9_-]{5}[AQgw]=='
+  # source: the same file (SEC101/031: oy2 and 43 base32, any case)
+  nuget-key                   '[Oo][Yy]2[A-Za-z2-7]{43}'
+  # source: developers.cloudflare.com/fundamentals/api/get-started/token-formats/ (cfk_, cfut_, cfat_: 40 characters and a checksum); developers.cloudflare.com/changelog/post/2026-04-14-cloudflare-api-token-detections/ (a CRC32 suffix); developers.cloudflare.com/changelog/post/2026-08-26-service-token-secret-format/ (cfast_: 40 alphanumeric and an 8-character checksum). The checksum's bytes are not published, so it is not verified; cfoat_ has no stated length
+  cloudflare-api-token        'cf(k|ut|at|ast)_[A-Za-z0-9]{48}'
+  # source: circleci.com/changelog/new-format-for-api-access-tokens (CCIPAT_ or CCIPRJ_, a base58 UUID, _, 40 hex)
+  circleci-token              'CCIP(AT|RJ)_[1-9A-HJ-NP-Za-km-z]{1,22}_[A-Fa-f0-9]{40}'
+  # source: replicate.com/docs/topics/security/api-tokens ("40-character strings that always start with r8_"; the characters unstated, alphanumeric as issued)
+  replicate-token             'r8_[A-Za-z0-9]{37}'
+  # source: github.com/sourcegraph/sourcegraph-public-snapshot, doc/dev/security/secret_formats.md (sgp_ v2 and v3, whose instance identifier is not verified, so any; sgd_, slk_, sgs_)
+  sourcegraph-token           'sgp_([A-Za-z0-9]{1,64}_)?[A-Fa-f0-9]{40}|s(gd|lk|gs)_[A-Fa-f0-9]{64}'
+  # source: github.com/moby/swarmkit, ca/config.go (SWMTKN-1-, 50 and 25 base36; SWMTKN-2- adds a FIPS digit) and manager/encryption/encryption.go (SWMKEY-1-, a 32-byte key in unpadded base64)
+  docker-swarm-token          'SWMTKN-(1|2-[01])-[0-9a-z]{50}-[0-9a-z]{25}|SWMKEY-1-([A-Za-z0-9+]|\\?/){43}'
 )
 # Path rules: a key file a tracked NAME gives away. A PKCS #12 bundle is
 # binary, so its content is skipped and counted, and its name is the only
