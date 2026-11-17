@@ -93,7 +93,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.16.2"
+VERSION="0.16.3"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -579,11 +579,11 @@ kv_weak() {
   if [[ "$v" =~ ^[A-Z0-9_]+$ && "$v" == *_* ]]; then return 0; fi
   return 1
 }
-# kv_overlaps <id> <match> <keys, one per line> [text]: the match's value
-# and one of the keys hold one another, so it is that key's rule's
-# (kv_yields). Given the text the match came from, a partial overlap counts
-# too: a value capped at 100 that starts before a key and ends inside it
-# (`ghs_<n>_<JWT>`) holds neither whole, and was reported beside the key
+# kv_overlaps <id> <match> <keys, one per line> [text] [cache id]: the
+# match's value and one of the keys hold one another, so it is that key's
+# rule's (kv_yields). Given the text the match came from, a partial overlap
+# counts too: a value capped at 100 that starts before a key and ends inside
+# it (`ghs_<n>_<JWT>`) holds neither whole, and was reported beside the key
 # (corpus harness, v0.16.1). That one is judged by position, never by text:
 # every place the match sits in the text must have its value touch the key
 # there — v0.16.1 compared their first 16 bytes, and a client secret that
@@ -591,34 +591,97 @@ kv_weak() {
 # /qaa of v0.16.1). Holding one another stays a text test: a key held in a
 # value lies in the value's own bytes. The masking passes no text, so a
 # value's bytes outside a key never print for a partial overlap.
-kv_overlaps() {
-  local v t vs=0 m=$2 txt=${4-} o rest s e k hit found=0
-  local -a part=() ks=() ke=()
-  if kv_value "$1" "$2"; then v=$REPLY; vs=${#BASH_REMATCH[1]}; else v=$2; fi
-  while IFS= read -r t; do
-    [[ -n "$t" ]] || continue
-    if [[ "$v" == *"$t"* || "$t" == *"$v"* ]]; then return 0; fi
-    if [[ -n "${4+x}" && ( "$v" == *"${t:0:16}"* || "$t" == *"${v:0:16}"* ) ]]; then part+=("$t"); fi
-  done <<< "$3"
-  [[ ${#part[@]} -gt 0 ]] || return 1
-  for t in "${part[@]}"; do
-    o=0
-    while rest=${txt:o}; [[ "$rest" == *"$t"* ]]; do
-      rest=${rest%%"$t"*}; o=$(( o + ${#rest} ))
-      ks+=("$o"); ke+=("$(( o + ${#t} ))"); o=$(( o + 1 ))
+# A line's key places are found once (kv_spans, by the cache id: the line
+# and its key set) and searched by position, each key once: v0.16.2 searched
+# the line for every candidate key at every match, and a line holding
+# `SECRET=ab12_<JWT>` a hundred times ran past two minutes (Codex, /cxr
+# 148aa93). Offsets are bytes (the C locale), in the index as in the match.
+declare -A KV_YIELDS=() KV_LINE_ID=() KV_KEYS=()
+KV_LINE_N=0
+# kv_lines <text>: KV_ARR = its non-empty lines, split in memory. A `read`
+# loop over a here-string reads a pipe one byte at a time, and kv_overlaps
+# and kv_yields ran one per match over every key on the line.
+kv_lines() {
+  local -
+  local IFS=$'\n'
+  set -f
+  KV_ARR=($1)
+}
+# kv_spans <cache id> <text>: every place each key in KV_ARR sits in the
+# text, sorted by start: KV_SS starts, KV_SE ends, KV_SK the key, KV_SM the
+# largest end so far. One line's index is kept: kv_yields judges a hit's
+# matches one after another, all on its line.
+KV_SPAN_ID=""
+kv_spans() {
+  local LC_ALL=C k n mx=0 txt=$2
+  local -a at=() ak=() we=() wk=()
+  if [[ -n "$1" && "$1" == "$KV_SPAN_ID" ]]; then return 0; fi
+  KV_SS=(); KV_SE=(); KV_SK=(); KV_SM=()
+  for n in "${!KV_ARR[@]}"; do
+    kv_places "$txt" "${KV_ARR[n]}"
+    for k in $REPLY; do at[k]+="$(( k + ${#KV_ARR[n]} )) "; ak[k]+="$n "; done
+  done
+  for k in "${!at[@]}"; do
+    we=(${at[k]}); wk=(${ak[k]})
+    for n in "${!we[@]}"; do
+      if (( we[n] > mx )); then mx=${we[n]}; fi
+      KV_SS+=("$k"); KV_SE+=("${we[n]}"); KV_SK+=("${KV_ARR[wk[n]]}"); KV_SM+=("$mx")
     done
   done
-  o=0
-  while rest=${txt:o}; [[ "$rest" == *"$m"* ]]; do
-    rest=${rest%%"$m"*}; o=$(( o + ${#rest} ))
-    found=1; hit=0; s=$(( o + vs )); e=$(( o + vs + ${#v} ))
-    for k in "${!ks[@]}"; do
-      if (( s < ke[k] && ks[k] < e )); then hit=1; break; fi
+  KV_SPAN_ID=$1
+}
+# kv_places <text> <needle> -> REPLY: every offset the needle starts at,
+# overlapping places included. bash's regex finds the leftmost place, the
+# quoted needle read literally; `${rest%%"$2"*}` tries a match at every
+# offset and was ten times slower on a long line (measured).
+kv_places() {
+  local LC_ALL=C rest=$1 p k=0
+  REPLY=""
+  while [[ $rest =~ "$2"(.*)$ ]]; do
+    p=$(( ${#rest} - ${#BASH_REMATCH[1]} - ${#2} ))
+    k=$(( k + p )); REPLY+="$k "
+    rest=${rest:p+1}; k=$(( k + 1 ))
+  done
+}
+# A key holds the value: one search of the key list, whose newlines no value
+# holds. A partial overlap's key is judged at the place the index names.
+kv_overlaps() {
+  local LC_ALL=C v t vs=0 m=$2 txt=${4-} o s e i lo hi mid hit=0 places
+  if kv_value "$1" "$2"; then v=$REPLY; vs=${#BASH_REMATCH[1]}; else v=$2; fi
+  kv_lines "$3"
+  [[ ${#KV_ARR[@]} -gt 0 ]] || return 1
+  if [[ "$3" == *"$v"* ]]; then return 0; fi
+  for t in "${KV_ARR[@]}"; do
+    if (( ${#t} <= ${#v} )) && [[ "$v" == *"$t"* ]]; then return 0; fi
+  done
+  [[ -n "${4+x}" ]] || return 1
+  if [[ "$3" != *"${v:0:16}"* ]]; then
+    for t in "${KV_ARR[@]}"; do
+      if [[ "$v" == *"${t:0:16}"* ]]; then hit=1; break; fi
     done
     [[ "$hit" -eq 1 ]] || return 1
-    o=$(( o + 1 ))
+  fi
+  kv_places "$txt" "$m"
+  # Kept apart: kv_spans' own kv_places replace REPLY, and the first match
+  # judged on a line read the last key's places (fuzzed against v0.16.2).
+  places=$REPLY
+  [[ -n "$places" ]] || return 1
+  kv_spans "${5-}" "$txt"
+  for o in $places; do
+    s=$(( o + vs )); e=$(( s + ${#v} )); hit=0
+    lo=0; hi=${#KV_SS[@]}
+    while (( lo < hi )); do
+      mid=$(( (lo + hi) / 2 ))
+      if (( KV_SS[mid] < e )); then lo=$(( mid + 1 )); else hi=$mid; fi
+    done
+    i=$(( lo - 1 ))
+    while (( i >= 0 )) && (( KV_SM[i] > s )); do
+      t=${KV_SK[i]}
+      if (( KV_SE[i] > s )) && [[ "$v" == *"${t:0:16}"* || "$t" == *"${v:0:16}"* ]]; then hit=1; break; fi
+      i=$(( i - 1 ))
+    done
+    [[ "$hit" -eq 1 ]] || return 1
   done
-  [[ "$found" -eq 1 ]]
 }
 # kv_show <id> <match> -> REPLY: what a keyword rule's hit prints.
 kv_show() {
@@ -2586,16 +2649,32 @@ for i in "${!H_FILE[@]}"; do
   done
 done
 # kv_yields <hit> <match>: a keyword rule's match whose value overlaps a key
-# a rule above it matched on the same line.
+# a rule above it matched on the same line. Judged once per rule, line and
+# match text (KV_YIELDS): kv_overlaps reads every place the match sits, so a
+# match repeated on its line gets the one answer. A line's keys are listed
+# once per rank (KV_KEYS), each once.
 kv_yields() {
-  local cid=${H_PAT[$1]#credential:} top=0 t keys=""
+  local cid=${H_PAT[$1]#credential:} top=0 t keys="" r=0 mk id
   local lk="${#H_FILE[$1]}:${H_FILE[$1]}${#H_LINE[$1]}:${H_LINE[$1]}${#H_COMMIT[$1]}:${H_COMMIT[$1]}:${H_TEXT[$1]}"
   [[ -n "${CRED_ON_LINE[$lk]+x}" ]] || return 1
+  id=${KV_LINE_ID[$lk]-}
+  if [[ -z "$id" ]]; then KV_LINE_N=$(( KV_LINE_N + 1 )); id=$KV_LINE_N; KV_LINE_ID[$lk]=$id; fi
+  mk="$cid $id:$2"
+  if [[ -n "${KV_YIELDS[$mk]+x}" ]]; then return "${KV_YIELDS[$mk]}"; fi
   if [[ "$cid" == "$KV_GENERIC" ]]; then top=1; fi
-  while IFS= read -r t; do
-    if [[ -n "$t" && "${t:0:1}" -le "$top" ]]; then keys+="${t:1}"$'\n'; fi
-  done <<< "${CRED_ON_LINE[$lk]}"
-  kv_overlaps "$cid" "$2" "$keys" "${H_TEXT[$1]}"
+  if [[ -n "${KV_KEYS["$top $id"]+x}" ]]; then
+    keys=${KV_KEYS["$top $id"]}
+  else
+    local -A seen=()
+    kv_lines "${CRED_ON_LINE[$lk]}"
+    for t in "${KV_ARR[@]}"; do
+      if [[ "${t:0:1}" -le "$top" && -z "${seen["k${t:1}"]+x}" ]]; then seen["k${t:1}"]=1; keys+="${t:1}"$'\n'; fi
+    done
+    KV_KEYS["$top $id"]=$keys
+  fi
+  kv_overlaps "$cid" "$2" "$keys" "${H_TEXT[$1]}" "$top $id" || r=1
+  KV_YIELDS[$mk]=$r
+  return "$r"
 }
 
 KEEP=()

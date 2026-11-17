@@ -3314,6 +3314,60 @@ assert [a["count"] for a in doc["allowed"]] == [1], doc["allowed"]
 PY
 }
 
+t_kv_overlaps_on_a_crowded_line_are_quick() {
+  # A value that runs into a key yields to it wherever the match sits, and
+  # v0.16.2 searched the line for every candidate key at every match: 50
+  # `SECRET=ab12_<JWT>` on a line took 15 s, 100 over 30 (Codex, /cxr
+  # 148aa93). Three hundred of one JWT on a line, and two hundred
+  # distinct ones, are judged within the bound, and every value still
+  # yields to its key.
+  local j
+  j=$(cred jwt)
+  python3 -I - "$j" <<'PY'
+import random, sys
+j = sys.argv[1]; h, p, s = j.split(".")
+r = random.Random(17); a = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+same = " ".join(["SECRET=ab12_" + j] * 300)
+dist = " ".join("SECRET=ab12_%s.%s%s.%s" % (h, p[:-8], "".join(r.choice(a) for _ in range(8)), s) for _ in range(200))
+open("crowd.txt", "w").write(same + "\n" + dist + "\n")
+PY
+  git add crowd.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 timeout 30 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = sorted((h["line"], h["pattern"]) for h in doc["hits"])
+assert got == [(1, "credential:jwt"), (2, "credential:jwt")], got
+PY
+}
+
+t_kv_overlap_edges_are_judged_at_their_place() {
+  # Guard: v0.16.2's judgement, which v0.16.3 rebuilt for speed; each line
+  # pins a part that no other test reached, and passes on v0.16.2 by design.
+  # 1. A value touching a key by fewer than 16 bytes is no partial overlap,
+  #    though it opens like a key elsewhere on the line: still reported.
+  # 2. A value a key holds yields wherever it sits (holding is a text test).
+  # 3. A value that opens inside a key and runs past it yields to that key:
+  #    a URL password holding `SECRET=`, the generic value running past `@`.
+  local g j r p
+  g=$(cred github-token); j=$(cred jwt)
+  r=$(python3 -I -c 'import random; r = random.Random(23); a = "abcdfghijkmnpqrstuvwxz23456789"; print("".join(r.choice(a) for _ in range(73)))')
+  p=$(python3 -I -c 'import random; r = random.Random(29); a = "ABCDFGHJKLMNPQRSTUVWXZabcdfghijkmnpqrstuvwxz23456789"; print("".join(r.choice(a) for _ in range(20)))')
+  printf '%s\n' "$g SECRET=${g:0:16}!$r$j" "$j token=\"${j:40:80}\"" "postgres://user:xSECRET=$p@db7/q9" > e.txt
+  git add e.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = sorted((h["line"], h["pattern"]) for h in doc["hits"])
+assert got == [(1, "credential:generic-secret"), (1, "credential:github-token"), (1, "credential:jwt"), (2, "credential:jwt")], got
+PY
+}
+
 t_kv_values_are_masked_where_they_print() {
   # An allow rule naming a keyword rule's value prints it masked, keyword
   # included (a masked run shows its first four bytes, which for a value
@@ -4087,6 +4141,8 @@ lc_test "keyword rules: weak values counted"      t_kv_weak_values_are_counted
 lc_test "keyword rules: yield to a fixed rule"    t_kv_rules_yield_to_a_fixed_format_rule
 lc_test "keyword rules: yield to a key run into"  t_kv_rules_yield_to_a_key_they_run_into
 lc_test "keyword rules: yield by position"       t_kv_rules_yield_by_position_not_text
+lc_test "keyword rules: a crowded line, quickly"  t_kv_overlaps_on_a_crowded_line_are_quick
+lc_test "keyword rules: overlaps judged in place" t_kv_overlap_edges_are_judged_at_their_place
 lc_test "keyword rules: masked where they print"  t_kv_values_are_masked_where_they_print
 lc_test "keyword rules: URL sub-delims"          t_kv_url_password_takes_rfc3986_sub_delims
 lc_test "keyword rules: a dotted token is no name" t_kv_dotted_token_is_no_name
