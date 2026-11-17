@@ -8,9 +8,11 @@
 # patterns + the optional .leakcheckrc and .leakcheckrc.local at the repo
 # top level (keep the .local one gitignored); --config replaces both.
 # Built-in credential rules find keys and tokens in formats their issuers
-# fixed (cloud, AI and git-host keys, webhooks, private key headers), and
-# key files by their names (PKCS #12); a credential hit is labelled
-# credential:<id>, and any key it prints is masked.
+# fixed (cloud, AI and git-host keys, webhooks, private key headers), key
+# files by their names (PKCS #12), and keys with no prefix of their own by
+# a keyword and the value's randomness (a password, an AWS secret key,
+# `token = ...`); a credential hit is labelled credential:<id>, and any key
+# it prints is masked.
 #
 # Usage:
 #   leakcheck                    # scan with defaults + .leakcheckrc(.local)
@@ -91,7 +93,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.15.0"
+VERSION="0.16.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -225,7 +227,7 @@ DEFAULTS=(
 # credential, or a stand-in written to look like one. Formats with no such
 # anchor (an AWS secret key, a password, `token = <anything>`) are not here:
 # telling them from ordinary text needs a keyword, the value and its entropy,
-# which one ERE per rule cannot weigh. A hit is labelled `credential:<id>`
+# which KV_CREDENTIALS weighs (below). A hit is labelled `credential:<id>`
 # and printed masked; allow rules and the placeholder check see the real
 # text. No `\b`: git's ERE is the system regex, and one that reads `\b` as a
 # plain `b` would make a rule match nothing, silently. Every `/` a rule
@@ -432,6 +434,148 @@ ALL_CREDENTIALS=("${CREDENTIALS[@]}" "${PATH_CREDENTIALS[@]}")
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# ─── keyword + value rules (stage C) ──────────────────────────────────
+# A secret with no prefix of its own (an AWS secret key, a password, a key a
+# service hands out bare) is told from ordinary text by three things at
+# once: a keyword naming it, an assignment, and a value random enough to be
+# a secret. One ERE per rule finds the keyword, the assignment and the
+# value's shape; at the hit, kv_value cuts the value from the match and
+# kv_weak judges it, and a weak value is a stand-in, counted with the
+# placeholders. A row: id; the keyword, an ERE in lower case matched in any
+# case (with KV_RAW, the whole ERE before the value instead); the value's
+# ERE, at most 128 characters; a literal the match ends with after the
+# value; the least entropy the value needs, in millibits per character.
+# A hit prints its keyword (a raw rule: the URL's scheme) and the value's
+# length, never a byte of the value. The rows are ours, not gitleaks'.
+KV_CREDENTIALS=(
+  # source: docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html (a secret access key, wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY: 40 characters); docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html (AWS_SECRET_ACCESS_KEY)
+  aws-secret-access-key   'aws[_.-]?secret[_.-]?(access[_.-]?)?key'  '([A-Za-z0-9+]|\\?/){40}'  ''  4000
+  # source: RFC 3986 §3.2.1 (userinfo: "user:password" is deprecated, and "applications should not render as clear text any data after the first colon")
+  url-password            '[A-Za-z][A-Za-z0-9+.-]{1,30}:(\\?/){2}[A-Za-z0-9._~!*+=%-]{0,64}:'  '[A-Za-z0-9._~!*+=%-]{8,128}'  '@'  3000
+  # source: none (the generic rule every scanner carries, its grammar and stopwords ours)
+  generic-secret          'passw(or)?d|pass|pwd|secret|token|credential|api[_.-]?key|apikey|access[_.-]?key|auth[_.-]?key|private[_.-]?key'  '[A-Za-z0-9_+/=~.!@#%^*-]{12,100}'  ''  3500
+)
+# KV_WORDY: rules whose values a person writes, judged for words too.
+declare -A KV_RAW=([url-password]=1) KV_WORDY=([url-password]=1 [generic-secret]=1)
+# The generic rule: it yields to every other (kv_yields).
+KV_GENERIC=generic-secret
+# kv_ci <ERE> -> REPLY: each lower-case letter as a bracket of both cases.
+kv_ci() {
+  local LC_ALL=C s=$1 i c
+  REPLY=""
+  for (( i = 0; i < ${#s}; i++ )); do
+    c=${s:i:1}
+    if [[ "$c" == [a-z] ]]; then REPLY+="[${c^^}$c]"; else REPLY+=$c; fi
+  done
+}
+# The grammar after a keyword: up to 12 more name characters (`_key`,
+# `word`, `_v2`; 20 let `id_token_signed_response_alg=` in), then an
+# assignment — `=`, `:=` or `=>` after an optional closing quote and blanks,
+# or `:` after a closing quote or before a blank, as JSON and YAML write it,
+# so `credential:github-token` in this tool's own config is no assignment —
+# then blanks and an opening quote. KV_KW keeps the keyword's ERE, for what
+# a hit prints.
+declare -A KV_PRE=() KV_VAL=() KV_POST=() KV_MINH=() KV_KW=()
+for (( k = 0; k < ${#KV_CREDENTIALS[@]}; k += 5 )); do
+  id=${KV_CREDENTIALS[k]}
+  if [[ -n "${KV_RAW[$id]+x}" ]]; then
+    KV_PRE[$id]=${KV_CREDENTIALS[k + 1]}
+  else
+    kv_ci "${KV_CREDENTIALS[k + 1]}"
+    KV_KW[$id]="($REPLY)"
+    KV_PRE[$id]="($REPLY)[A-Za-z0-9_.-]{0,12}([\"']?[[:space:]]*(:=|=>|=)|[\"']?[[:space:]]*:[[:space:]]|[\"']:)[[:space:]]*[\"'\`]?"
+  fi
+  KV_VAL[$id]=${KV_CREDENTIALS[k + 2]}
+  KV_POST[$id]=${KV_CREDENTIALS[k + 3]}
+  KV_MINH[$id]=${KV_CREDENTIALS[k + 4]}
+  CREDENTIALS+=("$id" "${KV_PRE[$id]}${KV_VAL[$id]}${KV_POST[$id]}")
+done
+ALL_CREDENTIALS=("${CREDENTIALS[@]}" "${PATH_CREDENTIALS[@]}")
+
+
+# round(1000·log2 k) for k = 0..128: Shannon entropy in integer bash.
+KV_LOG2=(0 0 1000 1585 2000 2322 2585 2807 3000 3170 3322 3459 3585 3700 3807
+  3907 4000 4087 4170 4248 4322 4392 4459 4524 4585 4644 4700 4755 4807 4858
+  4907 4954 5000 5044 5087 5129 5170 5209 5248 5285 5322 5358 5392 5426 5459
+  5492 5524 5555 5585 5615 5644 5672 5700 5728 5755 5781 5807 5833 5858 5883
+  5907 5931 5954 5977 6000 6022 6044 6066 6087 6109 6129 6150 6170 6190 6209
+  6229 6248 6267 6285 6304 6322 6340 6358 6375 6392 6409 6426 6443 6459 6476
+  6492 6508 6524 6539 6555 6570 6585 6600 6615 6629 6644 6658 6672 6687 6700
+  6714 6728 6741 6755 6768 6781 6794 6807 6820 6833 6845 6858 6870 6883 6895
+  6907 6919 6931 6943 6954 6966 6977 6989 7000)
+# kv_entropy <value> -> REPLY: its entropy over bytes, in millibits per
+# character: log2 n - Σ c·log2 c / n, for n bytes and each byte's count c.
+kv_entropy() {
+  local LC_ALL=C v=$1 n=${#1} i o s=0
+  local -a cnt=()
+  for (( i = 0; i < n; i++ )); do
+    printf -v o '%d' "'${v:i:1}"
+    cnt[o]=$(( ${cnt[o]:-0} + 1 ))
+  done
+  for o in "${cnt[@]}"; do s=$(( s + o * KV_LOG2[o] )); done
+  REPLY=$(( KV_LOG2[n] - s / n ))
+}
+# kv_value <id> <match> -> REPLY: the value cut from a keyword rule's match,
+# by the rule's own ERE in bash's regex (the system's, as git grep's is);
+# status 1 if it does not split, and the match is then judged and printed
+# as a whole.
+kv_value() {
+  local LC_ALL=C re="^(${KV_PRE[$1]})(${KV_VAL[$1]})${KV_POST[$1]}\$"
+  REPLY=""
+  [[ "$2" =~ $re ]] || return 1
+  REPLY=${2:${#BASH_REMATCH[1]}}
+  REPLY=${REPLY:0:${#REPLY}-${#KV_POST[$1]}}
+}
+# Words a person writes into a stand-in, never found in a random secret.
+KV_STOPWORDS=(example sample dummy fake test mock demo placeholder changeme change_me your
+  redacted insert replace secret password passwd token xxxx '****' todo foobar lorem)
+# kv_weak <id> <value>: no secret. A placeholder's shape or too little
+# entropy; in a rule a person writes values for (KV_WORDY), also no digit or
+# no letter, a stopword, a dotted name (settings.SECRET_KEY) or an
+# environment variable's name (MY_API_TOKEN). Judged at the hit only, as
+# GitHub's checksum is: masking hides every match whatever this says. The
+# substring tests (a placeholder's shape, a stopword) read a CRED_SLASH
+# rule's value up to its first `/`, as is_placeholder does, which can only
+# report more; entropy and the digit test read it whole, since a short
+# prefix would look weak and hide a key.
+kv_weak() {
+  local LC_ALL=C v=$2 lv w min=${KV_MINH[$1]}
+  if is_placeholder "$v" "$1"; then return 0; fi
+  kv_entropy "$v"
+  if (( REPLY < min )); then return 0; fi
+  [[ -n "${KV_WORDY[$1]+x}" ]] || return 1
+  if [[ "$v" != *[0-9]* || "$v" != *[A-Za-z]* ]]; then return 0; fi
+  lv=${v,,}
+  if [[ -n "${CRED_SLASH[$1]+x}" ]]; then lv=${lv%%/*}; fi
+  for w in "${KV_STOPWORDS[@]}"; do
+    if [[ "$lv" == *"$w"* ]]; then return 0; fi
+  done
+  if [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$ ]]; then return 0; fi
+  if [[ "$v" =~ ^[A-Z0-9_]+$ && "$v" == *_* ]]; then return 0; fi
+  return 1
+}
+# kv_overlaps <id> <match> <keys, one per line>: the match's value and one
+# of the keys hold one another, so it is that key's rule's (kv_yields).
+kv_overlaps() {
+  local v t
+  if kv_value "$1" "$2"; then v=$REPLY; else v=$2; fi
+  while IFS= read -r t; do
+    if [[ -n "$t" && ( "$v" == *"$t"* || "$t" == *"$v"* ) ]]; then return 0; fi
+  done <<< "$3"
+  return 1
+}
+# kv_show <id> <match> -> REPLY: what a keyword rule's hit prints.
+kv_show() {
+  local LC_ALL=C kw="" n=${#2}
+  if kv_value "$1" "$2"; then n=${#REPLY}; fi
+  if [[ -n "${KV_RAW[$1]+x}" ]]; then
+    kw="${2%%:*}://"
+  elif [[ "$2" =~ ${KV_KW[$1]} ]]; then
+    kw=${BASH_REMATCH[0]}
+  fi
+  REPLY="$kw[redacted, $n chars]"
+}
+
 # Rules with a left edge, and the literal each one's key begins with.
 declare -A CRED_KEYSTART=([deepseek-key]='sk-')
 # cred_key <id> <match>: the match cut to start at its key -> REPLY.
@@ -569,7 +713,7 @@ declare -A CRED_ARUN=([aws-access-key-id]=2 [facebook-token]=8)
 # whose body is widened to take `/` belongs here; the webhook rules never
 # do: their `/` ends a segment, and their stand-in is the secret segment.
 declare -A CRED_SLASH=([webhook-signing-secret]=1 [grafana-token]=1 [sentry-token]=1
-  [1password-token]=1 [flyio-token]=1 [jwt]=1)
+  [1password-token]=1 [flyio-token]=1 [jwt]=1 [generic-secret]=1)
 # The walk goes by 256-byte chunks: `${m:i:1}` measures all of m each time,
 # so one character at a time grew with the square of the match's length (a
 # 200 KB match took 20 s); `pc` carries the previous character across.
@@ -694,8 +838,18 @@ mask_texts() { # array label
   printf '%s\n' "${mt_text[@]}" > "$TMPD/subj/as-written"
   printf '%s\n' "${lit[@]}" > "$TMPD/subj/literal"
   cred_matches_all "$TMPD/rmatch" "$2" as-written literal
+  # A keyword rule's match yields to a fixed-format rule's key in its value,
+  # as at the hit (kv_yields): that rule's mask prints it.
+  local -A fixed=()
+  while IFS= read -r -d '' cid && IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
+    if [[ -z "${KV_VAL[$cid]+x}" ]]; then fixed["$f:$l"]+="$m"$'\n'; fi
+  done < "$TMPD/rmatch"
   while IFS= read -r -d '' cid && IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
     [[ "$l" =~ ^[0-9]+$ && -n "${mt_text[l - 1]+x}" ]] || die "internal error: $2 mask returned line $l"
+    if [[ -n "${KV_VAL[$cid]+x}" && -n "${fixed["$f:$l"]+x}" ]] &&
+       kv_overlaps "$cid" "$m" "${fixed["$f:$l"]}"; then
+      continue
+    fi
     # A private-key header is never a placeholder, as for a hit, and the key
     # after it runs to the end of the element, not the 64 characters the rule
     # reads: a one-line key printed whole after its header (/qaa, v0.11.5).
@@ -1192,19 +1346,42 @@ done
 # (59 of them took a scan of a small repo from 0.1 s to 1.2 s). Same engine,
 # flags and subject as each rule's own run, so where this finds nothing no
 # rule could. pass_patterns <label> <git grep command with "${CRED_E[@]}">
-# sets PASS_PATS: every pattern, less the credential rules on a miss.
-CRED_E=()
+# sets PASS_PATS: every pattern, less the credential rules on a miss. The
+# keyword rules go as a group of their own: their grammar matches weak
+# values in most repositories, and one such match made every other rule run
+# on its own too (a repository with one weak value: 0.9 s to 3.4 s).
+CRED_E=(); CRED_E_FIXED=(); CRED_E_KV=(); FIXED_PATS=(); KV_PATS=()
 for p in "${PATTERNS[@]}"; do
-  if [[ -n "${CRED_RE["l$p"]+x}" ]]; then CRED_E+=(-e "${CRED_RE["l$p"]}"); fi
+  if [[ -n "${CRED_RE["l$p"]+x}" ]]; then
+    CRED_E+=(-e "${CRED_RE["l$p"]}")
+    if [[ -n "${KV_VAL[${p#credential:}]+x}" ]]; then
+      CRED_E_KV+=(-e "${CRED_RE["l$p"]}"); KV_PATS+=("$p")
+    else
+      CRED_E_FIXED+=(-e "${CRED_RE["l$p"]}"); FIXED_PATS+=("$p")
+    fi
+  fi
 done
 OTHER_PATS=("${PATTERNS[@]:0:${#PATTERNS[@]}-CRED_RULES}")
 pass_patterns() {
-  local label=$1
+  local label=$1 i n=${#CRED_E[@]}
   shift
   PASS_PATS=("${PATTERNS[@]}")
   if [[ "$CRED_RULES" -eq 0 ]]; then return 0; fi
-  run_git "credential rules ($label)" "$TMPD/cpre" in_c "$@"
-  if [[ ! -s "$TMPD/cpre" ]]; then PASS_PATS=("${OTHER_PATS[@]}"); fi
+  local -a cmd=("$@")
+  # Where the caller put "${CRED_E[@]}": each group goes there in turn.
+  for (( i = 0; i + n <= ${#cmd[@]}; i++ )); do
+    if [[ "${cmd[i]}" == -e && "${cmd[i + 1]}" == "${CRED_E[1]}" ]]; then break; fi
+  done
+  (( i + n <= ${#cmd[@]} )) || die "internal error: no credential rules in the $label prefilter"
+  PASS_PATS=("${OTHER_PATS[@]}")
+  if [[ ${#CRED_E_FIXED[@]} -gt 0 ]]; then
+    run_git "credential rules ($label)" "$TMPD/cpre" in_c "${cmd[@]:0:i}" "${CRED_E_FIXED[@]}" "${cmd[@]:i+n}"
+    if [[ -s "$TMPD/cpre" ]]; then PASS_PATS+=("${FIXED_PATS[@]}"); fi
+  fi
+  if [[ ${#CRED_E_KV[@]} -gt 0 ]]; then
+    run_git "credential rules ($label)" "$TMPD/cpre" in_c "${cmd[@]:0:i}" "${CRED_E_KV[@]}" "${cmd[@]:i+n}"
+    if [[ -s "$TMPD/cpre" ]]; then PASS_PATS+=("${KV_PATS[@]}"); fi
+  fi
   return 0
 }
 
@@ -2229,6 +2406,8 @@ cred_show() {
     REPLY="---- ${h%% ----*} ----"
   elif [[ -n "${CRED_MARKER["l$1"]+x}" ]]; then
     REPLY=$2
+  elif [[ -n "${KV_VAL[${1#credential:}]+x}" ]]; then
+    kv_show "${1#credential:}" "$2"
   else
     REPLY="${2:0:4}[redacted, ${#2} chars]"
   fi
@@ -2291,6 +2470,36 @@ mask_names() {
   render_masked "$s" nhide ""
 }
 
+# A keyword rule yields to a fixed-format rule, and the generic rule to
+# every other: a key another rule matched, overlapping the value, is that
+# rule's to report, set aside or excuse. CRED_ON_LINE holds, by line, each
+# such key behind its rank (0 a fixed-format rule, 1 a keyword rule).
+declare -A CRED_ON_LINE=()
+for i in "${!H_FILE[@]}"; do
+  p=${H_PAT[$i]}; cid=${p#credential:}
+  [[ -n "${CRED_RE["l$p"]+x}" && "$cid" != "$KV_GENERIC" && -z "${CRED_PATHRULE["l$p"]+x}" ]] || continue
+  rank=0
+  if [[ -n "${KV_VAL[$cid]+x}" ]]; then rank=1; fi
+  lk="${#H_FILE[$i]}:${H_FILE[$i]}${#H_LINE[$i]}:${H_LINE[$i]}${#H_COMMIT[$i]}:${H_COMMIT[$i]}:${H_TEXT[$i]}"
+  for j in ${MT_OF[$i]}; do
+    t=${MT_TXT[j]}
+    if [[ "$rank" -eq 1 ]] && kv_value "$cid" "$t"; then t=$REPLY; fi
+    CRED_ON_LINE[$lk]+="$rank$t"$'\n'
+  done
+done
+# kv_yields <hit> <match>: a keyword rule's match whose value overlaps a key
+# a rule above it matched on the same line.
+kv_yields() {
+  local cid=${H_PAT[$1]#credential:} top=0 t keys=""
+  local lk="${#H_FILE[$1]}:${H_FILE[$1]}${#H_LINE[$1]}:${H_LINE[$1]}${#H_COMMIT[$1]}:${H_COMMIT[$1]}:${H_TEXT[$1]}"
+  [[ -n "${CRED_ON_LINE[$lk]+x}" ]] || return 1
+  if [[ "$cid" == "$KV_GENERIC" ]]; then top=1; fi
+  while IFS= read -r t; do
+    if [[ -n "$t" && "${t:0:1}" -le "$top" ]]; then keys+="${t:1}"$'\n'; fi
+  done <<< "${CRED_ON_LINE[$lk]}"
+  kv_overlaps "$cid" "$2" "$keys"
+}
+
 KEEP=()
 SHOW=()
 SHOW_FILE=()
@@ -2298,6 +2507,7 @@ ALLOWED_TOTAL=0
 CRED_FOUND=0
 CRED_UNSCOPED=0
 CRED_PLACEHOLDERS=0
+CRED_WEAK=0
 for i in "${!H_FILE[@]}"; do
   if [[ "${ALLOWED[$i]}" -eq 1 ]]; then
     ALLOWED_TOTAL=$((ALLOWED_TOTAL + 1))
@@ -2315,14 +2525,29 @@ for i in "${!H_FILE[@]}"; do
     # key of the rule's to mask, and is never a stand-in.
     if [[ -n "${CRED_PATHRULE["l${H_PAT[$i]}"]+x}" ]]; then ph=0; else
       SHOW[$i]=""
+      cid=${H_PAT[$i]#credential:}
+      live=0
       for j in ${MT_OF[$i]}; do
-        if ! is_placeholder "${MT_TXT[j]}" "${H_PAT[$i]#credential:}" &&
+        if [[ -n "${KV_VAL[$cid]+x}" ]] && kv_yields "$i" "${MT_TXT[j]}"; then continue; fi
+        live=1
+        if [[ -n "${KV_VAL[$cid]+x}" ]]; then
+          if ! { kv_value "$cid" "${MT_TXT[j]}" && kv_weak "$cid" "$REPLY"; }; then ph=0; fi
+        elif ! is_placeholder "${MT_TXT[j]}" "$cid" &&
            ! { [[ "${H_PAT[$i]}" == credential:github-token ]] && checksum_fails "${MT_TXT[j]}"; }; then
           ph=0
         fi
         cred_show "${H_PAT[$i]}" "${MT_TXT[j]}"
         SHOW[$i]+="${SHOW[$i]:+ }$REPLY"
       done
+      # Every match another rule's key: reported, set aside or excused there.
+      if [[ "$live" -eq 0 ]]; then continue; fi
+    fi
+    # A keyword rule's weak value is counted apart: a placeholder is a
+    # stand-in written to look like a key, a weak value text a keyword's
+    # grammar caught (`tokenizer = AutoTokenizer…`).
+    if [[ "$ph" -eq 1 && -n "${KV_VAL[${H_PAT[$i]#credential:}]+x}" ]]; then
+      CRED_WEAK=$((CRED_WEAK + 1))
+      continue
     fi
     if [[ "$ph" -eq 1 ]]; then
       CRED_PLACEHOLDERS=$((CRED_PLACEHOLDERS + 1))
@@ -2348,6 +2573,11 @@ if [[ "$CRED_COUNT" -gt 0 ]]; then
   # printed; a config that disables none prints what it always did.
   if [[ ${#CRED_DISABLED[@]} -gt 0 ]]; then
     CSCOPE+=", ${#CRED_DISABLED[@]} credential rules disabled by config"
+  fi
+  # Printed when there are any, as the disabled rules are: a run with none
+  # prints what it always did.
+  if [[ "$CRED_WEAK" -gt 0 ]]; then
+    CSCOPE+=", $CRED_WEAK weak keyword values not reported"
   fi
 else
   CSCOPE="credentials not scanned"
@@ -2448,6 +2678,7 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
       done
       printf ']'
     fi
+    if [[ "$CRED_WEAK" -gt 0 ]]; then printf ',"weak":%d' "$CRED_WEAK"; fi
     printf '}}\n'
   else
     printf ',"credentials_scanned":false}\n'

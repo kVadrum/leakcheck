@@ -1894,12 +1894,23 @@ t_credential_every_rule_finds_its_own_format() {
   assert_exit 1 "$BIN" --json
   cp "$LC_OUT" .git/cred.json
   # Each file is one hit, of its own rule only, printed masked — a path
-  # rule's stand-in, an empty file, one hit on its name — and the count of
+  # rule's stand-in, an empty file, one hit on its name; a keyword rule's,
+  # its keyword (a URL's scheme) and the value's length — and the count of
   # rules is the count of rules with stand-ins, so a rule added without one
   # fails here.
   python3 - .git/cred.json "$CRED_TSV" "$CRED_PATHS" <<'PY'
-import json, sys
+import json, re, sys
 doc = json.load(open(sys.argv[1]))
+kv = {"aws-secret-access-key", "url-password", "generic-secret"}
+def shown(cid, m):
+    if cid in markers:
+        return m
+    if cid not in kv:
+        return "%s[redacted, %d chars]" % (m[:4], len(m))
+    if "://" in m:
+        return "%s://[redacted, %d chars]" % (m.split("://")[0], len(m[:-1].rsplit(":", 1)[1]))
+    kw, val = re.match(r"([A-Za-z_]+)\s*[=:]\s*[\"']?(.*)$", m).groups()
+    return "%s[redacted, %d chars]" % (kw, len(val))
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
 paths = [l.rstrip("\n").split("\t") for l in open(sys.argv[3])]
 markers = {"private-key", "putty-private-key"}
@@ -1911,8 +1922,7 @@ assert doc["credentials_scanned"] is True and doc["credentials"] == {"rules": nr
 assert list(doc)[-2:] == ["credentials_scanned", "credentials"], list(doc)
 for cid, line, m in rows:
     hs = by.pop(cid + ".txt", [])
-    want = m if cid in markers else "%s[redacted, %d chars]" % (m[:4], len(m))
-    assert [(h["pattern"], h["text"]) for h in hs] == [("credential:" + cid, want)], (cid, hs)
+    assert [(h["pattern"], h["text"]) for h in hs] == [("credential:" + cid, shown(cid, m))], (cid, hs)
 for cid, name in paths:
     hs = by.pop(name, [])
     assert [(h["pattern"], h["line"], h["text"]) for h in hs] == [("credential:" + cid, 0, name)], (cid, hs)
@@ -3061,6 +3071,157 @@ PY
   assert_contains "long.txt:1: [credential:facebook-token] EAAM[redacted, 400004 chars]" "$LC_OUT"
 }
 
+t_kv_rules_find_unprefixed_secrets() {
+  # Stage C: a secret with no prefix of its own is found by a keyword, an
+  # assignment and a value random enough, in each syntax that writes one,
+  # and prints as its keyword (a URL's scheme) and the value's length,
+  # never a byte of the value; a key with a placeholder-shaped tail after a
+  # `/` is still a key (CRED_SLASH), its stopword test cut there too.
+  local vt="$PWD/.git/kv.tsv" v
+  python3 -I - "$vt" <<'PY'
+import random, sys
+r = random.Random(41)
+an = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz"
+def val(n):
+    return "".join(r.choice(an) for _ in range(n - 2)) + str(r.randint(2, 9)) + "q"
+rows = [
+    ("generic-secret", "API_KEY=%s", "API_KEY", 32),
+    ("generic-secret", 'export DB_PASSWORD="%s"', "PASSWORD", 20),
+    ("generic-secret", '  "client_secret": "%s",', "secret", 40),
+    ("generic-secret", '{"id":1,"token":"%s"}', "token", 24),
+    ("generic-secret", "password: %s", "password", 16),
+    ("generic-secret", "token = '%s'", "token", 28),
+    ("generic-secret", "run --api-key=%s now", "api-key", 30),
+    ("aws-secret-access-key", "aws_secret_access_key = %s", "aws_secret_access_key", 40),
+    ("url-password", "DATABASE_URL=postgres://app:%s@db:5432/app", "postgres://", 18),
+    ("url-password", "redis://:%s@cache:6379", "redis://", 16),
+    ("url-password", '"url": "mysql:\\/\\/root:%s@db"', "mysql://", 14),
+    ("generic-secret", "secret_key = '%s/XXXXXXXX'", "secret", 22),
+]
+with open(sys.argv[1], "w") as f:
+    for cid, fmt, kw, n in rows:
+        v = val(n) if cid != "aws-secret-access-key" else "".join(r.choice(an + "0123456789+/") for _ in range(n))
+        tail = 9 if "/XXXXXXXX" in fmt else 0
+        f.write("\t".join((cid, fmt % v, v, "%s[redacted, %d chars]" % (kw, n + tail))) + "\n")
+PY
+  cut -f2 "$vt" > k.txt
+  git add k.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "$vt" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
+got = sorted((h["line"], h["pattern"], h["text"]) for h in doc["hits"])
+want = sorted((n + 1, "credential:" + cid, shown) for n, (cid, _, _, shown) in enumerate(rows))
+assert got == want, (got, want)
+assert doc["credentials"]["placeholders"] == 0 and "weak" not in doc["credentials"], doc["credentials"]
+PY
+  assert_exit 1 "$BIN"
+  assert_contains "k.txt:3: [credential:generic-secret] secret[redacted, 40 chars]" "$LC_OUT"
+  while IFS=$'\t' read -r _ _ v _; do
+    assert_not_contains "$v" "$LC_OUT"
+    assert_not_contains "$v" "$LC_ERR"
+  done < "$vt"
+}
+
+t_kv_weak_values_are_counted() {
+  # A keyword rule's value that is no secret — a stopword, a placeholder's
+  # shape, too little entropy, a dotted name, an environment variable's name,
+  # no digit — is set aside and counted apart from the placeholders, each of
+  # the first six lines weak for that one reason alone; a
+  # colon with no blank after it is no assignment, so this tool's own
+  # `credential:<id>` and `token:<value>` are not read at all.
+  printf '%s\n' \
+    'password = "changeme1234567q"' \
+    "api_key = \"aB3dE6gH9j$(printf 'Z%.0s' {1..8})kM2nPq5rS7tU\"" \
+    'api_key = "abcdabcdabcdabcd1"' \
+    'secret = conf9.bkpz.vqlmw' \
+    'API_KEY=MY_SVC_QWZ_K9_PRD' \
+    'token = "kQwPrTyUiOnAsDfGh"' \
+    'tokenizer = AutoTokenizer.from_pretrained(name)' \
+    'url = "postgres://user:password1q@localhost"' \
+    'redis://:pa55word@localhost' \
+    "aws_secret_access_key = $(printf 'A%.0s' {1..40})" \
+    'max_tokens: 4096' \
+    'see credential:Xk3j9fLq2mZp7wR4 here' \
+    'token:Xk3j9fLq2mZp7wR4' > w.txt
+  git add w.txt
+  rc_file 'no-defaults' 'disable credential:github-token'
+  commit init
+  assert_exit 0 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))["credentials"]
+assert c["placeholders"] == 0 and c["weak"] == 10, c
+assert list(c) == ["rules", "placeholders", "disabled", "weak"], list(c)
+PY
+  assert_exit 0 "$BIN"
+  assert_contains "credentials scanned, 0 placeholders not reported, 1 credential rules disabled by config, 10 weak keyword values not reported)" "$LC_OUT"
+}
+
+t_kv_rules_yield_to_a_fixed_format_rule() {
+  # A key a fixed-format rule matched is that rule's: the keyword rules do
+  # not report it again, and the generic rule yields to the other keyword
+  # rules too. Only to a rule that ran: with github-token disabled, the
+  # keyword rules report those lines themselves.
+  local gh aws
+  gh=$(cred github-token)
+  aws=$(python3 -I -c 'import random; r = random.Random(43); print("".join(r.choice("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789+/") for _ in range(40)))')
+  printf '%s\n' "GITHUB_TOKEN=$gh" "aws_secret_access_key = $aws" "https://bot:$gh@github.com/o/r" > y.txt
+  git add y.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = sorted((h["line"], h["pattern"]) for h in doc["hits"])
+assert got == [(1, "credential:github-token"), (2, "credential:aws-secret-access-key"), (3, "credential:github-token")], got
+PY
+  rc_file 'no-defaults' 'disable credential:github-token'
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+got = sorted((h["line"], h["pattern"], h["text"]) for h in doc["hits"])
+assert got == [(1, "credential:generic-secret", "TOKEN[redacted, 40 chars]"),
+               (2, "credential:aws-secret-access-key", "aws_secret_access_key[redacted, 40 chars]"),
+               (3, "credential:url-password", "https://[redacted, 40 chars]")], got
+PY
+  assert_not_contains "${gh:4:30}" "$LC_OUT"
+}
+
+t_kv_values_are_masked_where_they_print() {
+  # An allow rule naming a keyword rule's value prints it masked, keyword
+  # included (a masked run shows its first four bytes, which for a value
+  # would be the value's), and a value in the committed config is a hit
+  # there, as any key is; an error quoting one is masked too. A key a
+  # fixed-format rule matched inside it keeps that rule's mask.
+  local v="Xk3j9fLq2mZp7wR4tY6u" gh
+  gh=$(cred github-token)
+  printf '%s\n' "token = '$v'" > m.txt
+  git add m.txt
+  rc_file 'no-defaults' "allow credential:generic-secret ^m\\.txt:1:token = '$v'\$"
+  commit init
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${v:2:14}" "$LC_OUT"
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+hits = [(h["file"], h["line"], h["pattern"], h["text"]) for h in doc["hits"]]
+assert hits == [(".leakcheckrc", 2, "credential:generic-secret", "token[redacted, 20 chars]")], hits
+a = [(x["rule"], x["count"]) for x in doc["allowed"]]
+assert a == [(r"credential:generic-secret ^m\.txt:1:toke[redacted, 29 chars]'$", 1)], a
+PY
+  assert_exit 2 "$BIN" "--password=$v"
+  assert_contains "leakcheck: unknown flag: --pass[redacted, 29 chars]" "$LC_ERR"
+  assert_not_contains "${v:2:14}" "$LC_ERR"
+  assert_exit 2 "$BIN" "--token=$gh"
+  assert_contains "leakcheck: unknown flag: --token=$(masked "$gh")" "$LC_ERR"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -3738,6 +3899,10 @@ lc_test "credentials: pkcs12-file, by name only"    t_credential_pkcs12_file
 lc_test "credentials: a tail after a body's slash"  t_credential_tail_after_a_slash_in_a_body
 lc_test "a hit on a 1.2 MB line, quickly"         t_long_line_hit_is_quick
 lc_test "a 400 KB credential match, quickly"     t_long_credential_match_is_quick
+lc_test "keyword rules: unprefixed secrets"       t_kv_rules_find_unprefixed_secrets
+lc_test "keyword rules: weak values counted"      t_kv_weak_values_are_counted
+lc_test "keyword rules: yield to a fixed rule"    t_kv_rules_yield_to_a_fixed_format_rule
+lc_test "keyword rules: masked where they print"  t_kv_values_are_masked_where_they_print
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder

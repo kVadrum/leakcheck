@@ -140,6 +140,9 @@ SPECS = {
  "replicate-token": ("KEY=", ["r8", "_", ("an", 37)]),
  "sourcegraph-token": ("KEY=", ["sg", "p_", ("hex", 16), "_", ("hex", 40)]),
  "docker-swarm-token": ("KEY=", ["SWM", "TKN-1-", ("lan", 50), "-", ("lan", 25)]),
+ "aws-secret-access-key": ("", ["aws", "_secret_access_key = ", ("b64", 40)]),
+ "url-password": ("URL=", ["post", "gres://app:", ("an", 14), ("d", 1), ("a", 1), "@"]),
+ "generic-secret": ("", ["api", "_key = \"", ("an", 30), ("d", 1), ("a", 1)]),
 }
 
 

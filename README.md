@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.15.0*
+*README v0.16.0*
 
 ## Install
 
@@ -111,6 +111,8 @@ Built-in rules also find keys and tokens in the formats their issuers fixed, by 
 - PKCS #12 key bundles, by their file names alone (`.p12`, `.pfx`, any case): their content is binary, so a tracked name is the only tell, and the rule runs over tracked path names and nothing else;
 - keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana, Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare (API tokens and origin CA keys), CircleCI, Sourcegraph, Docker Swarm (join tokens and unlock keys) and Mapbox.
 
+Keyword rules find keys with no prefix of their own too, by the name they are assigned to and how random they are: AWS secret access keys, passwords in URLs, and values assigned to a name such as `password`, `secret`, `token` or `api_key` ([Keyword rules](#keyword-rules)).
+
 A key or webhook URL is found with its slashes JSON-escaped, `\/`, as PHP's `json_encode` and others write them.
 A key is found inside a longer run of characters too, with one exception: a DeepSeek key, `sk-` and 32 hex digits, is also how generated names end (`task-…`, `desk-…`), so it is not found right after a lowercase letter.
 
@@ -155,9 +157,37 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
 - **The committed config is scanned for credentials**, though not for the patterns it lists: a key pasted into `.leakcheckrc` is published like any other.
 - **The rules are on by default.**
   `disable credential:<rule>` turns one off, and the summary counts it (`1 credential rules disabled by config`); `no-credentials` turns them all off, and the summary then says `credentials not scanned`; `no-defaults` turns off only the home-path patterns.
-- **They cannot find a secret with no fixed shape**: a password, an AWS secret access key, a database URL with its password in it, or `api_key = "…"` for a service whose keys look like random text.
-  Telling those from ordinary strings takes the keyword around them and a measure of their randomness, which these rules do not weigh, so for them run a dedicated secret scanner such as gitleaks or trufflehog as well.
 - **Every other hit prints as before**: a home-path or config-pattern hit on a line that also holds a credential prints that whole line, the credential included.
+
+### Keyword rules
+
+Three rules find a secret that has no prefix of its own by the name it is assigned to and how random it is:
+
+- `aws-secret-access-key`: 40 characters assigned to `aws_secret_access_key`, in any case, with `_`, `-`, `.` or nothing between the words;
+- `url-password`: the password in a URL's user part, `postgres://app:…@db` (with its slashes JSON-escaped too);
+- `generic-secret`: 12 to 100 characters assigned to a name holding `password`, `pass`, `pwd`, `secret`, `token`, `credential`, `api_key`, `access_key`, `auth_key` or `private_key`, in any case.
+
+The name may run on for up to 12 characters after the keyword (`DB_PASSWORD`, `secret_key`, `api_key_v2`), and the assignment is `=`, `:=` or `=>`, or a colon as YAML and JSON write it, before a blank or after a closing quote: `TOKEN=…`, `token: …` and `"token":"…"` count, and `credential:github-token` does not.
+A hit prints the keyword, or a URL's scheme, and the length of the value, never a byte of it:
+
+```text
+$ leakcheck
+config.py:5: [credential:url-password] postgres://[redacted, 18 chars]
+config.py:3: [credential:generic-secret] PASSWORD[redacted, 24 chars]
+leakcheck: 2 match(es)
+leakcheck: scanned 1 tracked files (index + worktree; 0 binary skipped, 0 submodules not scanned, 0 skipped by config, 0 allowed; history not scanned; credentials scanned, 0 placeholders not reported, 1 weak keyword values not reported)
+leakcheck: 2 credential(s) among these: revoke and reissue any that has left this machine; deleting one from the files or the history does not revoke it
+```
+
+- **The value is judged, and a weak one is counted, not reported.**
+  Weak is a stand-in's shape (as above), or too little entropy — 3.5 bits per character for the generic rule, 3 for a URL's password, 4 for an AWS key — or, for the generic and URL rules, no digit or no letter, a word people write into stand-ins (`example`, `changeme`, `your`, `test`, `xxxx`, …), a dotted name (`settings.SECRET_KEY`) or an environment variable's name (`MY_API_TOKEN`).
+  The summary counts these apart from the stand-ins, at the end of its line (`1 weak keyword values not reported`, above: `TOKEN = "your-token-here-…"`), and `--json` adds `"weak"` to `credentials`.
+  So a password shorter than 12 characters, or one made of words, is not found; nor is a value a template fills in (`${DB_PASSWORD}`, `os.environ[…]`), which is no secret.
+- **A key a fixed-format rule finds is that rule's.**
+  `GITHUB_TOKEN=ghp_…` is reported once, as `github-token`, and set aside or excused by that rule alone; a URL whose password is such a key is that rule's too, and the generic rule yields to the other two keyword rules as well.
+  With the fixed-format rule disabled, the keyword rule reports the key itself.
+- **Where a keyword rule's match prints in an allow rule or an error, it is masked with its keyword**, since the first four characters a masked run shows would otherwise be the value's.
+- **The grammar and the stopwords are leakcheck's own**; the rules run in history like every other, and `disable` and `allow credential:` name them as any rule.
 
 ## What it scans
 
@@ -400,7 +430,7 @@ Here is the Quick start run, formatted for reading:
 - With `--history`, `history_scanned` is `true` and a final `history` object follows: `{"commits": 4, "binary": 0, "skipped": 0, "config_lines_exempt": 1, "range": null, "refs": 1, "tags": 0, "tagged_unscanned": 0}`.
   `range` is the `--history-range` value, or `null` when every ref was scanned.
 - `allowed` lists what each allow rule suppressed, each rule as written, its `credential:` scope included.
-- `credentials` counts the credential rules that ran and the stand-ins not reported, then, when the config disables any, lists them: `"disabled": ["credential:mailchimp-key"]`.
+- `credentials` counts the credential rules that ran and the stand-ins not reported, then, when the config disables any, lists them: `"disabled": ["credential:mailchimp-key"]`; then, when a keyword rule set any value aside as weak, counts those: `"weak": 1` ([Keyword rules](#keyword-rules)).
   With `no-credentials`, `credentials_scanned` is `false` and the object is absent; when `disable` lines turn every rule off, `credentials_scanned` is `false` and the object stays, with `"rules": 0` and the list.
   A credential hit's `text` holds its masked matches, and its `file` masks any credential in the path.
 - Strings are JSON-escaped, and bytes that are not valid UTF-8 become U+FFFD.
