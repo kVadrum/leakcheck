@@ -1130,6 +1130,16 @@ t_old_bash_is_refused() {
 # when the flag is removed (checked by mutating a copy; SPEC.md § v0.5.0).
 
 sha_of() { git rev-parse "${1:-HEAD}"; }
+# How this git diffs merges under --history, probed as leakcheck probes it:
+# remerge from git 2.36 with an empty info/attributes, else separate (-m).
+merge_mode() {
+  local a; a=$(git rev-parse --git-path info/attributes)
+  if [[ ! -L "$a" && ! -s "$a" ]] && git log -0 --all --diff-merges=remerge >/dev/null 2>&1; then
+    echo remerge
+  else
+    echo separate
+  fi
+}
 
 t_history_finds_scrubbed_leak() {
   seed f.txt $'a\nb\nc'
@@ -1218,6 +1228,132 @@ t_history_evil_merge_line() {
   git -c core.hooksPath=/dev/null commit -q -m merge
   assert_exit 1 "$BIN" --history
   assert_contains "$(sha_of):evil.txt:1: [" "$LC_OUT"
+}
+
+t_history_remerge_conflict_resolution() {
+  # gap 6 (v0.22.0): a merge is diffed against git's own re-merge of its
+  # parents (git 2.36 and later), so a conflict's resolution is the merge's
+  # own lines. git notes the conflict in the stream (`remerge CONFLICT`),
+  # which the parser reads past; the JSON names how merges were diffed.
+  seed a.txt $'one\ntwo'
+  commit base
+  git checkout -q -b side
+  seed a.txt $'one\nTWO-side'
+  commit side
+  git checkout -q dev
+  seed a.txt $'one\nTWO-dev'
+  commit dev
+  git -c core.hooksPath=/dev/null merge -q side >/dev/null 2>&1 || true
+  seed a.txt $'one\nresolved, see /home/alice/x'
+  commit merge
+  local m; m=$(sha_of)
+  seed a.txt "clean"
+  commit scrub
+  assert_exit 1 "$BIN" --history --json
+  python3 - "$LC_OUT" "$m" "$(merge_mode)" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["history"]["merge_diffs"] == sys.argv[3], doc["history"]
+hits = [(h["commit"], h["file"], h["line"], h["text"]) for h in doc["hits"] if h["source"] == "history"]
+assert hits == [(sys.argv[2], "a.txt", 2, "resolved, see /home/alice/x")], hits
+PY
+}
+
+t_history_octopus_merge_line() {
+  # gap 6 (v0.22.0), a guard: remerge skips a merge of three or more
+  # parents, printing a warning where its diff would be, so octopus merges
+  # are diffed against each parent in a pass of their own. A line only the
+  # octopus adds is found at it.
+  seed a.txt "a"
+  commit root
+  git checkout -q -b one
+  seed one.txt "one"
+  commit one
+  git checkout -q dev
+  git checkout -q -b two
+  seed two.txt "two"
+  commit two
+  git checkout -q dev
+  seed d.txt "d"
+  commit d
+  git -c core.hooksPath=/dev/null merge -q --no-commit one two >/dev/null 2>&1
+  seed evil.txt "/home/alice/octopus"
+  commit octopus
+  local m; m=$(sha_of)
+  [[ $(git log -1 --format=%P | wc -w) -eq 3 ]]
+  git rm -q evil.txt
+  commit scrub
+  assert_exit 1 "$BIN" --history
+  assert_contains "$m:evil.txt:1: [" "$LC_OUT"
+}
+
+t_history_merges_without_remerge() {
+  # gap 6 (v0.22.0): a git before 2.36 has no remerge, so the merge pass
+  # falls back to -m, which finds the same lines, slower, and the JSON says
+  # `separate`. A git refusing the value stands in for an old one.
+  local real fb="$PWD/.git/fakebin"
+  real=$(command -v git)
+  mkdir -p "$fb"
+  printf '#!/bin/sh\nfor a; do [ "$a" = --diff-merges=remerge ] && { echo "fatal: unknown value for --diff-merges: remerge" >&2; exit 128; }; done\nexec %s "$@"\n' "$real" > "$fb/git"
+  chmod +x "$fb/git"
+  seed a.txt "a"
+  commit root
+  git checkout -q -b side
+  seed b.txt "b"
+  commit side
+  git checkout -q dev
+  seed c.txt "c"
+  commit main-side
+  git -c core.hooksPath=/dev/null merge -q --no-commit side >/dev/null 2>&1
+  seed evil.txt "/home/alice/evil"
+  commit merge
+  local m; m=$(sha_of)
+  PATH="$fb:$PATH" assert_exit 1 "$BIN" --history --json
+  python3 - "$LC_OUT" "$m" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["history"]["merge_diffs"] == "separate", doc["history"]
+assert any(h.get("commit") == sys.argv[2] and h["file"] == "evil.txt" for h in doc["hits"]), doc["hits"]
+PY
+}
+
+t_history_remerge_and_merge_drivers() {
+  # gap 6 (v0.22.0): a merge driver can write a line in neither parent, and
+  # would write it again in the re-merge, hiding it. A user's merge.default
+  # is pinned to git's own; a driver named in info/attributes, which no
+  # setting blanks, sends the pass to -m (`separate`).
+  local cfg="$PWD/.git/drv.cfg" m
+  printf '[merge]\n\tdefault = inject\n[merge "inject"]\n\tdriver = printf '"'"'see /home/alice/driver\\\\n'"'"' >> %%A\n' > "$cfg"
+  seed a.txt $'one\ntwo\nthree'
+  commit base
+  git checkout -q -b side
+  seed a.txt $'ONE\ntwo\nthree'
+  commit side
+  git checkout -q dev
+  seed a.txt $'one\ntwo\nTHREE'
+  commit dev
+  GIT_CONFIG_GLOBAL="$cfg" git -c core.hooksPath=/dev/null -c commit.gpgsign=false merge -q --no-edit side >/dev/null
+  m=$(sha_of)
+  [[ "$(tail -n 1 a.txt)" == "see /home/alice/driver" ]]
+  seed a.txt "clean"
+  commit scrub
+  GIT_CONFIG_GLOBAL="$cfg" assert_exit 1 "$BIN" --history --json
+  python3 - "$LC_OUT" "$m" "$(merge_mode)" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["history"]["merge_diffs"] == sys.argv[3], doc["history"]
+assert [(h["commit"], h["file"], h["line"]) for h in doc["hits"]] == [(sys.argv[2], "a.txt", 4)], doc["hits"]
+PY
+  # The driver named per path, in info/attributes, with the repo's config.
+  printf 'a.txt merge=inject\n' > .git/info/attributes
+  git config merge.inject.driver "printf 'see /home/alice/driver\\n' >> %A"
+  assert_exit 1 "$BIN" --history --json
+  python3 - "$LC_OUT" "$m" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["history"]["merge_diffs"] == "separate", doc["history"]
+assert [(h["commit"], h["file"], h["line"]) for h in doc["hits"]] == [(sys.argv[2], "a.txt", 4)], doc["hits"]
+PY
 }
 
 t_history_root_commit_despite_showroot_false() {
@@ -1423,11 +1559,11 @@ t_history_json_shape() {
   seed f.txt "clean"
   commit two
   assert_exit 1 "$BIN" --history --json
-  python3 - "$LC_OUT" "$(sha_of HEAD~1)" <<'PY'
+  python3 - "$LC_OUT" "$(sha_of HEAD~1)" "$(merge_mode)" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
 assert doc["history_scanned"] is True, doc
-assert doc["history"] == {"commits": 2, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": None, "refs": 1, "tags": 0, "tagged_unscanned": 0}, doc
+assert doc["history"] == {"commits": 2, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": None, "refs": 1, "tags": 0, "tagged_unscanned": 0, "merge_diffs": sys.argv[3]}, doc
 (hit,) = doc["hits"]
 assert hit["source"] == "history" and hit["commit"] == sys.argv[2], hit
 assert list(hit)[-1] == "commit" and list(doc)[-3:] == ["history", "credentials_scanned", "credentials"], doc
@@ -1574,11 +1710,11 @@ t_history_range_json() {
   seed f.txt "clean"
   commit two
   assert_exit 0 "$BIN" --history-range HEAD~1..HEAD --json
-  python3 - "$LC_OUT" <<'PY'
+  python3 - "$LC_OUT" "$(merge_mode)" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
 assert doc["clean"] is True, doc
-assert doc["history"] == {"commits": 1, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": "HEAD~1..HEAD", "refs": 1, "tags": 0, "tagged_unscanned": 0}, doc
+assert doc["history"] == {"commits": 1, "binary": 0, "skipped": 0, "config_lines_exempt": 0, "range": "HEAD~1..HEAD", "refs": 1, "tags": 0, "tagged_unscanned": 0, "merge_diffs": sys.argv[2]}, doc
 assert list(doc["history"])[4] == "range", doc
 PY
 }
@@ -4453,6 +4589,10 @@ lc_test "history: line numbers follow hunks"          t_history_line_numbers_fol
 lc_test "history: once, at the earliest commit"       t_history_reports_once_at_earliest_commit
 lc_test "history: side branch behind -s ours merge"   t_history_side_branch_behind_ours_merge
 lc_test "history: a line only the merge adds"         t_history_evil_merge_line
+lc_test "history: a conflict's resolution (remerge)"  t_history_remerge_conflict_resolution
+lc_test "history: a line only an octopus adds"       t_history_octopus_merge_line
+lc_test "history: merges without remerge (-m)"       t_history_merges_without_remerge
+lc_test "history: merge drivers and remerge"         t_history_remerge_and_merge_drivers
 lc_test "history: root commit despite showRoot=false" t_history_root_commit_despite_showroot_false
 lc_test "history: added line shaped like a header"    t_history_added_line_shaped_like_a_header
 lc_test "history: names, including renamed-away"      t_history_names

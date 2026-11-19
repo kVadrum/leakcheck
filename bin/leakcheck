@@ -112,7 +112,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.21.0"
+VERSION="0.22.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -2115,14 +2115,26 @@ done
 #                   merge then hides its whole side branch (measured). -m
 #                   happens to stop that in the content pass; the
 #                   .leakcheckrc.local pass has no -m and depends on this
-#   -m              lines a merge itself introduces appear in neither
-#                   parent's diff; -m diffs each merge against each parent
+#   --diff-merges=remerge, --max-parents=2
+#                   lines a merge itself introduces appear in neither
+#                   parent's diff; remerge diffs each merge against git's own
+#                   re-merge of its parents, so it shows exactly those lines
+#                   (every other line came from a parent, and is scanned at
+#                   the commit that added it). -m, a diff against each
+#                   parent, shows them too, with each side's whole churn: in
+#                   git.git's history it passed 31 GB unfinished, where
+#                   remerge's stream is 415 MB. git 2.36 and later; before
+#                   it, -m (HMERGE)
+#   -m (octopus)    remerge skips a merge of three or more parents, printing
+#                   a warning in place of its diff, so those merges are
+#                   diffed against each parent in a pass of their own
 #   --no-renames    a rename is a delete plus an add, so every `diff --git`
 #                   header names one path twice — the parser relies on that
 #   log.showRoot    `false` in a user's config hides the root commit's diff
 #   replace refs, grafts   ignored for every git call (exported above), so
 #                   the objects scanned are the objects a push publishes
 HIST_COMMITS=0
+HIST_MERGE_MODE=""   # how merges were diffed: remerge, or separate (-m)
 HIST_BINARY=0
 HIST_SKIPPED=0
 HIST_REFS=0
@@ -2164,8 +2176,11 @@ if [[ "$HISTORY" -eq 1 ]]; then
   # pinned to git's default, so a larger file is still skipped and counted.
   # i18n.logOutputEncoding: UTF-16 output split the metadata pass's NUL
   # framing, and a Latin-1 message hid a home path for user zoë (measured).
+  # merge.default: the re-merge (--diff-merges=remerge) runs a user's
+  # default merge driver, which can write a line in neither parent into the
+  # re-merge as into the merge, and so hide it (measured); pinned to git's.
   HLOG=(-c log.showRoot=true -c core.quotePath=false -c log.diffMerges=separate
-        -c core.bigFileThreshold=512m -c i18n.logOutputEncoding=UTF-8
+        -c core.bigFileThreshold=512m -c i18n.logOutputEncoding=UTF-8 -c merge.default=text
         log "${HREVS[@]}" --full-history --date-order --reverse --no-show-signature)
 
   # Commit metadata, ref names and tags share one subject file, each distinct
@@ -2199,6 +2214,22 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
   declare -A CUR_CFG=()
   if [[ -n "$CONFIG_REL" && -n "${SEEN_PATH["p$CONFIG_REL"]+x}" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do CUR_CFG["l$line"]=1; done < "$CONFIG_ABS"
+  fi
+
+  # remerge where git knows it (2.36 and later), -m before: the same lines,
+  # at a cost (above). A failed probe falls back to the slower, complete
+  # pass, never to none, and the JSON names the mode that ran.
+  # A merge driver can write lines in neither parent, and would write them
+  # again in the re-merge, hiding them: merge.default is pinned to git's own
+  # (HLOG), and a repository whose info/attributes holds anything — where a
+  # driver is named per path, and nothing here can blank it — gets -m.
+  HMERGE=(-m)
+  HIST_MERGE_MODE=separate
+  run_git "rev-parse (info/attributes)" "$TMPD/iattr" g rev-parse --git-path info/attributes
+  iattr=$(<"$TMPD/iattr")
+  if [[ ! -L "$iattr" && ! -s "$iattr" ]] && g log -0 --all --diff-merges=remerge >/dev/null 2>&1; then
+    HMERGE=(--max-parents=2 --diff-merges=remerge)
+    HIST_MERGE_MODE=remerge
   fi
 
   # git C-quotes a path holding ", \ or a control character even with
@@ -2263,9 +2294,11 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
   FC_SHA=()
   FC_PATH=()
   HB_FC=()
-  hist_parse() {
-    local LC_ALL=C line sha="" fc=-1 ln=0 in_hunk=0 h
+  hist_parse() { # stream...
+    local LC_ALL=C line sha="" fc=-1 ln=0 in_hunk=0 h stream
     exec 3>"$TMPD/subj/h" 4>"$TMPD/hmeta"
+    for stream in "$@"; do
+    in_hunk=0
     while IFS= read -r line || [[ -n "$line" ]]; do
       if (( in_hunk )); then
         case "$line" in
@@ -2300,16 +2333,30 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
         # is output this parser does not understand, and skipping it would
         # skip whatever it carried.
         ''|'index '*|'--- '*|'+++ '*|'new file mode '*|'deleted file mode '*|'old mode '*|'new mode '*) ;;
+        # remerge's note on a conflict the re-merge met, after `diff --git`
+        # (`remerge CONFLICT (content): Merge conflict in a.txt`).
+        'remerge '*) ;;
         *) die "scan error: unexpected line in the history diff: ${line:0:40}" ;;
       esac
-    done < "$TMPD/hlog"
+    done < "$stream"
+    done
     exec 3>&- 4>&-
   }
 
-  run_git "log (history)" "$TMPD/hlog" g "${HLOG[@]}" -m --no-renames -p -U0 \
-    --inter-hunk-context=0 --no-color --no-ext-diff --no-textconv --submodule=short \
-    --src-prefix=a/ --dst-prefix=b/ --format=%x01%H -- . "${skip_excludes[@]}"
-  hist_parse
+  HDIFF=(--no-renames -p -U0 --inter-hunk-context=0 --no-color --no-ext-diff
+    --no-textconv --submodule=short --src-prefix=a/ --dst-prefix=b/ --format=%x01%H)
+  run_git "log (history)" "$TMPD/hlog" g "${HLOG[@]}" "${HMERGE[@]}" "${HDIFF[@]}" \
+    -- . "${skip_excludes[@]}"
+  HSTREAMS=("$TMPD/hlog")
+  # Octopus merges after every other commit: a line one of them alone holds
+  # is found at it, unless a later commit adds the same line to the same
+  # file, which then takes the finding.
+  if [[ "$HIST_MERGE_MODE" == remerge ]]; then
+    run_git "log (octopus merges)" "$TMPD/hlog2" g "${HLOG[@]}" --min-parents=3 -m "${HDIFF[@]}" \
+      -- . "${skip_excludes[@]}"
+    HSTREAMS+=("$TMPD/hlog2")
+  fi
+  hist_parse "${HSTREAMS[@]}"
   mapfile -t HMETA < "$TMPD/hmeta"
 
   declare -A HIST_SEEN=()
@@ -3197,8 +3244,8 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
   if [[ "$HISTORY" -eq 1 ]]; then
     hr=null
     if [[ -n "$HIST_RANGE" ]]; then hr="\"$(json_escape "$HIST_RANGE")\""; fi
-    printf '],"history_scanned":true,"history":{"commits":%d,"binary":%d,"skipped":%d,"config_lines_exempt":%d,"range":%s,"refs":%d,"tags":%d,"tagged_unscanned":%d}' \
-      "$HIST_COMMITS" "$HIST_BINARY" "$HIST_SKIPPED" "${#CFG_EXEMPT[@]}" "$hr" "$HIST_REFS" "$HIST_TAGS" "$HIST_TAGGED"
+    printf '],"history_scanned":true,"history":{"commits":%d,"binary":%d,"skipped":%d,"config_lines_exempt":%d,"range":%s,"refs":%d,"tags":%d,"tagged_unscanned":%d,"merge_diffs":"%s"}' \
+      "$HIST_COMMITS" "$HIST_BINARY" "$HIST_SKIPPED" "${#CFG_EXEMPT[@]}" "$hr" "$HIST_REFS" "$HIST_TAGS" "$HIST_TAGGED" "$HIST_MERGE_MODE"
   else
     printf '],"history_scanned":false'
   fi

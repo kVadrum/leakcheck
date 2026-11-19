@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.21.0*
+*README v0.22.0*
 
 ## Install
 
@@ -242,6 +242,9 @@ leakcheck: scanned 1 tracked files (index + worktree; 0 binary skipped, 0 submod
 A history hit leads with the full commit id, then `path:line:`; commit metadata uses `(author)`, `(committer)` or `(message)` in place of the path, with the message's line number.
 Ref and tag hits use `(ref)`, `(tag)`, `(tagger)` or `(tag message)`, and lead with the object they name: the commit a branch points at, or the tag object.
 
+- **A merge is read for the lines it adds itself.**
+  With git 2.36 or later, each merge is diffed against git's own re-merge of its parents, so what is read is what the merge alone adds — a conflict's resolution, a line slipped into the merge — while every other line was already scanned at the commit that added it.
+  An older git diffs each merge against each parent instead, which finds the same lines but repeats each side's changes, slow on a long history; a merge of three or more parents is always diffed that way, and `--json` names the mode (`merge_diffs`).
 - **Each finding is reported once, at the earliest commit that has it.**
   A line that stayed put through fifty edits is one hit, and so is one email address in five hundred commits.
 - **A leak that is still in the tree is reported twice** — once as it is now, once at the commit that introduced it — because each needs its own fix: an edit for the tree, a history rewrite (for example with `git filter-repo`) for the past.
@@ -453,7 +456,7 @@ Here is the Quick start run, formatted for reading:
 
 - `version` is the leakcheck version that ran.
 - `source` says where a hit was found: `index`, `worktree` or `both` — or `history`, and then the hit also carries `commit` after `source`: the full commit id, or for a ref or tag hit the id of the object it names.
-- With `--history`, `history_scanned` is `true` and a final `history` object follows: `{"commits": 4, "binary": 0, "skipped": 0, "config_lines_exempt": 1, "range": null, "refs": 1, "tags": 0, "tagged_unscanned": 0}`.
+- With `--history`, `history_scanned` is `true` and a final `history` object follows: `{"commits": 4, "binary": 0, "skipped": 0, "config_lines_exempt": 1, "range": null, "refs": 1, "tags": 0, "tagged_unscanned": 0, "merge_diffs": "remerge"}` (`separate` where git has no remerge, before 2.36).
   `range` is the `--history-range` value, or `null` when every ref was scanned.
 - `allowed` lists what each allow rule suppressed, each rule as written, its `credential:` scope included.
 - `credentials` counts the credential rules that ran and the stand-ins not reported, then, when the config disables any, lists them: `"disabled": ["credential:mailchimp-key"]`; then, when a keyword rule set any value aside as weak, counts those: `"weak": 1` ([Keyword rules](#keyword-rules)).
