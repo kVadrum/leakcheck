@@ -1901,12 +1901,21 @@ t_credential_every_rule_finds_its_own_format() {
   python3 - .git/cred.json "$CRED_TSV" "$CRED_PATHS" <<'PY'
 import json, re, sys
 doc = json.load(open(sys.argv[1]))
-kv = {"aws-secret-access-key", "url-password", "generic-secret"}
+kv = {"aws-secret-access-key", "url-password", "generic-secret", "http-basic-auth",
+      "http-bearer-token", "curl-user-password", "xml-key-value"}
 def shown(cid, m):
     if cid in markers:
         return m
     if cid not in kv:
         return "%s[redacted, %d chars]" % (m[:4], len(m))
+    if cid in ("http-basic-auth", "http-bearer-token"):
+        scheme, val = re.match(r".* (\w+) +(\S+)$", m).groups()
+        return "%s[redacted, %d chars]" % (scheme, len(val))
+    if cid == "curl-user-password":
+        return "-u[redacted, %d chars]" % len(m.split(":", 1)[1])
+    if cid == "xml-key-value":
+        k, val = re.match(r'<add key="([^"]*)" value="(.*)$', m).groups()
+        return "%s[redacted, %d chars]" % (k, len(val))
     if "://" in m:
         return "%s://[redacted, %d chars]" % (m.split("://")[0], len(m[:-1].rsplit(":", 1)[1]))
     kw, val = re.match(r"([A-Za-z_]+)\s*[=:]\s*[\"']?(.*)$", m).groups()
@@ -3482,6 +3491,83 @@ assert doc["credentials"]["weak"] == 1, doc["credentials"]
 PY
 }
 
+t_kv_http_auth_rules() {
+  # Stage C, HTTP authentication (v0.17.0): an Authorization header's Basic
+  # credentials (judged by the password they encode, or by the user when the
+  # password is empty), its Bearer or `token` credential, curl's
+  # `-u user:password`, and an XML setting `<add key="…Password" value="…">`
+  # — each in the syntaxes that write it, printed as its scheme, flag or key
+  # name and the value's length. Weak values are counted, and a template's
+  # value (`$TOKEN`, `"deploy:$DEPLOY_PASSWORD"`, `<token>`) and `docker run
+  # -u 1000:1000` are no match at all.
+  local vt="$PWD/.git/kv.tsv" v
+  python3 -I - "$vt" <<'PY'
+import base64, random, sys
+r = random.Random(61)
+an = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz"
+AZ = "Authori" "zation"
+def val(n):
+    return "".join(r.choice(an) for _ in range(n - 2)) + str(r.randint(2, 9)) + "q"
+def basic(u, p):
+    return base64.b64encode((u + ":" + p).encode()).decode()
+rows = []
+for fmt, user, n in ((AZ + ": Basic %s", "svc", 14),
+                     ('curl -H "' + AZ + ': Basic %s" https://api.invalid/', "svc", 10),
+                     ("proxy_set_header " + AZ + ' "Basic %s";', None, 20)):
+    p = val(n)
+    b = basic(p, "") if user is None else basic(user, p)
+    rows.append(("http-basic-auth", fmt % b, b, "Basic[redacted, %d chars]" % len(b)))
+for fmt, scheme, n in (('  "' + AZ + '": "Bearer %s",', "Bearer", 30),
+                       ('req.Header.Set("' + AZ + '", "Bearer %s")', "Bearer", 24),
+                       ("headers = {'" + AZ + "': 'token %s'}", "token", 38),
+                       ("'Proxy-" + AZ + "' => 'bearer %s'", "bearer", 20)):
+    v = val(n)
+    rows.append(("http-bearer-token", fmt % v, v, "%s[redacted, %d chars]" % (scheme, n)))
+for fmt, flag, n in (("curl -u admin:%s https://api.invalid/", "-u", 12),
+                     ('curl -s --user "deploy:%s" https://x.invalid/', "--user", 16),
+                     ("curl -fsS -uci:%s https://x.invalid/", "-u", 9)):
+    v = val(n)
+    rows.append(("curl-user-password", fmt % v, v, "%s[redacted, %d chars]" % (flag, n)))
+for fmt, key, n in (('<add key="ClearText' 'Password" value="%s" />', "ClearTextPassword", 18),
+                    ("<add key='DbPassword' value='%s'/>", "DbPassword", 14)):
+    v = val(n)
+    rows.append(("xml-key-value", fmt % v, v, "%s[redacted, %d chars]" % (key, n)))
+weak = [
+    AZ + ": Basic " + basic("user", "password"),
+    AZ + ": Basic " + basic("Aladdin", "open sesame"),
+    AZ + ": Bearer YOUR_ACCESS_TOKEN_HERE",
+    "curl -u admin:changeme123 https://x.invalid",
+    '<add key="ClearText' 'Password" value="%NUGET_PASSWORD%" />',
+]
+none = [AZ + ": Bearer $TOKEN", 'curl -u "deploy:$DEPLOY_PASSWORD" https://x.invalid',
+        "docker run -u 1000:1000 img", AZ + ": Bearer <token>"]
+with open(sys.argv[1], "w") as f:
+    for row in rows:
+        f.write("\t".join(row) + "\n")
+with open(sys.argv[1] + ".weak", "w") as f:
+    f.write("\n".join(weak + none) + "\n")
+PY
+  { cut -f2 "$vt"; cat "$vt.weak"; } > h.txt
+  git add h.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "$vt" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
+got = sorted((h["line"], h["pattern"], h["text"]) for h in doc["hits"])
+want = sorted((n + 1, "credential:" + cid, shown) for n, (cid, _, _, shown) in enumerate(rows))
+assert got == want, (got, want)
+assert doc["credentials"]["weak"] == 5, doc["credentials"]
+PY
+  assert_exit 1 "$BIN"
+  while IFS=$'\t' read -r _ _ v _; do
+    assert_not_contains "$v" "$LC_OUT"
+    assert_not_contains "$v" "$LC_ERR"
+  done < "$vt"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -4172,6 +4258,7 @@ lc_test "a caller's shell settings stay outside"  t_caller_shell_settings_do_not
 lc_test "keyword rules: masked where they print"  t_kv_values_are_masked_where_they_print
 lc_test "keyword rules: URL sub-delims"          t_kv_url_password_takes_rfc3986_sub_delims
 lc_test "keyword rules: a dotted token is no name" t_kv_dotted_token_is_no_name
+lc_test "keyword rules: HTTP authentication"     t_kv_http_auth_rules
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder

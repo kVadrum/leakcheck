@@ -10,6 +10,7 @@ prints the TSV it reads) and test/corpus.py (many per rule, in many contexts).
 A stand-in never has a placeholder's shape (stand_in_ok): those are set aside,
 and tested on their own.
 """
+import base64
 import random
 import zlib
 
@@ -51,6 +52,10 @@ B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 def part(p, r):
     if isinstance(p, str):
         return p
+    if p[0] == "basic":
+        # HTTP Basic credentials: the base64 of the parts (a user, `:`, a
+        # password), as RFC 7617 sends them.
+        return base64.b64encode("".join(part(q, r) for q in p[1]).encode()).decode()
     s = "".join(r.choice(CS["an" if p[0] == "an-crc" else p[0]]) for _ in range(p[1]))
     if p[0] == "an-crc":
         # GitHub's checksum: the last six are the base62 CRC-32 of the rest.
@@ -143,6 +148,10 @@ SPECS = {
  "aws-secret-access-key": ("", ["aws", "_secret_access_key = ", ("b64", 40)]),
  "url-password": ("URL=", ["post", "gres://app:", ("an", 14), ("d", 1), ("a", 1), "@"]),
  "generic-secret": ("", ["api", "_key = \"", ("an", 30), ("d", 1), ("a", 1)]),
+ "http-basic-auth": ("", ["Authori", "zation: Basic ", ("basic", ["svc:", ("an", 18), ("d", 1), ("a", 1)])]),
+ "http-bearer-token": ("", ["Authori", "zation: Bearer ", ("an", 30), ("d", 1), ("a", 1)]),
+ "curl-user-password": ("", ["cu", "rl -u deploy:", ("an", 14), ("d", 1), ("a", 1)]),
+ "xml-key-value": ("", ['<add key="ClearText', 'Password" value="', ("an", 16), ("d", 1), ("a", 1)]),
 }
 
 

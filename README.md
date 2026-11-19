@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.16.4*
+*README v0.17.0*
 
 ## Install
 
@@ -111,7 +111,7 @@ Built-in rules also find keys and tokens in the formats their issuers fixed, by 
 - PKCS #12 key bundles, by their file names alone (`.p12`, `.pfx`, any case): their content is binary, so a tracked name is the only tell, and the rule runs over tracked path names and nothing else;
 - keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana, Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare (API tokens and origin CA keys), CircleCI, Sourcegraph, Docker Swarm (join tokens and unlock keys) and Mapbox.
 
-Keyword rules find keys with no prefix of their own too, by the name they are assigned to and how random they are: AWS secret access keys, passwords in URLs, and values assigned to a name such as `password`, `secret`, `token` or `api_key` ([Keyword rules](#keyword-rules)).
+Keyword rules find keys with no prefix of their own too, by the name they are assigned to and how random they are: AWS secret access keys, passwords in URLs, HTTP `Authorization` headers, curl's `-u user:password`, and values assigned to a name such as `password`, `secret`, `token` or `api_key` ([Keyword rules](#keyword-rules)).
 
 A key or webhook URL is found with its slashes JSON-escaped, `\/`, as PHP's `json_encode` and others write them.
 A key is found inside a longer run of characters too, with one exception: a DeepSeek key, `sk-` and 32 hex digits, is also how generated names end (`task-…`, `desk-…`), so it is not found right after a lowercase letter.
@@ -162,14 +162,20 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
 
 ### Keyword rules
 
-Three rules find a secret that has no prefix of its own by the name it is assigned to and how random it is:
+Seven rules find a secret that has no prefix of its own by the name it is assigned to and how random it is:
 
 - `aws-secret-access-key`: 40 characters assigned to `aws_secret_access_key`, in any case, with `_`, `-`, `.` or nothing between the words;
 - `url-password`: the password in a URL's user part, `postgres://app:…@db` (with its slashes JSON-escaped too);
-- `generic-secret`: 12 to 100 characters assigned to a name holding `password`, `pass`, `pwd`, `secret`, `token`, `credential`, `api_key`, `access_key`, `auth_key` or `private_key`, in any case.
+- `generic-secret`: 12 to 100 characters assigned to a name holding `password`, `pass`, `pwd`, `secret`, `token`, `credential`, `api_key`, `access_key`, `auth_key` or `private_key`, in any case;
+- `http-basic-auth`: an `Authorization` (or `Proxy-Authorization`) header's `Basic` credentials, judged by the password they encode (or the user, where the password is empty, as an API key sent as the user is);
+- `http-bearer-token`: the same header's `Bearer` or `token` credential, 16 characters or more;
+- `curl-user-password`: the password in curl's `-u user:password`, `--user` or `--proxy-user`, on the line that runs curl;
+- `xml-key-value`: an XML setting whose key holds one of the generic rule's words, `<add key="ClearTextPassword" value="…"/>` as NuGet and .NET write them.
+
+The header may be written as a request, a config or code writes it: `Authorization: …`, `"Authorization": "…"`, `'Authorization' => '…'`, `Header.Set("Authorization", "…")`, or nginx's `Authorization "…"`.
 
 The name may run on for up to 12 characters after the keyword (`DB_PASSWORD`, `secret_key`, `api_key_v2`), and the assignment is `=`, `:=` or `=>`, or a colon as YAML and JSON write it, before a blank or after a closing quote: `TOKEN=…`, `token: …` and `"token":"…"` count, and `credential:github-token` does not.
-A hit prints the keyword, or a URL's scheme, and the length of the value, never a byte of it:
+A hit prints the keyword — a URL's scheme, a header's scheme (`Bearer`), curl's flag, an XML setting's key — and the length of the value, never a byte of it:
 
 ```text
 $ leakcheck
@@ -181,11 +187,11 @@ leakcheck: 2 credential(s) among these: revoke and reissue any that has left thi
 ```
 
 - **The value is judged, and a weak one is counted, not reported.**
-  Weak is a stand-in's shape (as above), or too little entropy — 3.5 bits per character for the generic rule, 3 for a URL's password, 4 for an AWS key — or, for the generic and URL rules, no digit or no letter, a word people write into stand-ins (`example`, `changeme`, `your`, `test`, `xxxx`, …), a dotted name (`settings.SECRET_KEY`, though not one with a part of 16 or more characters mixing upper case, lower case and digits, as a token's parts do) or an environment variable's name (`MY_API_TOKEN`).
+  Weak is a stand-in's shape (as above), or too little entropy — 3.5 bits per character for the generic rule, 4 for an AWS key, 3 for the others — or, for every rule but the AWS one, no digit or no letter, a word people write into stand-ins (`example`, `changeme`, `your`, `test`, `xxxx`, …), a dotted name (`settings.SECRET_KEY`, though not one with a part of 16 or more characters mixing upper case, lower case and digits, as a token's parts do) or an environment variable's name (`MY_API_TOKEN`).
   The summary counts these apart from the stand-ins, at the end of its line (`1 weak keyword values not reported`, above: `TOKEN = "your-token-here-…"`), and `--json` adds `"weak"` to `credentials`.
-  So a password shorter than 12 characters, or one made of words, is not found; nor is a value a template fills in (`${DB_PASSWORD}`, `os.environ[…]`), which is no secret.
+  So a password shorter than 12 characters, or one made of words, is not found; nor is a value a template fills in (`${DB_PASSWORD}`, `os.environ[…]`, `Bearer $TOKEN`, `-u "$USER:$PASS"`), which is no secret.
 - **A key a fixed-format rule finds is that rule's.**
-  `GITHUB_TOKEN=ghp_…` is reported once, as `github-token`, and set aside or excused by that rule alone; a URL whose password is such a key is that rule's too, and the generic rule yields to the other two keyword rules as well.
+  `GITHUB_TOKEN=ghp_…` is reported once, as `github-token`, and set aside or excused by that rule alone; a URL whose password, or a header whose credential, is such a key is that rule's too, and the generic rule yields to the other keyword rules as well.
   So is a value that runs into such a key where the key sits; a separate value that only opens with the same characters is reported on its own.
   With the fixed-format rule disabled, the keyword rule reports the key itself.
 - **Where a keyword rule's match prints in an allow rule or an error, it is masked with its keyword**, since the first four characters a masked run shows would otherwise be the value's.

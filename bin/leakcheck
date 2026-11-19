@@ -11,8 +11,9 @@
 # fixed (cloud, AI and git-host keys, webhooks, private key headers), key
 # files by their names (PKCS #12), and keys with no prefix of their own by
 # a keyword and the value's randomness (a password, an AWS secret key,
-# `token = ...`); a credential hit is labelled credential:<id>, and any key
-# it prints is masked.
+# `token = ...`, an HTTP Authorization header, curl's -u user:password); a
+# credential hit is labelled credential:<id>, and any key it prints is
+# masked.
 #
 # Usage:
 #   leakcheck                    # scan with defaults + .leakcheckrc(.local)
@@ -102,7 +103,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.16.4"
+VERSION="0.17.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -462,21 +463,6 @@ ALL_CREDENTIALS=("${CREDENTIALS[@]}" "${PATH_CREDENTIALS[@]}")
 # value; the least entropy the value needs, in millibits per character.
 # A hit prints its keyword (a raw rule: the URL's scheme) and the value's
 # length, never a byte of the value. The rows are ours, not gitleaks'.
-KV_CREDENTIALS=(
-  # source: docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html (a secret access key, wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY: 40 characters); docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html (AWS_SECRET_ACCESS_KEY)
-  aws-secret-access-key   'aws[_.-]?secret[_.-]?(access[_.-]?)?key'  '([A-Za-z0-9+]|\\?/){40}'  ''  4000
-  # source: RFC 3986 §3.2.1 (userinfo: "user:password" is deprecated, and "applications should not render as clear text any data after the first colon")
-  # RFC 3986's userinfo: unreserved, percent-encoded, every sub-delim
-  # (`!$&'()*+,;=`) and, past the first, `:`; a password holding `$&'(),;`
-  # or a `:` was no match (v0.16.0; the colon, Codex, the /qaa of v0.16.1).
-  url-password            '[A-Za-z][A-Za-z0-9+.-]{1,30}:(\\?/){2}[A-Za-z0-9._~!$&'"'"'()*+,;=%-]{0,64}:'  '[A-Za-z0-9._~!$&'"'"'()*+,;=%:-]{8,128}'  '@'  3000
-  # source: none (the generic rule every scanner carries, its grammar and stopwords ours)
-  generic-secret          'passw(or)?d|pass|pwd|secret|token|credential|api[_.-]?key|apikey|access[_.-]?key|auth[_.-]?key|private[_.-]?key'  '[A-Za-z0-9_+/=~.!@#%^*-]{12,100}'  ''  3500
-)
-# KV_WORDY: rules whose values a person writes, judged for words too.
-declare -A KV_RAW=([url-password]=1) KV_WORDY=([url-password]=1 [generic-secret]=1)
-# The generic rule: it yields to every other (kv_yields).
-KV_GENERIC=generic-secret
 # kv_ci <ERE> -> REPLY: each lower-case letter as a bracket of both cases.
 kv_ci() {
   local LC_ALL=C s=$1 i c
@@ -486,6 +472,61 @@ kv_ci() {
     if [[ "$c" == [a-z] ]]; then REPLY+="[${c^^}$c]"; else REPLY+=$c; fi
   done
 }
+# The words a secret's name holds, shared by the generic rule and the XML
+# setting rule.
+KV_SECRET_WORDS='passw(or)?d|pass|pwd|secret|token|credential|api[_.-]?key|apikey|access[_.-]?key|auth[_.-]?key|private[_.-]?key'
+# An HTTP Authorization header, as a request, a config or code writes it:
+# `Authorization: X`, `"Authorization": "X"`, `'Authorization' => 'X'`,
+# `Header.Set("Authorization", "X")`, nginx's `Authorization "X"`; the
+# proxy's header (RFC 9110 §11.6.2, §11.7.2) by its tail, as nothing anchors
+# the match's start.
+kv_ci 'authorization'
+KV_AUTHZ="$REPLY[\"'\`]?([[:space:]]*(:|=>?|,)[[:space:]]*|[[:space:]]+)[\"'\`]?"
+kv_ci "$KV_SECRET_WORDS"
+KV_SECRET_CI=$REPLY
+# curl's user and password on its command line, `-u user:password`: a value
+# opening with `$`, `<` or `{` is a template's (`-u "$USER:$PASS"`).
+KV_CURL_U="[Cc][Uu][Rr][Ll][[:space:]]([^|;]{0,200}[[:space:]])?(-u[[:space:]]*|-U[[:space:]]*|--user[[:space:]=]+|--proxy-user[[:space:]=]+)[\"']?[^[:space:]:\"'\`\$<{]{1,64}:"
+KV_CURL_PW="[^[:space:]\"'\`\$<{][^[:space:]\"'\`]{7,127}"
+# A setting written as XML, `<add key="…Password" value="…"/>`: NuGet's
+# packageSourceCredentials and .NET's appSettings, with the generic words.
+KV_XML_ADD="<[Aa][Dd][Dd][[:space:]]+[Kk][Ee][Yy][[:space:]]*=[[:space:]]*[\"'][A-Za-z0-9_.:-]{0,40}($KV_SECRET_CI)[A-Za-z0-9_.:-]{0,40}[\"'][[:space:]]+[Vv][Aa][Ll][Uu][Ee][[:space:]]*=[[:space:]]*[\"']"
+KV_XML_VAL="[^\"'<>[:space:]]{8,128}"
+KV_CREDENTIALS=(
+  # source: docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html (a secret access key, wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY: 40 characters); docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html (AWS_SECRET_ACCESS_KEY)
+  aws-secret-access-key   'aws[_.-]?secret[_.-]?(access[_.-]?)?key'  '([A-Za-z0-9+]|\\?/){40}'  ''  4000
+  # source: RFC 3986 §3.2.1 (userinfo: "user:password" is deprecated, and "applications should not render as clear text any data after the first colon")
+  # RFC 3986's userinfo: unreserved, percent-encoded, every sub-delim
+  # (`!$&'()*+,;=`) and, past the first, `:`; a password holding `$&'(),;`
+  # or a `:` was no match (v0.16.0; the colon, Codex, the /qaa of v0.16.1).
+  url-password            '[A-Za-z][A-Za-z0-9+.-]{1,30}:(\\?/){2}[A-Za-z0-9._~!$&'"'"'()*+,;=%-]{0,64}:'  '[A-Za-z0-9._~!$&'"'"'()*+,;=%:-]{8,128}'  '@'  3000
+  # source: none (the generic rule every scanner carries, its grammar and stopwords ours)
+  generic-secret          "$KV_SECRET_WORDS"  '[A-Za-z0-9_+/=~.!@#%^*-]{12,100}'  ''  3500
+  # source: RFC 7617 §2 (Basic: the base64 of a user-id, a colon and a password); RFC 9110 §11.6.2 (Authorization)
+  http-basic-auth         "${KV_AUTHZ}[Bb][Aa][Ss][Ii][Cc][[:space:]]+"  '[A-Za-z0-9+/]{8,126}={0,2}'  ''  3000
+  # source: RFC 6750 §2.1 (Bearer and its b64token); docs.github.com/en/rest/authentication/authenticating-to-the-rest-api (the `token` scheme)
+  http-bearer-token       "${KV_AUTHZ}([Bb][Ee][Aa][Rr][Ee][Rr]|[Tt][Oo][Kk][Ee][Nn])[[:space:]]+"  '[A-Za-z0-9._~+/-]{16,126}={0,2}'  ''  3000
+  # source: curl.se/docs/manpage.html (-u, --user <user:password>; -U, --proxy-user <user:password>)
+  curl-user-password      "$KV_CURL_U"  "$KV_CURL_PW"  ''  3000
+  # source: learn.microsoft.com/en-us/nuget/reference/nuget-config-file (packageSourceCredentials, ClearTextPassword); learn.microsoft.com/en-us/dotnet/framework/configure-apps/file-schema/appsettings/add-element-for-appsettings
+  xml-key-value           "$KV_XML_ADD"  "$KV_XML_VAL"  ''  3000
+)
+# KV_WORDY: rules whose values a person writes, judged for words too.
+declare -A KV_RAW=([url-password]=1 [http-basic-auth]=1 [http-bearer-token]=1
+  [curl-user-password]=1 [xml-key-value]=1)
+declare -A KV_WORDY=([url-password]=1 [generic-secret]=1 [http-basic-auth]=1
+  [http-bearer-token]=1 [curl-user-password]=1 [xml-key-value]=1)
+# What a raw rule's hit prints before the value's length: group 1 of this
+# ERE over the text before the value (the URL rule prints its scheme).
+declare -A KV_SHOW_RE=([http-basic-auth]='([A-Za-z]+)[[:space:]]+$'
+  [http-bearer-token]='([A-Za-z]+)[[:space:]]+$'
+  [curl-user-password]='(-u|-U|--user|--proxy-user)[[:space:]=]*["'"'"']?[^:]*:$'
+  [xml-key-value]='[Kk][Ee][Yy][[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']*)["'"'"'][[:space:]]+[Vv][Aa][Ll][Uu][Ee]')
+# A value that is base64 of `user:password` (Basic): judged as its password,
+# or as its user where the password is empty (an API key sent as the user).
+declare -A KV_B64USER=([http-basic-auth]=1)
+# The generic rule: it yields to every other (kv_yields).
+KV_GENERIC=generic-secret
 # The grammar after a keyword: up to 12 more name characters (`_key`,
 # `word`, `_v2`; 20 let `id_token_signed_response_alg=` in), then an
 # assignment — `=`, `:=` or `=>` after an optional closing quote and blanks,
@@ -547,6 +588,25 @@ kv_value() {
 # Words a person writes into a stand-in, never found in a random secret.
 KV_STOPWORDS=(example sample dummy fake test mock demo placeholder changeme change_me your
   redacted insert replace secret password passwd token xxxx '****' todo foobar lorem)
+# b64_text <base64> -> REPLY: the text it encodes, in bash; status 1 if a
+# character is no base64 or a byte decodes to no printable ASCII.
+B64_ALPHA=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
+ASCII_PRINT=' !"#$%&'"'"'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~'
+b64_text() {
+  local LC_ALL=C s=${1%%=*} i c p v=0 bits=0 o
+  REPLY=""
+  for (( i = 0; i < ${#s}; i++ )); do
+    c=${s:i:1}
+    p=${B64_ALPHA%%"$c"*}
+    (( ${#p} < 64 )) || return 1
+    v=$(( (v << 6) | ${#p} )); bits=$(( bits + 6 ))
+    if (( bits >= 8 )); then
+      bits=$(( bits - 8 )); o=$(( (v >> bits) & 255 )); v=$(( v & ((1 << bits) - 1) ))
+      (( o >= 32 && o < 127 )) || return 1
+      REPLY+=${ASCII_PRINT:o-32:1}
+    fi
+  done
+}
 # kv_weak <id> <value>: no secret. A placeholder's shape or too little
 # entropy; in a rule a person writes values for (KV_WORDY), also no digit or
 # no letter, a stopword, a dotted name (settings.SECRET_KEY) or an
@@ -558,6 +618,11 @@ KV_STOPWORDS=(example sample dummy fake test mock demo placeholder changeme chan
 # prefix would look weak and hide a key.
 kv_weak() {
   local LC_ALL=C v=$2 lv w min=${KV_MINH[$1]}
+  if [[ -n "${KV_B64USER[$1]+x}" ]] && b64_text "$v" && [[ "$REPLY" == *:* ]]; then
+    v=${REPLY#*:}
+    if [[ -z "$v" ]]; then v=${REPLY%%:*}; fi
+    [[ -n "$v" ]] || return 0
+  fi
   if is_placeholder "$v" "$1"; then return 0; fi
   kv_entropy "$v"
   if (( REPLY < min )); then return 0; fi
@@ -694,9 +759,11 @@ kv_overlaps() {
 }
 # kv_show <id> <match> -> REPLY: what a keyword rule's hit prints.
 kv_show() {
-  local LC_ALL=C kw="" n=${#2}
-  if kv_value "$1" "$2"; then n=${#REPLY}; fi
-  if [[ -n "${KV_RAW[$1]+x}" ]]; then
+  local LC_ALL=C kw="" n=${#2} pre=$2
+  if kv_value "$1" "$2"; then n=${#REPLY}; pre=${BASH_REMATCH[1]}; fi
+  if [[ -n "${KV_SHOW_RE[$1]+x}" ]]; then
+    if [[ "$pre" =~ ${KV_SHOW_RE[$1]} ]]; then kw=${BASH_REMATCH[1]}; fi
+  elif [[ -n "${KV_RAW[$1]+x}" ]]; then
     kw="${2%%:*}://"
   elif [[ "$2" =~ ${KV_KW[$1]} ]]; then
     kw=${BASH_REMATCH[0]}
