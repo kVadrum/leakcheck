@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.29.0*
+*README v0.29.1*
 
 ## Install
 
@@ -253,9 +253,11 @@ leakcheck: scanned 1 tracked files (index + worktree; 0 binary skipped, 0 submod
 ```
 
 - **A hit names the member** as `archive!member`; its line is the member's.
+- **What an archive says beside its members is read too**, on line 0: a zip's comment and each entry's (`(comment) …`), a tar entry's owner (`(owner) user:group`) and pax records (`(pax) key=value`), a gzip's comment, and the name a `.tar.gz` was compressed under (`(name) …`).
+- **A tar entry of a type it does not know is read as a file**, as GNU tar extracts one, and a zip's directory is read to its end, whatever count its end record states.
 - **Bash and git alone read it**, no `unzip`, `tar` or `gzip`: git inflates what is deflated.
 - **One level:** an archive inside an archive is a binary member, counted.
-- **Counted, never silent:** a member encrypted, compressed by another method than deflate, or not read whole, and an archive that cannot be read (zip64, a damaged file), are in the summary, and `--strict` reports each; an archive read is no longer a binary file not scanned.
+- **Counted, never silent:** a member encrypted, compressed by another method than deflate, or not read whole (its data longer or shorter than its stated size among them), and an archive that cannot be read (zip64, a damaged file), are in the summary, and `--strict` reports each; an archive read is no longer a binary file not scanned.
 - Tracked content only, not `--history`, and not decoded under `--decode`.
 
 ## Scanning files outside a repository

@@ -4398,6 +4398,96 @@ assert src == [(".leakcheckrc", "decoded-base64"), ("a.txt", "decoded-base64"), 
 ' "$LC_OUT"
 }
 
+t_archives_read_what_they_publish() {
+  # /qaa (v0.29.1), each case a member or a byte v0.29.0 left unread or
+  # printed: a key in a member's name printed whole in the hit's text, a
+  # .p12 member past the path rules, an entry past the end record's count,
+  # an unknown tar type's data, a member holding more than its stated size,
+  # metadata (zip and gzip comments, a tar owner, pax records, a .tar.gz's
+  # own name), and --redact leaving a member name's tell in its path.
+  local gh H='[/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/]'
+  gh=$(cred github-token)
+  python3 - "$gh" <<'PY'
+import gzip, io, struct, sys, tarfile, zipfile, zlib
+gh = sys.argv[1]
+def tbytes(members, fmt=tarfile.USTAR_FORMAT, **kw):
+    b = io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w", format=fmt, **kw) as t:
+        for ti, data in members:
+            ti.size = len(data)
+            t.addfile(ti, io.BytesIO(data))
+    return b.getvalue()
+def zbytes(entries, comment=b""):
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w") as z:
+        z.comment = comment
+        for zi, data in entries:
+            z.writestr(zi, data)
+    return bytearray(b.getvalue())
+open("names.tar", "wb").write(tbytes([(tarfile.TarInfo("MYHOST/" + gh), b"x\n")]))
+open("certs.zip", "wb").write(bytes(zbytes([(zipfile.ZipInfo("certs/client.p12"), b"0\x82\x01\x00")])))
+# The end record's two counts one short.
+z = zbytes([(zipfile.ZipInfo("one.txt"), b"x\n"), (zipfile.ZipInfo("two.txt"), b"see /home/alice/two\n")])
+e = z.rfind(b"PK\x05\x06")
+z[e + 8:e + 12] = struct.pack("<HH", 1, 1)
+open("count.zip", "wb").write(bytes(z))
+u = tarfile.TarInfo("u.dat"); u.type = b"U"
+open("type.tar", "wb").write(tbytes([(u, b"see /home/alice/typeu\n")]))
+# Stated 100 bytes, deflating to 10 KB: under a buffer of 16 KiB more.
+zi = zipfile.ZipInfo("long.txt"); zi.compress_type = zipfile.ZIP_DEFLATED
+z = zbytes([(zi, b"x\n" * 5000 + b"see /home/alice/tail\n")])
+c = z.rfind(b"PK\x01\x02")
+z[c + 24:c + 28] = struct.pack("<I", 100)
+open("long.zip", "wb").write(bytes(z))
+zi = zipfile.ZipInfo("e.txt"); zi.comment = b"see /home/alice/meta2"
+open("meta.zip", "wb").write(bytes(zbytes([(zi, b"x\n")], comment=b"built in /home/alice/meta1")))
+raw = zlib.compressobj(9, zlib.DEFLATED, -15)
+body = raw.compress(b"x\n") + raw.flush()
+open("c.gz", "wb").write(b"\x1f\x8b\x08\x10\0\0\0\0\0\x03" + b"see /home/alice/gzc\0" + body
+                         + struct.pack("<II", zlib.crc32(b"x\n"), 2))
+o = tarfile.TarInfo("f.txt"); o.uname = "MYHOST"; o.pax_headers = {"comment": "see /home/alice/pax"}
+open("owner.tar", "wb").write(tbytes([(o, b"x\n")], fmt=tarfile.PAX_FORMAT))
+open("glob.tar", "wb").write(tbytes([(tarfile.TarInfo("g.txt"), b"x\n")], fmt=tarfile.PAX_FORMAT,
+                                    pax_headers={"comment": "see /home/alice/glob"}))
+g = io.BytesIO()
+with gzip.GzipFile(filename="MYHOST-backup.tar", mode="wb", fileobj=g, mtime=0) as f:
+    f.write(tbytes([(tarfile.TarInfo("h.txt"), b"x\n")]))
+open("named.tar.gz", "wb").write(g.getvalue())
+PY
+  git add names.tar certs.zip count.zip type.tar long.zip meta.zip c.gz owner.tar glob.tar named.tar.gz
+  rc_file 'pattern MYHOST'
+  commit init
+  assert_exit 1 "$BIN" --archives
+  assert_contains "names.tar!MYHOST/$(masked "$gh"):0: [MYHOST] MYHOST/$(masked "$gh")" "$LC_OUT"
+  assert_contains "names.tar!MYHOST/$(masked "$gh"):0: [credential:github-token] $(masked "$gh")" "$LC_OUT"
+  assert_contains "certs.zip!certs/client.p12:0: [credential:pkcs12-file] certs/client.p12" "$LC_OUT"
+  assert_contains "count.zip!two.txt:1: $H see /home/alice/two" "$LC_OUT"
+  assert_contains "type.tar!u.dat:1: $H see /home/alice/typeu" "$LC_OUT"
+  assert_not_contains "alice/tail" "$LC_OUT"
+  assert_contains "meta.zip:0: $H (comment) built in /home/alice/meta1" "$LC_OUT"
+  assert_contains "meta.zip!e.txt:0: $H (comment) see /home/alice/meta2" "$LC_OUT"
+  assert_contains "c.gz:0: $H (comment) see /home/alice/gzc" "$LC_OUT"
+  assert_contains "owner.tar!f.txt:0: [MYHOST] (owner) MYHOST:" "$LC_OUT"
+  assert_contains "owner.tar!f.txt:0: $H (pax) comment=see /home/alice/pax" "$LC_OUT"
+  assert_contains "glob.tar:0: $H (pax) comment=see /home/alice/glob" "$LC_OUT"
+  assert_contains "named.tar.gz:0: [MYHOST] (name) MYHOST-backup.tar" "$LC_OUT"
+  assert_not_contains "$gh" "$LC_OUT"
+  assert_not_contains "$gh" "$LC_ERR"
+  assert_contains "1 not read)" "$LC_ERR"
+  assert_exit 1 "$BIN" --archives --strict --json
+  assert_not_contains "$gh" "$LC_OUT"
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+u = [(h["file"], h["text"]) for h in d["hits"] if h["pattern"] == "unscanned:archive"]
+assert u == [("long.zip!long.txt", "(archive member not read: not read whole)")], u
+' "$LC_OUT"
+  # --redact hides a tell found in a member's name wherever a path prints.
+  assert_exit 1 "$BIN" --archives --redact
+  assert_not_contains "MYHOST" "$LC_OUT"
+  assert_not_contains "$gh" "$LC_OUT"
+}
+
 t_archives_read_members() {
   # Stage E (v0.28.0): --archives reads tracked zip, tar and gzip files by
   # their first bytes, with bash and git alone: a deflated member, a stored
@@ -5301,6 +5391,7 @@ lc_test "--dir: every file under a directory"   t_dir_scans_every_file
 lc_test "--stdin"                               t_stdin_scans_input
 lc_test "--decode: base64, hex, percent"        t_decode_finds_encoded_values
 lc_test "--archives: zip, tar, gzip"            t_archives_read_members
+lc_test "--archives: what they publish"       t_archives_read_what_they_publish
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential

@@ -121,7 +121,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.29.0"
+VERSION="0.29.1"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -2095,6 +2095,9 @@ H_FILE=()
 H_LINE=()
 H_TEXT=()
 H_SRC=()
+# A hit on a name that is no path of the tree (an archive member's): a name
+# hit as a path's is, though its file and text differ.
+declare -A H_NAME=()
 H_COMMIT=()
 declare -A HIT_AT=()
 add_hit() { # pattern file line text source [commit]
@@ -2215,6 +2218,7 @@ AR_NPATH=()
 AR_NSUBJ=()
 AR_NTEXT=()
 AR_NSRC=()
+AR_NNAME=()
 AR_UPATH=()
 AR_UWHY=()
 AR_USRC=()
@@ -2286,34 +2290,57 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
     done
     return 1
   }
+  # A write that fails (a full disk) is a scan error: these functions run
+  # where errexit is off (`ar_one … || rc=$?`), and a member written short
+  # would be scanned short.
+  ar_wfail() { die "scan error: cannot write a member of $AR_LABEL"; }
+  ar_put() { # view1 view2: a piece's bytes to fd 6
+    local LC_ALL=C s1=$1 s2=$2 f pre i=0 j bs='\\' pc='%%' nul='\000'
+    # A NUL is Z in view 1 and Y in view 2. Without one, view 1 is the
+    # bytes; when every Z (or every Y) is one, a format prints them, as
+    # \000: printf reads three octal digits at most, so a digit after it is
+    # its own, where \0000 printed a 0 after each NUL. Else smaller pieces: a
+    # loop per NUL over a piece of 4096 cost 18 s a MiB of zeros (/qaa).
+    if [[ "$s1" != *Z* || "$s2" != *Y* ]]; then printf '%s' "$s1" >&6 || ar_wfail; return 0; fi
+    if [[ "$s2" != *Z* ]]; then
+      f=${s1//\\/"$bs"}; f=${f//%/"$pc"}; printf -- "${f//Z/"$nul"}" >&6 || ar_wfail; return 0
+    fi
+    if [[ "$s1" != *Y* ]]; then
+      f=${s2//\\/"$bs"}; f=${f//%/"$pc"}; printf -- "${f//Y/"$nul"}" >&6 || ar_wfail; return 0
+    fi
+    if (( ${#s1} > 64 )); then
+      for (( j = 0; j < ${#s1}; j += 64 )); do ar_put "${s1:j:64}" "${s2:j:64}"; done
+      return 0
+    fi
+    while [[ "$s1" == *Z* ]]; do
+      pre=${s1%%Z*}; i=$(( i + ${#pre} ))
+      printf '%s' "$pre" >&6 || ar_wfail
+      if [[ "${s2:i:1}" == Y ]]; then printf '\0' >&6 || ar_wfail; else printf Z >&6 || ar_wfail; fi
+      i=$(( i + 1 )); s1=${s1#*Z}
+    done
+    printf '%s' "$s1" >&6 || ar_wfail
+  }
   ar_copy() { # n: the next n bytes, exactly, to fd 6
-    local LC_ALL=C n=$1 k c1 c2 pre i
+    local LC_ALL=C n=$1 k c1 c2
     while (( n > 0 )); do
       k=$(( n > 4096 ? 4096 : n ))
       IFS= read -r -d '' -N "$k" c1 <&7 || :
       IFS= read -r -d '' -N "$k" c2 <&8 || :
       (( ${#c1} == k && ${#c2} == k )) || return 1
-      i=0
-      while [[ "$c1" == *Z* ]]; do
-        pre=${c1%%Z*}; i=$(( i + ${#pre} ))
-        printf '%s' "$pre" >&6
-        if [[ "${c2:i:1}" == Y ]]; then printf '\0' >&6; else printf Z >&6; fi
-        i=$(( i + 1 )); c1=${c1#*Z}
-      done
-      printf '%s' "$c1" >&6
+      ar_put "$c1" "$c2"
       n=$(( n - k )); AR_POS=$(( AR_POS + k ))
     done
   }
   ar_fsize() { # file -> REPLY: its size
     local LC_ALL=C c n=0
-    tr '\0' Z < "$1" > "$TMPD/fsz" 2> "$TMPD/err" || return 1
+    tr '\0' Z < "$1" > "$TMPD/fsz" 2> "$TMPD/err" || fail_err "leakcheck: scan error: cannot read a member of $AR_LABEL"
     exec 9< "$TMPD/fsz"
     while IFS= read -r -d '' -N 65536 c <&9; do n=$(( n + ${#c} )); done
     exec 9<&-
     REPLY=$(( n + ${#c} ))
   }
   ar_store() { # n: the next n bytes, as member $AR_K
-    exec 6> "$TMPD/ar/$AR_K"
+    exec 6> "$TMPD/ar/$AR_K" || ar_wfail
     if ! ar_copy "$1"; then exec 6>&-; return 1; fi
     exec 6>&-
   }
@@ -2321,22 +2348,23 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
     local hx
     printf -v hx '\\x00\\x%02x\\x%02x\\x%02x\\x%02x' $(( $1 & 255 )) $(( $1 >> 8 )) \
       $(( ~$1 & 255 )) $(( (~$1 >> 8) & 255 ))
-    printf "$hx" >&6
+    printf "$hx" >&6 || ar_wfail
   }
   ar_lines() { # n: n line breaks to fd 6
     local n=$1
-    while (( n > 4096 )); do printf '%s' "$AR_NL4K" >&6; n=$(( n - 4096 )); done
-    printf '%s' "${AR_NL4K:0:n}" >&6
+    while (( n > 4096 )); do printf '%s' "$AR_NL4K" >&6 || ar_wfail; n=$(( n - 4096 )); done
+    printf '%s' "${AR_NL4K:0:n}" >&6 || ar_wfail
   }
-  ar_inflate() { # csize usize out: the next csize bytes (raw deflate) inflated to out
-    local p=$(( 65536 - $2 % 65536 )) hdr left blk rc=0
+  ar_inflated() { # csize usize p: the next csize bytes inflated by git after
+    # p line breaks; REPLY the size of what git printed, in $TMPD/arout
+    local p=$3 hdr left blk rc=0
     hdr="blob $(( p + $2 ))"
-    exec 6> "$AR_OBJ"
-    printf '\x78\x01' >&6
+    exec 6> "$AR_OBJ" || ar_wfail
+    printf '\x78\x01' >&6 || ar_wfail
     left=$(( ${#hdr} + 1 + p ))
     blk=$(( left > 65535 ? 65535 : left ))
     ar_block "$blk"
-    printf '%s\0' "$hdr" >&6
+    printf '%s\0' "$hdr" >&6 || ar_wfail
     ar_lines $(( blk - ${#hdr} - 1 ))
     left=$(( left - blk ))
     while (( left > 0 )); do
@@ -2353,9 +2381,22 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
     if (( rc != 0 )); then
       [[ $rc -eq 128 && "$(< "$TMPD/err")" == "fatal: unable to stream $AR_OID to stdout" ]] || return 1
     fi
-    ar_fsize "$TMPD/arout" || return 1
+    ar_fsize "$TMPD/arout"
+  }
+  ar_inflate() { # csize usize out: the next csize bytes (raw deflate) inflated to out
+    local start=$AR_POS p=$(( 65536 - $2 % 65536 ))
+    # git prints whole buffers of 16 KiB, and the last one, cut short by the
+    # missing checksum, never: padded to a whole number of them, the member
+    # prints whole. That alone passed a member holding up to 16 KiB more
+    # than its stated size, cut there (/qaa). So a first pass pads one byte
+    # short of a buffer: one byte more fills it, and git prints it.
+    ar_inflated "$1" "$2" $(( p + 16383 )) || return 1
     (( REPLY == p + $2 )) || return 1
-    LC_ALL=C sed "1,${p}d" "$TMPD/arout" > "$3" 2> "$TMPD/err"
+    ar_goto "$start"
+    ar_inflated "$1" "$2" "$p" || return 1
+    (( REPLY == p + $2 )) || return 1
+    LC_ALL=C sed "1,${p}d" "$TMPD/arout" > "$3" 2> "$TMPD/err" ||
+      fail_err "leakcheck: scan error: cannot write a member of $AR_LABEL"
   }
   ar_add() { # name: member $AR_K is label!name
     AR_PATH[AR_K]="$AR_LABEL!$1"; AR_SRC[AR_K]=$AR_CSRC
@@ -2363,14 +2404,26 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
   }
   ar_name() { # name [target]: a name, or a link's target, for the name pass
     AR_NPATH+=("$AR_LABEL!$1"); AR_NSRC+=("$AR_CSRC")
-    if [[ $# -gt 1 ]]; then AR_NSUBJ+=("$2"); AR_NTEXT+=("-> $2"); else AR_NSUBJ+=("$1"); AR_NTEXT+=("$1"); fi
+    if [[ $# -gt 1 ]]; then
+      AR_NSUBJ+=("$2"); AR_NTEXT+=("-> $2"); AR_NNAME+=(0)
+    else
+      AR_NSUBJ+=("$1"); AR_NTEXT+=("$1"); AR_NNAME+=(1)
+    fi
+  }
+  # Metadata an archive publishes beside its members — comments, a tar
+  # entry's owner, pax records — for the name pass, as `(kind) text`: a
+  # member's when one is named, else the archive's (/qaa: none was read).
+  ar_meta() { # member kind text
+    [[ -n "$3" ]] || return 0
+    if [[ -n "$1" ]]; then AR_NPATH+=("$AR_LABEL!$1"); else AR_NPATH+=("$AR_LABEL"); fi
+    AR_NSRC+=("$AR_CSRC"); AR_NSUBJ+=("$3"); AR_NTEXT+=("($2) $3"); AR_NNAME+=(0)
   }
   ar_unread() { # name why
     AR_UPATH+=("$AR_LABEL!$1"); AR_UWHY+=("$2"); AR_USRC+=("$AR_CSRC")
   }
   ar_zip() { # 1 if the archive is not read
     local LC_ALL=C tl e n cds cdo i k nl xl cl name
-    local -a zn=() zf=() zm=() zc=() zu=() zo=()
+    local -a zn=() zf=() zm=() zc=() zu=() zo=() zk=()
     (( AR_SIZE >= 22 )) || return 1
     tl=$(( AR_SIZE < 65557 ? AR_SIZE : 65557 ))
     ar_goto $(( AR_SIZE - tl ))
@@ -2384,12 +2437,17 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
     ar_le 10 2; n=$REPLY
     ar_le 12 4; cds=$REPLY
     ar_le 16 4; cdo=$REPLY
+    ar_le 20 2
+    ar_meta "" comment "${R1:e+22:REPLY}"
     # Zip64 (a count or an offset saturated) is not read.
     (( n < 65535 && cds < 4294967295 && cdo < 4294967295 && cdo + cds <= AR_SIZE )) || return 1
     ar_goto "$cdo"
     ar_read "$cds" || return 1
+    # The directory is walked to its end, not to the count: a count written
+    # modulo 65536, or one entry short, hid every entry past it (/qaa).
     i=0
-    for (( k = 0; k < n; k++ )); do
+    while (( i < cds )); do
+      (( i + 46 <= cds )) || return 1
       B1=${R1:i:46}; B2=${R2:i:46}
       [[ "${B1:0:4}" == PK$'\1\2' ]] || return 1
       ar_le 8 2; zf+=("$REPLY")
@@ -2400,13 +2458,15 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
       ar_le 30 2; xl=$REPLY
       ar_le 32 2; cl=$REPLY
       ar_le 42 4; zo+=("$REPLY")
+      (( i + 46 + nl + xl + cl <= cds )) || return 1
       zn+=("${R1:i+46:nl}")
+      zk+=("${R1:i+46+nl+xl:cl}")
       i=$(( i + 46 + nl + xl + cl ))
     done
-    (( i <= cds )) || return 1
     for k in "${!zn[@]}"; do
       name=${zn[k]}
       ar_name "$name"
+      ar_meta "$name" comment "${zk[k]}"
       [[ "$name" != */ ]] || continue
       if (( zf[k] & 1 )); then ar_unread "$name" "encrypted"; continue; fi
       if (( zm[k] != 0 && zm[k] != 8 )); then ar_unread "$name" "compression method ${zm[k]}"; continue; fi
@@ -2426,7 +2486,8 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
     done
   }
   ar_tar() { # 1 if the archive is not read
-    local LC_ALL=C pos=0 size typ name long="" llink="" rec kv len
+    local LC_ALL=C pos=0 size typ name long="" llink="" rec kv len own grp
+    local -a pmeta=()
     while (( pos + 512 <= AR_SIZE )); do
       ar_goto "$pos"
       ar_read 512 || return 1
@@ -2445,7 +2506,8 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
       if [[ -n "$long" ]]; then name=$long; long=""; fi
       pos=$(( pos + 512 + (size + 511) / 512 * 512 ))
       case "$typ" in
-        x) # pax: a path or a link's target for the next entry
+        x|g) # pax: a path or a link's target for the next entry (x), and
+          # every other record, metadata for that entry or the archive
           ar_read "$size" || return 1
           rec=$R1
           while [[ "$rec" =~ ^([0-9]+)\  ]]; do
@@ -2453,28 +2515,40 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
             (( len > ${#BASH_REMATCH[0]} && len <= ${#rec} )) || return 1
             kv=${rec:${#BASH_REMATCH[0]}:len - ${#BASH_REMATCH[0]} - 1}
             rec=${rec:len}
+            if [[ "$typ" == g ]]; then ar_meta "" pax "$kv"; continue; fi
             case "$kv" in
               path=*) long=${kv#path=} ;;
               linkpath=*) llink=${kv#linkpath=} ;;
+              *) pmeta+=("$kv") ;;
             esac
           done ;;
-        g) ;;
         L|K) # GNU: a long name, or a long link target, for the next entry
           ar_read "$size" || return 1
           B1=$R1; B2=$R2
           ar_cstr 0 "$size"
           if [[ "$typ" == L ]]; then long=$REPLY; else llink=$REPLY; fi ;;
-        0|7)
-          ar_name "$name"
-          if (( size > AR_MAX )); then ar_unread "$name" "too large"
-          elif ar_store "$size"; then ar_add "$name"
-          else return 1; fi ;;
-        1|2)
-          ar_cstr 157 100
-          ar_name "$name"
-          ar_name "$name" "${llink:-$REPLY}"
-          llink="" ;;
-        *) ar_name "$name" ;;
+        *)
+          if [[ "$typ" == [12] ]]; then
+            ar_cstr 157 100
+            ar_name "$name"
+            ar_name "$name" "${llink:-$REPLY}"
+            llink=""
+          else
+            ar_name "$name"
+          fi
+          ar_cstr 265 32; own=$REPLY
+          ar_cstr 297 32; grp=$REPLY
+          if [[ -n "$own$grp" ]]; then ar_meta "$name" owner "$own:$grp"; fi
+          for kv in "${pmeta[@]}"; do ar_meta "$name" pax "$kv"; done
+          pmeta=()
+          # A file's data, and any other type's that has some: GNU tar
+          # extracts an unknown type as a file, and data skipped under one
+          # was a member neither read nor counted (/qaa).
+          if [[ "$typ" == [07] ]] || (( size > 0 )); then
+            if (( size > AR_MAX )); then ar_unread "$name" "too large"
+            elif ar_store "$size"; then ar_add "$name"
+            else return 1; fi
+          fi ;;
       esac
     done
   }
@@ -2492,7 +2566,7 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
       ar_goto $(( AR_POS + REPLY ))
     fi
     if (( flg & 8 )); then ar_zstr || return 1; name=$REPLY; fi
-    if (( flg & 16 )); then ar_zstr || return 1; fi
+    if (( flg & 16 )); then ar_zstr || return 1; ar_meta "" comment "$REPLY"; fi
     if (( flg & 2 )); then ar_goto $(( AR_POS + 2 )); fi
     off=$AR_POS
     (( off + 8 <= AR_SIZE )) || return 1
@@ -2504,6 +2578,8 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
     ar_inflate $(( AR_SIZE - 8 - off )) "$isize" "$TMPD/argz" || return 1
     ar_sniff "$TMPD/argz"
     if [[ "${AR_HEAD:257:5}" == ustar ]]; then
+      # The name it was compressed under names no member here.
+      ar_meta "" name "$name"
       ar_views "$TMPD/argz" "$AR_LABEL"
       ar_tar
       return
@@ -2726,23 +2802,25 @@ S_PATH=()
 S_SUBJ=()
 S_TEXT=()
 S_SRC=()
+S_NAME=()   # 1: a name, which the path rules read and a hit on is a name hit
 for path in "${PATHS[@]}"; do
-  S_PATH+=("$path"); S_SUBJ+=("$path"); S_TEXT+=("$path"); S_SRC+=("index")
+  S_PATH+=("$path"); S_SUBJ+=("$path"); S_TEXT+=("$path"); S_SRC+=("index"); S_NAME+=(1)
 done
 for i in "${!LINK_PATHS[@]}"; do
   if ! tgt="$(git cat-file blob "${LINK_OIDS[$i]}" 2>"$TMPD/err")"; then
     fail_err "leakcheck: scan error: cannot read symlink ${LINK_PATHS[$i]}"
   fi
-  S_PATH+=("${LINK_PATHS[$i]}"); S_SUBJ+=("$tgt"); S_TEXT+=("-> $tgt"); S_SRC+=("index")
+  S_PATH+=("${LINK_PATHS[$i]}"); S_SUBJ+=("$tgt"); S_TEXT+=("-> $tgt"); S_SRC+=("index"); S_NAME+=(0)
 done
 for path in "${PATHS[@]}"; do
   [[ -L "$path" ]] || continue
   tgt="$(readlink -- "$path")" || die "scan error: cannot read symlink $path"
-  S_PATH+=("$path"); S_SUBJ+=("$tgt"); S_TEXT+=("-> $tgt"); S_SRC+=("worktree")
+  S_PATH+=("$path"); S_SUBJ+=("$tgt"); S_TEXT+=("-> $tgt"); S_SRC+=("worktree"); S_NAME+=(0)
 done
-# --archives: every member's name, and a link member's target.
+# --archives: every member's name, a link member's target, and metadata.
 for i in "${!AR_NPATH[@]}"; do
   S_PATH+=("${AR_NPATH[$i]}"); S_SUBJ+=("${AR_NSUBJ[$i]}"); S_TEXT+=("${AR_NTEXT[$i]}"); S_SRC+=("${AR_NSRC[$i]}")
+  S_NAME+=("${AR_NNAME[$i]}")
 done
 
 SUBJ_OF_LINE=()
@@ -2768,11 +2846,14 @@ for p in "${PASS_PATS[@]}"; do
   while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
     i="${SUBJ_OF_LINE[$l]:-}"
     [[ -n "$i" ]] || die "internal error: names pass returned line $l"
+    n0=${#H_FILE[@]}
     add_hit "$p" "${S_PATH[$i]}" 0 "${S_TEXT[$i]}" "${S_SRC[$i]}"
+    if (( ${#H_FILE[@]} > n0 )) && [[ "${S_NAME[$i]}" == 1 ]]; then H_NAME[$n0]=1; fi
   done < "$TMPD/shits"
 done
-# The path rules, over the path names alone: the first ${#PATHS[@]}
-# subjects. A symlink's target names a file the link does not publish.
+# The path rules, over the names alone: a path's or an archive member's
+# (which the cut at the tree's paths left out, /qaa). A symlink's target
+# names a file the link does not publish.
 for p in "${PATH_PATS[@]}"; do
   pat_args "$p"
   run_git "pattern '$p' (names)" "$TMPD/shits" \
@@ -2780,9 +2861,11 @@ for p in "${PATH_PATS[@]}"; do
   while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
     i="${SUBJ_OF_LINE[$l]:-}"
     [[ -n "$i" ]] || die "internal error: names pass returned line $l"
-    [[ $i -lt ${#PATHS[@]} ]] || continue
+    [[ "${S_NAME[$i]}" == 1 ]] || continue
     [[ "${SUBJ_OF_LINE[$((l + 1))]:-}" != "$i" ]] || continue
+    n0=${#H_FILE[@]}
     add_hit "$p" "${S_PATH[$i]}" 0 "${S_TEXT[$i]}" "${S_SRC[$i]}"
+    if (( ${#H_FILE[@]} > n0 )); then H_NAME[$n0]=1; fi
   done < "$TMPD/shits"
 done
 
@@ -3615,7 +3698,7 @@ cred_show() {
 # path), a ref name or a tag name; an --strict hit on a ref leads with it.
 is_name_hit() { # hit
   [[ "${H_LINE[$1]}" == 0 ]] || return 1
-  [[ "${H_FILE[$1]}" == "${H_TEXT[$1]}" || "${H_FILE[$1]}" == "(ref)" || "${H_FILE[$1]}" == "(tag)" ]]
+  [[ -n "${H_NAME[$1]+x}" || "${H_FILE[$1]}" == "${H_TEXT[$1]}" || "${H_FILE[$1]}" == "(ref)" || "${H_FILE[$1]}" == "(tag)" ]]
 }
 
 # Credentials in names, from the name hits; mask_names <string> -> REPLY.
