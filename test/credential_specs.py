@@ -154,6 +154,7 @@ SPECS = {
  "xml-key-value": ("", ['<add key="ClearText', 'Password" value="', ("an", 16), ("d", 1), ("a", 1)]),
  "generic-key": ("", ["ke", "y = \"", ("an", 30), ("d", 1), ("a", 1)]),
  "sidekiq-credentials": ("", ["bundle config --local gems.contrib", "sys.com ", ("hex", 7), "c", ":", ("hex", 6), "b", ("d", 1)]),
+ "service-secret": ("", ["data", "dog: ", ("an", 30), ("d", 1), ("a", 1)]),
  "jfrog-token": ("KEY=", ["AK", "Cp", ("an", 69)]),
  "authress-key": ("KEY=", ["sc", "_", ("an", 12), ".", ("an", 5), ".acc", "_", ("lan", 20), ".", ("an-_", 60)]),
  "maxmind-license-key": ("KEY=", [("an", 6), "_", ("an", 29), "_mm", "k"]),

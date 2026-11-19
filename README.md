@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.19.0*
+*README v0.20.0*
 
 ## Install
 
@@ -111,7 +111,7 @@ Built-in rules also find keys and tokens in the formats their issuers fixed, by 
 - PKCS #12 key bundles, by their file names alone (`.p12`, `.pfx`, any case): their content is binary, so a tracked name is the only tell, and the rule runs over tracked path names and nothing else;
 - keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana (legacy API keys too), Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare (API tokens and origin CA keys), CircleCI, Sourcegraph, Docker Swarm (join tokens and unlock keys), Mapbox, Authress, MaxMind (license keys), OpenShift, SettleMint, Scalingo, Harness, Adobe (OAuth client secrets), Infracost and Prefect.
 
-Keyword rules find keys with no prefix of their own too, by the name they are assigned to and how random they are: AWS secret access keys, passwords in URLs, HTTP `Authorization` headers, curl's `-u user:password`, Sidekiq Pro and Enterprise credentials, and values assigned to a name such as `password`, `secret`, `token` or `api_key` ([Keyword rules](#keyword-rules)).
+Keyword rules find keys with no prefix of their own too, by the name they are assigned to and how random they are: AWS secret access keys, passwords in URLs, HTTP `Authorization` headers, curl's `-u user:password`, Sidekiq Pro and Enterprise credentials, values assigned to a service's name, and values assigned to a name such as `password`, `secret`, `token` or `api_key` ([Keyword rules](#keyword-rules)).
 
 A key or webhook URL is found with its slashes JSON-escaped, `\/`, as PHP's `json_encode` and others write them.
 A key is found inside a longer run of characters too, with one exception: a DeepSeek key, `sk-` and 32 hex digits, is also how generated names end (`task-…`, `desk-…`), so it is not found right after a lowercase letter.
@@ -162,7 +162,7 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
 
 ### Keyword rules
 
-Nine rules find a secret that has no prefix of its own by the name it is assigned to and how random it is:
+Ten rules find a secret that has no prefix of its own by the name it is assigned to and how random it is:
 
 - `aws-secret-access-key`: 40 characters assigned to `aws_secret_access_key`, in any case, with `_`, `-`, `.` or nothing between the words;
 - `url-password`: the password in a URL's user part, `postgres://app:…@db` (with its slashes JSON-escaped too);
@@ -172,7 +172,8 @@ Nine rules find a secret that has no prefix of its own by the name it is assigne
 - `curl-user-password`: the password in curl's `-u user:password`, `--user` or `--proxy-user`, on the line that runs curl;
 - `xml-key-value`: an XML setting whose key holds one of the generic rule's words, `<add key="ClearTextPassword" value="…"/>` as NuGet and .NET write them;
 - `sidekiq-credentials`: Sidekiq Pro and Enterprise's `user:password` for the gem server, in `BUNDLE_GEMS__CONTRIBSYS__COM` (or the Enterprise one) or `bundle config gems.contribsys.com`, at 1 bit a character (the URL form is `url-password`'s);
-- `generic-key`: the same as `generic-secret` for the weaker names `key`, `auth`, `access`, `creds` and `api` (`SIGNING_KEY`, `"key":`, `AUTH=`), where a value made of words is weak too (below); it yields to every other rule, `generic-secret` included.
+- `service-secret`: 12 to 100 characters assigned to a name that starts with a service's name — the providers GitHub's secret scanning lists (`HEROKU=…`, `"datadog": "…"`, `MAILGUN_SIGNING=…`) — at 3 bits a character and judged for words; weak when the name holds an identifier's word (`_ID`, `_SID`, `_URL`, `_HOST`, `_REGION`, `_SHA`, `_PRICE`, `_APP`, `_TENANT`, …), which a service hands out beside the secret; it yields to every other rule;
+- `generic-key`: the same as `generic-secret` for the weaker names `key`, `auth`, `access`, `creds` and `api` (`SIGNING_KEY`, `"key":`, `AUTH=`), where a value made of words is weak too (below); it yields to every other rule but `service-secret`, `generic-secret` included.
 
 The header may be written as a request, a config or code writes it: `Authorization: …`, `"Authorization": "…"`, `'Authorization' => '…'`, `Header.Set("Authorization", "…")`, or nginx's `Authorization "…"`.
 
@@ -189,11 +190,11 @@ leakcheck: 2 credential(s) among these: revoke and reissue any that has left thi
 ```
 
 - **The value is judged, and a weak one is counted, not reported.**
-  Weak is a stand-in's shape (as above), or too little entropy — 3.5 bits per character for the generic rules, 4 for an AWS key, 1 for Sidekiq's machine-made passwords, 3 for the others — or, for every rule but the AWS one, no digit or no letter, a word people write into stand-ins (`example`, `changeme`, `your`, `test`, `xxxx`, …), a dotted name (`settings.SECRET_KEY`, though not one with a part of 16 or more characters mixing upper case, lower case and digits, as a token's parts do) or an environment variable's name (`MY_API_TOKEN`); and for `generic-key`, a value of two or more parts split at `-_./:~@+` that are each a word, a number, or a letter and a number — a slug, a path, a cache key, a file name (`cache-v1-node-modules`, `~/.ssh/id_ed25519`, `tenants/t1/media`).
+  Weak is a stand-in's shape (as above), or too little entropy — 3.5 bits per character for the generic rules, 4 for an AWS key, 1 for Sidekiq's machine-made passwords, 3 for the others — or, for every rule but the AWS one, no digit or no letter, a word people write into stand-ins (`example`, `changeme`, `your`, `test`, `xxxx`, …), a dotted name (`settings.SECRET_KEY`, though not one with a part of 16 or more characters mixing upper case, lower case and digits, as a token's parts do) or an environment variable's name (`MY_API_TOKEN`); and for `generic-key` and `service-secret`, a value of two or more parts split at `-_./:~@+` that are each a word, a number, or a letter and a number — a slug, a path, a cache key, a file name (`cache-v1-node-modules`, `~/.ssh/id_ed25519`, `tenants/t1/media`).
   The summary counts these apart from the stand-ins, at the end of its line (`1 weak keyword values not reported`, above: `TOKEN = "your-token-here-…"`), and `--json` adds `"weak"` to `credentials`.
   So a password shorter than 12 characters, or one made of words, is not found; nor is a value a template fills in (`${DB_PASSWORD}`, `os.environ[…]`, `Bearer $TOKEN`, `-u "$USER:$PASS"`), which is no secret.
 - **A key a fixed-format rule finds is that rule's.**
-  `GITHUB_TOKEN=ghp_…` is reported once, as `github-token`, and set aside or excused by that rule alone; a URL whose password, or a header whose credential, is such a key is that rule's too, and the generic rule yields to the other keyword rules as well.
+  `GITHUB_TOKEN=ghp_…` is reported once, as `github-token`, and set aside or excused by that rule alone; a URL whose password, or a header whose credential, is such a key is that rule's too, and the generic rules yield to the other keyword rules as well, while `service-secret` yields to every rule, the generic ones included.
   So is a value that runs into such a key where the key sits; a separate value that only opens with the same characters is reported on its own.
   With the fixed-format rule disabled, the keyword rule reports the key itself.
 - **Where a keyword rule's match prints in an allow rule or an error, it is masked with its keyword**, since the first four characters a masked run shows would otherwise be the value's.

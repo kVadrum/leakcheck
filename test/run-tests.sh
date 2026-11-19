@@ -1903,7 +1903,7 @@ import json, re, sys
 doc = json.load(open(sys.argv[1]))
 kv = {"aws-secret-access-key", "url-password", "generic-secret", "http-basic-auth",
       "http-bearer-token", "curl-user-password", "xml-key-value", "generic-key",
-      "sidekiq-credentials"}
+      "sidekiq-credentials", "service-secret"}
 def shown(cid, m):
     if cid in markers:
         return m
@@ -3693,6 +3693,62 @@ t_credential_issuer_sourced_near_misses_are_clean() {
   assert_exit 0 "$BIN"
 }
 
+t_kv_service_names() {
+  # gap 2 (v0.20.0): service-secret finds a secret under a service's name
+  # alone (`HEROKU=`, `"datadog":`), at 3 bits a character, so a 32-hex key
+  # generic-secret's 3.5 bits sets aside a fifth of the time is found. It
+  # yields to every other rule; a name holding an identifier's word
+  # (`_ACCOUNT_ID`, `_SHA`, `PriceId`, `_TENANT`, `_APP`) makes the value
+  # weak, as do word parts (`orderEvents-v2-handler`); and the service's
+  # name must start a name: `xheroku` is no match. The `pagerduty` value is
+  # hex drawn until it falls between 3 and 3.5 bits a character.
+  local vt="$PWD/.git/svc.tsv"
+  python3 -I - "$vt" <<'PY'
+import collections, math, random, sys, uuid
+r = random.Random(73)
+def H(s):
+    c = collections.Counter(s)
+    return -sum(k / len(s) * math.log2(k / len(s)) for k in c.values())
+an = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz"
+hx = lambda n: "".join(r.choice("0123456789abcdef") for _ in range(n - 2)) + "7c"
+def val(n):
+    return "".join(r.choice(an) for _ in range(n - 2)) + str(r.randint(2, 9)) + "q"
+u = str(uuid.UUID(int=r.getrandbits(128), version=4))
+rows = [("service-secret", "HEROKU=" + u, "HEROKU[redacted, 36 chars]", u)]
+v = hx(32); rows.append(("service-secret", '  "datadog": "%s",' % v, "datadog[redacted, 32 chars]", v))
+v = val(28); rows.append(("service-secret", "mailgun_signing = '%s'" % v, "mailgun[redacted, 28 chars]", v))
+v = val(34); rows.append(("service-secret", "export TWILIO_PRIMARY=%s" % v, "TWILIO[redacted, 34 chars]", v))
+v = val(26); rows.append(("generic-secret", "DATADOG_API_KEY=%s" % v, "API_KEY[redacted, 26 chars]", v))
+v = val(30); rows.append(("generic-key", "SENTRY_KEY=%s" % v, "KEY[redacted, 30 chars]", v))
+v = next(w for w in (hx(32) for _ in range(5000)) if 3.05 < H(w) < 3.4)
+rows.append(("service-secret", '  "pagerduty": "%s",' % v, "pagerduty[redacted, 32 chars]", v))
+weak = ["CLOUDFLARE_ACCOUNT_ID=" + hx(32), "GITHUB_SHA=" + hx(40), "stripePriceId: 'price_" + val(24) + "'",
+        "HEROKU_APP=shop-api-prod-2024", "AZURE_TENANT=" + str(uuid.UUID(int=r.getrandbits(128), version=4)),
+        "SENDGRID_WEBHOOK=orderEvents-v2-handler"]
+none = ["xheroku = '" + val(30) + "'"]
+with open(sys.argv[1], "w") as f:
+    for row in rows:
+        f.write("\t".join(row) + "\n")
+with open(sys.argv[1] + ".weak", "w") as f:
+    f.write("\n".join(weak + none) + "\n")
+PY
+  { cut -f2 "$vt"; cat "$vt.weak"; } > svc.txt
+  git add svc.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "$vt" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
+got = sorted((h["line"], h["pattern"], h["text"]) for h in doc["hits"])
+want = sorted((n + 1, "credential:" + cid, shown) for n, (cid, _, shown, _) in enumerate(rows))
+assert got == want, (got, want)
+assert doc["credentials"]["weak"] == 6, doc["credentials"]
+PY
+  while IFS=$'\t' read -r _ _ _ v; do assert_not_contains "$v" "$LC_OUT"; done < "$vt"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -4387,6 +4443,7 @@ lc_test "keyword rules: HTTP authentication"     t_kv_http_auth_rules
 lc_test "keyword rules: the weaker names"       t_kv_generic_key_names
 lc_test "credentials: issuer-sourced, v0.19.0"   t_credential_issuer_sourced_v019
 lc_test "credentials: v0.19.0 near misses clean" t_credential_issuer_sourced_near_misses_are_clean
+lc_test "keyword rules: a service's name"       t_kv_service_names
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
