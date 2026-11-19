@@ -115,7 +115,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.25.0"
+VERSION="0.25.1"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -820,15 +820,24 @@ kv_namestop() {
 # rule's names are weak, and its stand-ins are words (measured, v0.18.0).
 KV_WORD_RE='^([A-Za-z]|[0-9]{1,6}|[A-Za-z][0-9]{1,6}|([A-Z]?[a-z]{2,}|[A-Z]{2,})+([0-9]{1,6}([A-Z]?[a-z]{2,}|[A-Z]{2,})+)*[0-9]{0,6})$'
 kv_wordparts() {
-  local LC_ALL=C p n=0
+  local LC_ALL=C p n=0 hump=0 v=$1
   local -a parts=()
-  IFS='-_./:~@+' read -r -a parts <<< "$1"
+  # A TypeScript non-null read (`signer!.privatePkcs8`) is a property
+  # access: its parts are the names it reads (v0.25.1). `?.` needs no such
+  # reading: `?` ends a value.
+  v=${v//\!./.}
+  IFS='-_./:~@+' read -r -a parts <<< "$v"
   for p in "${parts[@]}"; do
     [[ -n "$p" ]] || continue
     [[ "$p" =~ $KV_WORD_RE ]] || return 1
+    if [[ "$p" =~ [a-z][A-Z] ]]; then hump=1; fi
     n=$(( n + 1 ))
   done
-  (( n >= 2 ))
+  # Two parts, or one camel-case name (`createPrivateKey`, `privatePkcs8`):
+  # code, where a random run is almost never camel case throughout, and an
+  # all-lowercase one, with no hump, stays a key (v0.25.1, from four such
+  # names the fleet sweep reported as keys in a test file).
+  (( n >= 2 || hump == 1 ))
 }
 # kv_overlaps <id> <match> <keys, one per line> [text] [cache id]: the
 # match's value and one of the keys hold one another, so it is that key's

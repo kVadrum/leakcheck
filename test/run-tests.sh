@@ -4253,6 +4253,28 @@ t_baseline_errors() {
   assert_exit 2 "$BIN" --write-baseline .git/no/such/dir/base
 }
 
+t_kv_code_identifiers_are_weak() {
+  # v0.25.1: a value under `key` that is code, not a literal — a camel-case
+  # function or variable name (`createPrivateKey(`, `privatePkcs8`), or a
+  # TypeScript non-null read (`signer!.privatePkcs8`) — is weak, as
+  # word parts are: the fleet sweep took four such names in a test file for
+  # keys. A random value still is a key, a lowercase one with digits
+  # included: its runs read as words, but it has no camel case.
+  seed a.ts "    const key = createPrivateKey({ key: signer!.privatePkcs8, format: 'der', type: 'pkcs8' });
+    const priv = createPrivateKey({ key: privatePkcs8, format: 'der', type: 'pkcs8' });"
+  seed b.txt $'key: "Zq7Lm2Xv9Rt4Wp8Ks3Nb"\nkey: qzv7kxmb3trlw9pd'
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert sorted((h["file"], h["line"], h["pattern"]) for h in d["hits"]) == [("b.txt", 1, "credential:generic-key"), ("b.txt", 2, "credential:generic-key")], d["hits"]
+# Two hits weak: line 1 holds two matches (the call and the read), line 2 one.
+assert d["credentials"]["weak"] == 2, d["credentials"]
+PY
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -4952,6 +4974,7 @@ lc_test "keyword rules: the weaker names"       t_kv_generic_key_names
 lc_test "credentials: issuer-sourced, v0.19.0"   t_credential_issuer_sourced_v019
 lc_test "credentials: v0.19.0 near misses clean" t_credential_issuer_sourced_near_misses_are_clean
 lc_test "keyword rules: a service's name"       t_kv_service_names
+lc_test "keyword rules: code is no key"          t_kv_code_identifiers_are_weak
 lc_test "label: a pattern prints its name"       t_label_pattern_prints_its_name
 lc_test "config from the environment"            t_config_from_environment
 lc_test "--redact hides every hit's text"        t_redact_hides_every_hit_text

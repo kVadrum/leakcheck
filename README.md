@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.25.0*
+*README v0.25.1*
 
 ## Install
 
@@ -190,7 +190,7 @@ leakcheck: 2 credential(s) among these: revoke and reissue any that has left thi
 ```
 
 - **The value is judged, and a weak one is counted, not reported.**
-  Weak is a stand-in's shape (as above), or too little entropy — 3.5 bits per character for the generic rules, 4 for an AWS key, 1 for Sidekiq's machine-made passwords, 3 for the others — or, for every rule but the AWS one, no digit or no letter, a word people write into stand-ins (`example`, `changeme`, `your`, `test`, `xxxx`, …), a dotted name (`settings.SECRET_KEY`, though not one with a part of 16 or more characters mixing upper case, lower case and digits, as a token's parts do) or an environment variable's name (`MY_API_TOKEN`); and for `generic-key` and `service-secret`, a value of two or more parts split at `-_./:~@+` that are each a word, a number, or a letter and a number — a slug, a path, a cache key, a file name (`cache-v1-node-modules`, `~/.ssh/id_ed25519`, `tenants/t1/media`).
+  Weak is a stand-in's shape (as above), or too little entropy — 3.5 bits per character for the generic rules, 4 for an AWS key, 1 for Sidekiq's machine-made passwords, 3 for the others — or, for every rule but the AWS one, no digit or no letter, a word people write into stand-ins (`example`, `changeme`, `your`, `test`, `xxxx`, …), a dotted name (`settings.SECRET_KEY`, though not one with a part of 16 or more characters mixing upper case, lower case and digits, as a token's parts do) or an environment variable's name (`MY_API_TOKEN`); and for `generic-key` and `service-secret`, a value of two or more parts split at `-_./:~@+` that are each a word, a number, or a letter and a number — a slug, a path, a cache key, a file name (`cache-v1-node-modules`, `~/.ssh/id_ed25519`, `tenants/t1/media`) — or code: one camel-case name (`createPrivateKey`, `privatePkcs8`), or a property read through TypeScript's `!.` (`signer!.privatePkcs8`).
   The summary counts these apart from the stand-ins, at the end of its line (`1 weak keyword values not reported`, above: `TOKEN = "your-token-here-…"`), and `--json` adds `"weak"` to `credentials`.
   So a password shorter than 12 characters, or one made of words, is not found; nor is a value a template fills in (`${DB_PASSWORD}`, `os.environ[…]`, `Bearer $TOKEN`, `-u "$USER:$PASS"`), which is no secret.
 - **A key a fixed-format rule finds is that rule's.**
