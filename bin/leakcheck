@@ -28,6 +28,8 @@
 #                                # revision range only (origin/main..HEAD)
 #   leakcheck --json             # machine-readable output
 #   leakcheck --format FMT       # text, json (as --json), sarif, csv or junit
+#   leakcheck --write-baseline FILE  # write each finding's fingerprint to FILE
+#   leakcheck --baseline FILE    # report only findings FILE does not hold
 #   leakcheck --redact           # print no hit's text, and no tell in a path
 #   leakcheck --rule ID          # run only this rule (repeatable): a
 #                                # credential:<id> or a config label
@@ -113,7 +115,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.24.0"
+VERSION="0.25.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -127,6 +129,8 @@ REDACT=0
 RULE_ONLY=()
 FORMAT_ARG=""
 JSON_FLAG=0
+BASELINE_IN=""
+BASELINE_OUT=""
 
 # Every error leaves through fail, masked by every built-in rule once the
 # temp dir exists (mask_texts): an error quotes what it is about — a config
@@ -182,6 +186,12 @@ while [[ $# -gt 0 ]]; do
       [[ -z "$HIST_RANGE" ]] || die "--history-range given twice; pass one revision range"
       HIST_RANGE="$2"; HISTORY=1; shift 2 ;;
     --list-patterns)   LIST_ONLY=1; shift ;;
+    --baseline|--write-baseline)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "leakcheck: $1 needs a value" >&2; usage 2 >&2
+      fi
+      if [[ "$1" == --baseline ]]; then BASELINE_IN=$2; else BASELINE_OUT=$2; fi
+      shift 2 ;;
     --redact)          REDACT=1; shift ;;
     --rule)
       if [[ $# -lt 2 || -z "$2" ]]; then
@@ -1329,6 +1339,22 @@ if [[ -n "$CONFIG_FILE" ]]; then
   cfg_dir="$(cd -- "$(dirname -- "$CONFIG_FILE")" && pwd -P)" \
     || die "cannot resolve config path: $CONFIG_FILE"
   CONFIG_ABS="$cfg_dir/$(basename -- "$CONFIG_FILE")"
+fi
+
+# A baseline resolves as --config does. One named and missing is an error:
+# reading none would report every finding a baseline was meant to hold.
+abs_path() { # path -> REPLY, its directory resolved
+  local d
+  d="$(cd -- "$(dirname -- "$1")" 2>/dev/null && pwd -P)" || die "cannot resolve path: $1"
+  REPLY="$d/$(basename -- "$1")"
+}
+if [[ -n "$BASELINE_IN" ]]; then
+  [[ -f "$BASELINE_IN" ]] || die "baseline not found: $BASELINE_IN"
+  [[ -r "$BASELINE_IN" ]] || die "baseline not readable: $BASELINE_IN"
+  abs_path "$BASELINE_IN"; BASELINE_IN_ABS=$REPLY
+fi
+if [[ -n "$BASELINE_OUT" ]]; then
+  abs_path "$BASELINE_OUT"; BASELINE_OUT_ABS=$REPLY
 fi
 
 # Always scan from the top level. `git ls-files` and `git grep` are
@@ -3089,6 +3115,7 @@ declare -A PAT_NUM=()
 pn=0
 for p in "${PATTERNS[@]}" "${PATH_PATS[@]}"; do pn=$(( pn + 1 )); PAT_NUM["l$p"]=$pn; done
 ALLOWED_TOTAL=0
+declare -A IS_CRED_HIT=()
 CRED_FOUND=0
 CRED_UNSCOPED=0
 CRED_PLACEHOLDERS=0
@@ -3143,6 +3170,7 @@ for i in "${!H_FILE[@]}"; do
   fi
   KEEP+=("$i")
   SHOW_PAT[$i]=${H_PAT[$i]}
+  if [[ -n "${CRED_RE["l${H_PAT[$i]}"]+x}" ]]; then IS_CRED_HIT[$i]=1; fi
   if [[ "$REDACT" -eq 1 ]]; then
     redact_names "${SHOW_FILE[$i]}"; SHOW_FILE[$i]=$REPLY
     if [[ -z "${CRED_RE["l${H_PAT[$i]}"]+x}" ]]; then SHOW[$i]="[redacted, ${#H_TEXT[$i]} chars]"; fi
@@ -3153,6 +3181,79 @@ for i in "${!H_FILE[@]}"; do
     fi
   fi
 done
+
+# --write-baseline and --baseline. A finding is a hash of its path, pattern
+# and raw text — raw, so a new key where an old one sat, whose masked text
+# is the same, is a new finding — and its ordinal among identical findings,
+# so a copy is new too; a line that moves keeps both. Not its commit: history
+# reports a finding once, at its earliest commit, and a rebase would make
+# every one of them new. The file holds the hashes alone, so committing it
+# publishes no path, text or key.
+# The baseline is read before it is written, so one file can be both.
+BASELINE_HEAD="# leakcheck baseline v1"
+BASELINED=0
+if [[ -n "$BASELINE_IN$BASELINE_OUT" ]]; then
+  declare -A BASE=() FP=() FP_N=()
+  if [[ -n "$BASELINE_IN" ]]; then
+    bl=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      bl=$((bl + 1))
+      line=${line%$'\r'}
+      if [[ $bl -eq 1 ]]; then
+        [[ "$line" == "$BASELINE_HEAD" ]] ||
+          die "baseline $BASELINE_IN: not a leakcheck baseline (its first line is not: $BASELINE_HEAD)"
+        continue
+      fi
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      [[ "$line" =~ ^[0-9a-f]{40}([0-9a-f]{24})?:[1-9][0-9]*$ ]] ||
+        die "baseline $BASELINE_IN: line $bl is not a finding's fingerprint"
+      BASE[$line]=1
+    done < "$BASELINE_IN_ABS"
+    [[ $bl -gt 0 ]] || die "baseline $BASELINE_IN: empty, not a leakcheck baseline"
+  fi
+  mkdir "$TMPD/fp" || die "cannot create a temporary directory"
+  for i in "${KEEP[@]}"; do
+    printf '%s\0%s\0%s' "${H_FILE[$i]}" "${H_PAT[$i]}" "${H_TEXT[$i]}" > "$TMPD/fp/$i"
+    printf '%s\n' "$TMPD/fp/$i"
+  done > "$TMPD/fp.list"
+  FP_HASH=()
+  if [[ ${#KEEP[@]} -gt 0 ]]; then
+    run_git "hash-object (baseline)" "$TMPD/fp.hash" git hash-object --no-filters --stdin-paths < "$TMPD/fp.list"
+    mapfile -t FP_HASH < "$TMPD/fp.hash"
+    [[ ${#FP_HASH[@]} -eq ${#KEEP[@]} ]] ||
+      die "scan error: git hash-object returned ${#FP_HASH[@]} hashes for ${#KEEP[@]} findings"
+  fi
+  k=0
+  for i in "${KEEP[@]}"; do
+    h=${FP_HASH[k]}; k=$((k + 1))
+    [[ "$h" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || die "scan error: unexpected hash from git hash-object"
+    FP_N[$h]=$(( ${FP_N[$h]:-0} + 1 ))
+    FP[$i]="$h:${FP_N[$h]}"
+  done
+  if [[ -n "$BASELINE_OUT" ]]; then
+    {
+      printf '%s\n' "$BASELINE_HEAD" \
+        "# One accepted finding a line: a hash of its path, pattern and text, then its" \
+        "# ordinal among identical findings. Rewrite it with --write-baseline."
+      for i in "${KEEP[@]}"; do printf '%s\n' "${FP[$i]}"; done
+    } > "$BASELINE_OUT_ABS" || die "cannot write baseline: $BASELINE_OUT"
+  fi
+  if [[ -n "$BASELINE_IN" ]]; then
+    kept=()
+    for i in "${KEEP[@]}"; do
+      if [[ -n "${BASE[${FP[$i]}]+x}" ]]; then
+        BASELINED=$((BASELINED + 1))
+        if [[ -n "${IS_CRED_HIT[$i]+x}" ]]; then
+          CRED_FOUND=$((CRED_FOUND - 1))
+          if [[ -n "${UNSCOPED_HINT[$i]+x}" ]]; then CRED_UNSCOPED=$((CRED_UNSCOPED - 1)); fi
+        fi
+        continue
+      fi
+      kept+=("$i")
+    done
+    KEEP=("${kept[@]}")
+  fi
+fi
 HIT_COUNT=${#KEEP[@]}
 
 if [[ "$HISTORY" -eq 1 ]]; then
@@ -3186,6 +3287,10 @@ SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodule
 # --rule is a scope reduction, so it is counted where the scope is printed.
 if [[ ${#RULE_ONLY[@]} -gt 0 ]]; then
   SCOPE+="; only ${#RULE_WANT[@]} rules run (--rule)"
+fi
+# A baseline is a scope reduction like an allow rule, so it is counted.
+if [[ -n "$BASELINE_IN" ]]; then
+  SCOPE+="; $BASELINED in baseline"
 fi
 
 # An allow rule may name a credential outright — the README's way to excuse
@@ -3357,6 +3462,8 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
     done
     printf ']'
   fi
+  # --baseline: the findings it held, last (append-only).
+  if [[ -n "$BASELINE_IN" ]]; then printf ',"baseline":%d' "$BASELINED"; fi
   printf '}\n'
 elif [[ "$OUTPUT_MODE" == "sarif" ]]; then
   # SARIF 2.1.0, as GitHub code scanning reads it: one run, a rule for each

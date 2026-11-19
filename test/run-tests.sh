@@ -817,7 +817,7 @@ t_help_lists_every_flag() {
   # The script header is --help: a flag missing there is undiscoverable.
   assert_exit 0 "$BIN" --help
   local f
-  for f in --strict --history --history-range --json --format --redact --rule --list-patterns --list-rules --config --root --version --help; do
+  for f in --strict --history --history-range --json --format --baseline --write-baseline --redact --rule --list-patterns --list-rules --config --root --version --help; do
     assert_contains "$f" "$LC_OUT"
   done
 }
@@ -4169,6 +4169,90 @@ t_format_flag() {
   assert_exit 1 "$BIN" --json --format json
 }
 
+t_baseline_reports_only_new_findings() {
+  # Stage F (v0.25.0): --write-baseline writes a hash per finding — path,
+  # pattern, raw text, and its ordinal among identical findings, never the
+  # commit, so a rebase changes nothing —
+  # and --baseline reports only findings it does not hold, counted. A line
+  # that moves is the same finding; a copy is new, and so is a different key
+  # where an accepted one sat, though both print the same masked text. The
+  # file holds no path, text or key.
+  local st st2 b="$PWD/.git/base"
+  st=$(cred stripe-key)
+  if [[ "${st: -1}" == Q ]]; then st2="${st%?}R"; else st2="${st%?}Q"; fi
+  seed a.txt "see /home/alice/notes"
+  seed b.txt "key: $st"
+  seed c.txt "on MYHOST"
+  rc_file 'pattern MYHOST'
+  commit init
+  assert_exit 1 "$BIN" --write-baseline "$b"
+  assert_contains "leakcheck: 3 match(es)" "$LC_ERR"
+  python3 - "$b" "$st" <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+assert lines[0] == "# leakcheck baseline v1", lines
+body = [l for l in lines if l and not l.startswith("#")]
+assert len(body) == 3 and all(re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?:1", l) for l in body), body
+text = open(sys.argv[1]).read()
+for tell in ("alice", "MYHOST", "a.txt", sys.argv[2]):
+    assert tell not in text, tell
+PY
+  assert_exit 0 "$BIN" --baseline "$b"
+  assert_contains "; 3 in baseline)" "$LC_OUT"
+  assert_exit 0 "$BIN" --baseline "$b" --json
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["count"] == 0 and d["baseline"] == 3 and list(d)[-1] == "baseline", d' "$LC_OUT"
+  # Moved: the same finding.
+  printf 'top\nsee /home/alice/notes\n' > a.txt
+  git add a.txt
+  assert_exit 0 "$BIN" --baseline "$b"
+  # Copied: the second copy is new.
+  printf 'top\nsee /home/alice/notes\nsee /home/alice/notes\n' > a.txt
+  git add a.txt
+  assert_exit 1 "$BIN" --baseline "$b"
+  assert_contains "a.txt:3: [" "$LC_OUT"
+  assert_not_contains "a.txt:2: [" "$LC_OUT"
+  assert_contains "; 3 in baseline)" "$LC_ERR"
+  # The accepted key is no credential this run reports.
+  assert_not_contains "credential(s) among these" "$LC_ERR"
+  # A different key where the accepted one sat: new, and still a credential.
+  printf 'top\nsee /home/alice/notes\n' > a.txt
+  git add a.txt
+  seed b.txt "key: $st2"
+  assert_exit 1 "$BIN" --baseline "$b"
+  assert_contains "b.txt:1: [credential:stripe-key]" "$LC_OUT"
+  assert_contains "leakcheck: 1 credential(s) among these" "$LC_ERR"
+  # One file as both: read, then rewritten.
+  assert_exit 1 "$BIN" --baseline "$b" --write-baseline "$b"
+  assert_exit 0 "$BIN" --baseline "$b"
+  # History: the same findings after a commit is rewritten (the second key
+  # entered at `two`, which the amend replaces).
+  commit two
+  assert_exit 1 "$BIN" --history --write-baseline "$b"
+  assert_exit 0 "$BIN" --history --baseline "$b"
+  git -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q --amend -m two-amended
+  assert_exit 0 "$BIN" --history --baseline "$b"
+}
+
+t_baseline_errors() {
+  # Stage F (v0.25.0): a baseline that is missing, empty, not a leakcheck
+  # baseline, or holds a line that is no fingerprint is exit 2 — reading
+  # none would report every finding it was meant to hold, and reading a
+  # wrong file could hold any.
+  seed a.txt "see /home/alice/notes"
+  commit init
+  assert_exit 2 "$BIN" --baseline .git/missing
+  assert_contains "baseline not found" "$LC_ERR"
+  : > .git/empty
+  assert_exit 2 "$BIN" --baseline .git/empty
+  printf 'pattern MYHOST\n' > .git/other
+  assert_exit 2 "$BIN" --baseline .git/other
+  assert_contains "not a leakcheck baseline" "$LC_ERR"
+  printf '# leakcheck baseline v1\nnot-a-hash\n' > .git/bad
+  assert_exit 2 "$BIN" --baseline .git/bad
+  assert_contains "line 2 is not a finding's fingerprint" "$LC_ERR"
+  assert_exit 2 "$BIN" --write-baseline .git/no/such/dir/base
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -4876,6 +4960,8 @@ lc_test "--format sarif"                        t_format_sarif
 lc_test "--format csv"                          t_format_csv
 lc_test "--format junit"                        t_format_junit
 lc_test "--format: json, text, errors"          t_format_flag
+lc_test "--baseline: only new findings"         t_baseline_reports_only_new_findings
+lc_test "--baseline: errors"                    t_baseline_errors
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential

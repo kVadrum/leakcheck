@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.24.0*
+*README v0.25.0*
 
 ## Install
 
@@ -383,6 +383,8 @@ leakcheck --history           also scan every commit reachable from any ref
 leakcheck --history-range R   the same, over the commits in revision range R only
 leakcheck --json              machine-readable output
 leakcheck --format FMT        text, json (as --json), sarif, csv or junit
+leakcheck --write-baseline F  also write each finding's fingerprint to F
+leakcheck --baseline F        report only the findings F does not hold
 leakcheck --redact            print no hit's text, and no tell found in a name
 leakcheck --rule ID           run only this rule (repeatable): credential:<id> or a label
 leakcheck --list-patterns     print the effective pattern set
@@ -478,6 +480,23 @@ Here is the Quick start run, formatted for reading:
 - **JUnit XML**: a failed test case per hit; a clean scan is one passing case, `scan`.
 
 Each format keeps the exit codes, `--redact` and the masking of credentials.
+
+## Baselines
+
+A repository with findings you have judged and accepted can still gate on new ones:
+
+```sh
+leakcheck --write-baseline .leakcheck-baseline   # once, after reviewing every finding
+leakcheck --baseline .leakcheck-baseline         # from then on: only what is new
+```
+
+- **A fingerprint is a hash** of the finding's path, pattern and text, then its ordinal among identical findings; the file holds nothing else, so committing it publishes no path, text or key.
+- **A line that moves is the same finding**; a copy of it is a new one, and so is a different key where an accepted one sat, though both print the same masked text.
+- **A history finding is the same after a rebase**: the commit is not part of the fingerprint, since history reports each finding once, at its earliest commit.
+- **The findings a baseline holds are counted** in the summary (`3 in baseline`) and in `--json` (`"baseline": 3`), as allow rules are.
+- `--write-baseline` writes every finding the run reports, before `--baseline` takes any out, and leaves the exit code as it is; the baseline is read first, so one file can be both.
+- A baseline that is missing, unreadable, or not a leakcheck baseline is exit `2`, never an empty one.
+- Prefer an `allow` rule for a finding you can name, such as a placeholder: a rule says why; a fingerprint only that someone looked.
 
 ## Use in CI
 
