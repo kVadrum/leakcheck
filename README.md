@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.25.2*
+*README v0.26.0*
 
 ## Install
 
@@ -222,6 +222,19 @@ What it does not scan, and says so on every run:
 - **Encoded or compressed content** (base64, gzip, archives) is never decoded.
 - **Untracked and gitignored files**, which a push does not publish.
 
+## Scanning files outside a repository
+
+`--dir DIR` scans every file under `DIR` — a release tarball unpacked, a build output, a folder that is no repository — as if each were tracked, ignored files included, with the `.leakcheckrc` and `.leakcheckrc.local` at its top; `--stdin` scans standard input as one file, `stdin`, with the config `--config` or the environment names.
+
+```sh
+leakcheck --dir dist/
+git diff --cached | leakcheck --stdin --config .leakcheckrc
+```
+
+- Nothing is written into `DIR`: a private, temporary repository indexes it, and the scan reads each file as it is.
+- A repository inside `DIR` is counted with the submodules, not scanned; scan it on its own.
+- `--history` needs a repository, so it is refused with either.
+
 ## Scanning history
 
 `leakcheck --history` also scans every commit reachable from any ref — branches, tags, remote-tracking branches, stashes and notes — with the same patterns:
@@ -385,6 +398,8 @@ leakcheck --json              machine-readable output
 leakcheck --format FMT        text, json (as --json), sarif, csv or junit
 leakcheck --write-baseline F  also write each finding's fingerprint to F
 leakcheck --baseline F        report only the findings F does not hold
+leakcheck --dir DIR           scan every file under DIR, in a repository or not
+leakcheck --stdin             scan standard input, as a file named stdin
 leakcheck --redact            print no hit's text, and no tell found in a name
 leakcheck --rule ID           run only this rule (repeatable): credential:<id> or a label
 leakcheck --list-patterns     print the effective pattern set

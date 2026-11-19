@@ -817,7 +817,7 @@ t_help_lists_every_flag() {
   # The script header is --help: a flag missing there is undiscoverable.
   assert_exit 0 "$BIN" --help
   local f
-  for f in --strict --history --history-range --json --format --baseline --write-baseline --redact --rule --list-patterns --list-rules --config --root --version --help; do
+  for f in --strict --history --history-range --json --format --baseline --write-baseline --dir --stdin --redact --rule --list-patterns --list-rules --config --root --version --help; do
     assert_contains "$f" "$LC_OUT"
   done
 }
@@ -4278,6 +4278,67 @@ assert d["credentials"]["weak"] == 3, d["credentials"]
 PY
 }
 
+t_dir_scans_every_file() {
+  # Stage E (v0.26.0): --dir scans every file under a directory that is no
+  # repository — an ignored one, a symlink's target, a name, with the
+  # directory's own .leakcheckrc — and writes nothing into it; a repository
+  # inside it is counted, not scanned; the caller's repository and index are
+  # not this scan's. --history is refused.
+  local d="$PWD/.git/plain"
+  seed outer.txt "see /home/alice/outer"
+  commit init
+  mkdir -p "$d/sub"
+  printf 'see /home/alice/a\n' > "$d/a.txt"
+  printf '*.log\n' > "$d/.gitignore"
+  printf 'ignored /home/alice/i\n' > "$d/ign.log"
+  ln -s /home/alice/target "$d/link"
+  printf 'x\n' > "$d/sub/notes-MYHOST.txt"
+  printf 'pattern MYHOST\n' > "$d/.leakcheckrc"
+  git init -q "$d/nested"
+  printf 'nested /home/alice/n\n' > "$d/nested/n.txt"
+  GIT_INDEX_FILE="$PWD/.git/index" assert_exit 1 "$BIN" --dir "$d"
+  assert_contains "a.txt:1: [" "$LC_OUT"
+  assert_contains "ign.log:1: [" "$LC_OUT"
+  assert_contains "link:0: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] -> /home/alice/target" "$LC_OUT"
+  assert_contains "sub/notes-MYHOST.txt:0: [MYHOST] sub/notes-MYHOST.txt" "$LC_OUT"
+  assert_not_contains "outer.txt" "$LC_OUT"
+  assert_not_contains "nested" "$LC_OUT"
+  assert_contains "leakcheck: scanned 6 files (every file under the directory, ignored ones included; 0 binary skipped, 1 submodules not scanned, 1 skipped by config" "$LC_ERR"
+  [[ ! -e "$d/.git" ]]
+  assert_exit 1 "$BIN" --dir "$d" --json
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["target"] == "dir" and d["count"] == 4, d' "$LC_OUT"
+  # The caller's own repository still scans as before.
+  assert_exit 1 "$BIN"
+  assert_contains "outer.txt:1: [" "$LC_OUT"
+  assert_exit 2 "$BIN" --dir "$d" --history
+  assert_contains "--history needs a git repository" "$LC_ERR"
+  assert_exit 2 "$BIN" --dir "$PWD/.git/missing"
+  assert_contains "not a directory" "$LC_ERR"
+  rm -rf "$d"
+}
+
+t_stdin_scans_input() {
+  # Stage E (v0.26.0): --stdin scans standard input as one file, `stdin`,
+  # bytes as they are (a NUL makes it binary, counted), with the config
+  # --config names; --stdin with --dir is refused.
+  printf 'see /home/alice/x\nbuilt on MYHOST\n' > .git/in.txt
+  printf 'pattern MYHOST\n' > .git/rc
+  assert_exit 1 "$BIN" --stdin < .git/in.txt
+  assert_contains "stdin:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] see /home/alice/x" "$LC_OUT"
+  assert_not_contains "MYHOST" "$LC_OUT"
+  assert_contains "leakcheck: scanned 1 files (standard input;" "$LC_ERR"
+  assert_exit 1 "$BIN" --stdin --config "$PWD/.git/rc" --json < .git/in.txt
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["target"] == "stdin" and sorted(h["pattern"] for h in d["hits"])[0] == "/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/" and d["count"] == 2, d' "$LC_OUT"
+  printf 'a\0b /home/alice/x\n' > .git/bin.txt
+  assert_exit 0 "$BIN" --stdin < .git/bin.txt
+  assert_contains "1 binary skipped" "$LC_OUT"
+  assert_exit 1 "$BIN" --stdin --strict < .git/bin.txt
+  printf 'clean\n' > .git/clean.txt
+  assert_exit 0 "$BIN" --stdin < .git/clean.txt
+  assert_contains "leakcheck: clean — 0 matches across 1 files (standard input;" "$LC_OUT"
+  assert_exit 2 "$BIN" --stdin --dir "$PWD/.git" < .git/clean.txt
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -4988,6 +5049,8 @@ lc_test "--format junit"                        t_format_junit
 lc_test "--format: json, text, errors"          t_format_flag
 lc_test "--baseline: only new findings"         t_baseline_reports_only_new_findings
 lc_test "--baseline: errors"                    t_baseline_errors
+lc_test "--dir: every file under a directory"   t_dir_scans_every_file
+lc_test "--stdin"                               t_stdin_scans_input
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
