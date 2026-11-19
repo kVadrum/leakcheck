@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.26.0*
+*README v0.27.0*
 
 ## Install
 
@@ -222,6 +222,23 @@ What it does not scan, and says so on every run:
 - **Encoded or compressed content** (base64, gzip, archives) is never decoded.
 - **Untracked and gitignored files**, which a push does not publish.
 
+## Encoded values
+
+`--decode` reads each line of tracked content a second time with every encoded value in it decoded in place — base64 (the URL-safe alphabet too), hex, and percent-encoding — when the value decodes to text, and every pattern runs over the lines that makes; the line keeps its context, so a key beside an encoded value still counts. Here `app.yaml` holds `config: ` and the base64 of `password: ` and a password:
+
+```text
+$ leakcheck --decode
+app.yaml:2: [credential:generic-secret] password[redacted, 24 chars] (decoded base64)
+leakcheck: 1 match(es)
+leakcheck: scanned 1 tracked files (index + worktree; 0 binary skipped, 0 submodules not scanned, 0 skipped by config, 0 allowed; history not scanned; credentials scanned, 0 placeholders not reported; 1 encoded values decoded (tracked content, one level))
+leakcheck: 1 credential(s) among these: revoke and reissue any that has left this machine; deleting one from the files or the history does not revoke it
+```
+
+- **A hit names the encoding** after its text, and in `--json` as its `source`: `decoded-base64`, `decoded-hex` or `decoded-percent`.
+- **A value that decodes to anything but text** — printable ASCII, tabs and line breaks — is not read: an image's base64 is binary, and a long word that happens to look like base64 almost never decodes to text.
+- **One level, and the tracked content only**: a value encoded twice is not found, nor one in `--history`'s lines; the summary counts the values decoded.
+- It is off by default: it costs a second pass over every line that holds a candidate.
+
 ## Scanning files outside a repository
 
 `--dir DIR` scans every file under `DIR` — a release tarball unpacked, a build output, a folder that is no repository — as if each were tracked, ignored files included, with the `.leakcheckrc` and `.leakcheckrc.local` at its top; `--stdin` scans standard input as one file, `stdin`, with the config `--config` or the environment names.
@@ -400,6 +417,7 @@ leakcheck --write-baseline F  also write each finding's fingerprint to F
 leakcheck --baseline F        report only the findings F does not hold
 leakcheck --dir DIR           scan every file under DIR, in a repository or not
 leakcheck --stdin             scan standard input, as a file named stdin
+leakcheck --decode            also read encoded values decoded (base64, hex, %XX)
 leakcheck --redact            print no hit's text, and no tell found in a name
 leakcheck --rule ID           run only this rule (repeatable): credential:<id> or a label
 leakcheck --list-patterns     print the effective pattern set

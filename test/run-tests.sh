@@ -817,7 +817,7 @@ t_help_lists_every_flag() {
   # The script header is --help: a flag missing there is undiscoverable.
   assert_exit 0 "$BIN" --help
   local f
-  for f in --strict --history --history-range --json --format --baseline --write-baseline --dir --stdin --redact --rule --list-patterns --list-rules --config --root --version --help; do
+  for f in --strict --history --history-range --json --format --baseline --write-baseline --dir --stdin --decode --redact --rule --list-patterns --list-rules --config --root --version --help; do
     assert_contains "$f" "$LC_OUT"
   done
 }
@@ -4339,6 +4339,61 @@ t_stdin_scans_input() {
   assert_exit 2 "$BIN" --stdin --dir "$PWD/.git" < .git/clean.txt
 }
 
+t_decode_finds_encoded_values() {
+  # Stage E (v0.27.0): --decode reads each tracked line again with each
+  # encoded value decoded in place, where it decodes to text — base64 (the
+  # URL-safe alphabet too, unpadded), hex, percent-encoding — so a keyword
+  # beside the value still counts; a hit names its encoding, a key stays
+  # masked, an image's base64 is not decoded, and the values decoded are
+  # counted. A config pattern reaches the pass through pat_args (`(?i)`), and
+  # the config's own lines are decoded for the credential rules alone, as the
+  # tree passes read it. Without the flag nothing changes.
+  local gh b64 tok hex pw hostb cfgk cfgp
+  gh=$(cred github-token)
+  b64=$(python3 -c 'import base64; print(base64.b64encode(b"see /home/alice/b64\n").decode())')
+  # URL-safe and unpadded: `~~~` encodes to `fn5-`, so a - is in it.
+  tok=$(python3 -c 'import base64,sys; v=base64.urlsafe_b64encode(("~~~ token: " + sys.argv[1]).encode()).decode().rstrip("="); assert "-" in v; print(v)' "$gh")
+  hex=$(python3 -c 'print(b"/home/alice/hexvalue".hex())')
+  pw=$(python3 -c 'import base64; print(base64.b64encode(b"Xq7vR2mPz9Lw4sKd8Tn3bQy5").decode())')
+  hostb=$(python3 -c 'import base64; print(base64.b64encode(b"built on MyHost today").decode())')
+  cfgk=$(python3 -c 'import base64,sys; print(base64.b64encode(("token = " + sys.argv[1]).encode()).decode())' "$gh")
+  cfgp=$(python3 -c 'import base64; print(base64.b64encode(b"see /home/alice/config").decode())')
+  seed a.txt "data: $b64"
+  seed b.txt "blob = $tok"
+  seed c.txt "cfg: $hex"
+  seed d.txt "url = https://x/%2Fhome%2Falice%2Fpct"
+  seed e.yaml "  password: $pw"
+  seed f.txt "img: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+  seed g.txt "note: $hostb"
+  rc_file "pattern (?i)myhost
+# $cfgk
+# $cfgp"
+  commit init
+  # Without --decode only the raw base64 under `password:` is a finding.
+  assert_exit 1 "$BIN"
+  assert_contains "leakcheck: 1 match(es)" "$LC_ERR"
+  assert_exit 1 "$BIN" --decode
+  assert_contains "a.txt:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] data: see /home/alice/b64 (decoded base64)" "$LC_OUT"
+  assert_contains "b.txt:1: [credential:github-token] $(masked "$gh") (decoded base64)" "$LC_OUT"
+  assert_contains "c.txt:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] cfg: /home/alice/hexvalue (decoded hex)" "$LC_OUT"
+  assert_contains "d.txt:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] url = https://x//home/alice/pct (decoded percent)" "$LC_OUT"
+  assert_contains "e.yaml:1: [credential:generic-secret] password[redacted, 24 chars] (decoded base64)" "$LC_OUT"
+  assert_contains "g.txt:1: [(?i)myhost] note: built on MyHost today (decoded base64)" "$LC_OUT"
+  assert_contains ".leakcheckrc:2: [credential:github-token] $(masked "$gh") (decoded base64)" "$LC_OUT"
+  assert_not_contains "alice/config" "$LC_OUT"
+  assert_not_contains "f.txt" "$LC_OUT"
+  assert_not_contains "$gh" "$LC_OUT"
+  assert_contains "leakcheck: 8 match(es)" "$LC_ERR"
+  assert_contains "; 8 encoded values decoded (tracked content, one level)" "$LC_ERR"
+  assert_exit 1 "$BIN" --decode --json
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+src = sorted((h["file"], h["source"]) for h in d["hits"])
+assert src == [(".leakcheckrc", "decoded-base64"), ("a.txt", "decoded-base64"), ("b.txt", "decoded-base64"), ("c.txt", "decoded-hex"), ("d.txt", "decoded-percent"), ("e.yaml", "both"), ("e.yaml", "decoded-base64"), ("g.txt", "decoded-base64")], src
+' "$LC_OUT"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -5051,6 +5106,7 @@ lc_test "--baseline: only new findings"         t_baseline_reports_only_new_find
 lc_test "--baseline: errors"                    t_baseline_errors
 lc_test "--dir: every file under a directory"   t_dir_scans_every_file
 lc_test "--stdin"                               t_stdin_scans_input
+lc_test "--decode: base64, hex, percent"        t_decode_finds_encoded_values
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
