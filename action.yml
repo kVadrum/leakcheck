@@ -21,5 +21,6 @@ runs:
         # into `run` is code.
         LEAKCHECK_ARGS: ${{ inputs.args }}
       run: |
-        read -r -a args <<< "$LEAKCHECK_ARGS"
+        # -d '': every line of an `args: |` block, where read -a takes one.
+        read -r -d '' -a args <<< "$LEAKCHECK_ARGS" || :
         "$GITHUB_ACTION_PATH/bin/leakcheck" "${args[@]}"

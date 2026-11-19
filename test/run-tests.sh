@@ -1133,7 +1133,11 @@ sha_of() { git rev-parse "${1:-HEAD}"; }
 # How this git diffs merges under --history, probed as leakcheck probes it:
 # remerge from git 2.36 with an empty info/attributes, else separate (-m).
 merge_mode() {
-  local a; a=$(git rev-parse --git-path info/attributes)
+  local a d old=1; a=$(git rev-parse --git-path info/attributes)
+  if [[ "$(git version)" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]] &&
+     (( BASH_REMATCH[1] > 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] >= 40) )); then old=0; fi
+  d=$'\n'$(git config --name-only --get-regexp '^merge\..*\.driver$' || :)$'\n'
+  if [[ "$d" == *$'\nmerge.text.driver\n'* || ( $old -eq 1 && "$d" != $'\n\n' ) ]]; then echo separate; return; fi
   if [[ ! -L "$a" && ! -s "$a" ]] && git log -0 --all --diff-merges=remerge >/dev/null 2>&1; then
     echo remerge
   else
@@ -1338,7 +1342,7 @@ t_history_remerge_and_merge_drivers() {
   seed a.txt "clean"
   commit scrub
   GIT_CONFIG_GLOBAL="$cfg" assert_exit 1 "$BIN" --history --json
-  python3 - "$LC_OUT" "$m" "$(merge_mode)" <<'PY'
+  python3 - "$LC_OUT" "$m" "$(GIT_CONFIG_GLOBAL="$cfg" merge_mode)" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
 assert doc["history"]["merge_diffs"] == sys.argv[3], doc["history"]
@@ -4044,6 +4048,10 @@ PY
   GITHUB_ACTION_PATH="$ap" LEAKCHECK_ARGS="--json --strict" \
     assert_exit 1 bash --noprofile --norc -eo pipefail .git/run.sh
   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["count"] == 1, d' "$LC_OUT"
+  # Every line of an `args: |` block (v0.29.3: read -a took the first).
+  GITHUB_ACTION_PATH="$ap" LEAKCHECK_ARGS=$'--strict\n--json' \
+    assert_exit 1 bash --noprofile --norc -eo pipefail .git/run.sh
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["count"] == 1, d' "$LC_OUT"
   GITHUB_ACTION_PATH="$ap" LEAKCHECK_ARGS="*" \
     assert_exit 2 bash --noprofile --norc -eo pipefail .git/run.sh
   assert_contains "unexpected arg: *" "$LC_ERR"
@@ -4569,6 +4577,136 @@ PY
   assert_contains "see /home/alice/wincut (decoded base64)" "$LC_OUT"
   assert_contains "z.zip!m.txt:1: $H v: see /home/alice/ardec (decoded base64)" "$LC_OUT"
   assert_contains "l.txt:1: $H k: see /home/alice/tcdec (decoded base64)" "$LC_OUT"
+}
+
+t_kv_random_camel_values_are_keys() {
+  # /qaa (v0.29.3): v0.25.1 took one word-part value with a hump for a
+  # camel-case name, and a random key has one often (1.9% at 16): these two
+  # read as code. A name in whole words is still code (a guard).
+  printf '%s\n' "SIGNING_KEY=Vqm""Cplppjs46Lmue" "HEROKU=WPns""uvBqbwq7sdTW" "key: privateKeyPEM" > .env.example
+  git add .env.example
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert sorted((h["line"], h["pattern"]) for h in d["hits"]) == [(1, "credential:generic-key"), (2, "credential:service-secret")], d["hits"]
+assert d["credentials"]["weak"] == 1, d["credentials"]
+PY
+}
+
+t_kv_basic_auth_user_is_judged() {
+  # /qaa (v0.29.3): Basic auth judged by its password alone set aside an
+  # API key sent as the user with `X` for the password (Freshdesk,
+  # BambooHR, Teamwork). Weak only when both are (a guard: admin:changeme).
+  local b w
+  b=$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1].encode()).decode())' "Xk3j9fLq""2mZp7wR4aQ:X")
+  w=$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1].encode()).decode())' "admin:changeme")
+  seed h.txt $'Authorization: Basic '"$b"$'\nAuthorization: Basic '"$w"
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert [(h["line"], h["pattern"]) for h in d["hits"]] == [(1, "credential:http-basic-auth")], d["hits"]
+assert d["credentials"]["weak"] == 1, d["credentials"]
+PY
+}
+
+t_redact_hides_tells_in_credential_text() {
+  # /qaa (v0.29.3): --redact gathered tells from names alone, and hid them
+  # in paths alone: a path rule's hit printed its name (MYHOST-client.p12),
+  # and xml-key-value its keyword (MYHOST.Password), each a tell another
+  # hit had hidden.
+  seed "MYHOST-client.p12" "x"
+  seed n.config '<add key="MYHOST.Password" value="Xk3j9fLq2mZp7wR4a"/>'
+  rc_file 'pattern MYHOST'
+  commit init
+  assert_exit 1 "$BIN" --redact
+  assert_contains "[credential:pkcs12-file]" "$LC_OUT"
+  assert_contains "[credential:xml-key-value]" "$LC_OUT"
+  assert_not_contains "MYHOST" "$LC_OUT"
+  assert_exit 1 "$BIN" --redact --json
+  assert_not_contains "MYHOST" "$LC_OUT"
+  # The tell in a line alone, in no name: gathered from the line's hit.
+  git rm -q "MYHOST-client.p12"
+  commit two
+  assert_exit 1 "$BIN" --redact
+  assert_contains "[credential:xml-key-value]" "$LC_OUT"
+  assert_not_contains "MYHOST" "$LC_OUT"
+}
+
+t_credential_cut_only_past_an_edge() {
+  # /qaa (v0.29.3): cred_key cut a match at its rule's literal wherever it
+  # sat, and facebook-token's <app id>|<secret> can hold EAA in its secret:
+  # the cut printed the secret's head in a name, and masked the rest as a
+  # shorter key.
+  local fb
+  fb="7391046""28517392|Qx7kZp2""EA""Am9Lw4Rt8Vy3Nb6Hc1Jd5"
+  seed "cfg-$fb.txt" "x"
+  seed a.txt "tok: $fb"
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [credential:facebook-token] $(masked "$fb")" "$LC_OUT"
+  assert_contains "cfg-$(masked "$fb").txt:0: [credential:facebook-token] $(masked "$fb")" "$LC_OUT"
+  assert_not_contains "Qx7kZp2" "$LC_OUT"
+}
+
+t_baseline_holds_unscanned_content() {
+  # /qaa (v0.29.3): an unscanned finding's print was its path, pattern and
+  # fixed text, so a baselined binary file stayed baselined whatever it came
+  # to hold. Its content's identity is in the print now, the worktree's and
+  # the index's.
+  printf 'a\0b' > data.bin
+  git add data.bin
+  commit init
+  assert_exit 1 "$BIN" --strict --write-baseline .git/bl
+  assert_exit 0 "$BIN" --strict --baseline .git/bl
+  printf 'c\0d' > data.bin
+  assert_exit 1 "$BIN" --strict --baseline .git/bl
+  git add data.bin
+  commit two
+  assert_exit 1 "$BIN" --strict --baseline .git/bl
+}
+
+t_junit_drops_xml_noncharacters() {
+  # /qaa (v0.29.3): U+FFFE and U+FFFF are well-formed UTF-8 and no XML 1.0
+  # character; a hit line holding one made the JUnit report unparseable.
+  seed a.txt "see /home/alice/x $(printf '\xef\xbf\xbf\xef\xbf\xbe') y"
+  commit init
+  assert_exit 1 "$BIN" --format junit
+  python3 -c 'import sys, xml.dom.minidom; xml.dom.minidom.parse(sys.argv[1])' "$LC_OUT"
+  assert_contains "/home/alice/x" "$LC_OUT"
+}
+
+t_history_text_driver_sends_merges_to_m() {
+  # /qaa (v0.29.3): merge.default=text, pinned so the re-merge runs git's
+  # own driver, named a user's `[merge "text"]` driver instead, as git looks
+  # a name up among the user's first: it wrote the merge's own line again,
+  # and the re-merge hid it. Such a driver sends the pass to -m.
+  local cfg="$PWD/.git/text.cfg" m
+  printf '[merge]\n\tdefault = text\n[merge "text"]\n\tdriver = printf '"'"'see /home/alice/textdrv\\\\n'"'"' >> %%A\n' > "$cfg"
+  seed a.txt $'one\ntwo\nthree'
+  commit base
+  git checkout -q -b side
+  seed a.txt $'ONE\ntwo\nthree'
+  commit side
+  git checkout -q dev
+  seed a.txt $'one\ntwo\nTHREE'
+  commit dev
+  GIT_CONFIG_GLOBAL="$cfg" git -c core.hooksPath=/dev/null -c commit.gpgsign=false merge -q --no-edit side >/dev/null
+  m=$(sha_of)
+  seed a.txt "clean"
+  commit scrub
+  GIT_CONFIG_GLOBAL="$cfg" assert_exit 1 "$BIN" --history --json
+  python3 - "$LC_OUT" "$m" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["history"]["merge_diffs"] == "separate", doc["history"]
+assert [(h["commit"], h["file"], h["line"]) for h in doc["hits"]] == [(sys.argv[2], "a.txt", 4)], doc["hits"]
+PY
 }
 
 t_archives_read_members() {
@@ -5477,6 +5615,13 @@ lc_test "--archives: zip, tar, gzip"            t_archives_read_members
 lc_test "--archives: what they publish"       t_archives_read_what_they_publish
 lc_test "--dir: paths named .git counted"     t_dir_counts_paths_named_git
 lc_test "--decode: past prefixes, in copies"  t_decode_reads_past_prefixes
+lc_test "credentials: random camel values are keys" t_kv_random_camel_values_are_keys
+lc_test "credentials: Basic auth's user judged" t_kv_basic_auth_user_is_judged
+lc_test "--redact: tells in credential text" t_redact_hides_tells_in_credential_text
+lc_test "credentials: cut only past an edge" t_credential_cut_only_past_an_edge
+lc_test "--baseline: unscanned content" t_baseline_holds_unscanned_content
+lc_test "--format junit: XML noncharacters" t_junit_drops_xml_noncharacters
+lc_test "history: a user's text driver, -m" t_history_text_driver_sends_merges_to_m
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential

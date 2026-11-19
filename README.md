@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.29.2*
+*README v0.29.3*
 
 ## Install
 
@@ -193,6 +193,8 @@ leakcheck: 2 credential(s) among these: revoke and reissue any that has left thi
 
 - **The value is judged, and a weak one is counted, not reported.**
   Weak is a stand-in's shape (as above), or too little entropy — 3.5 bits per character for the generic rules, 4 for an AWS key, 1 for Sidekiq's machine-made passwords, 3 for the others — or, for every rule but the AWS one, no digit or no letter, a word people write into stand-ins (`example`, `changeme`, `your`, `test`, `xxxx`, …), a dotted name (`settings.SECRET_KEY`, though not one with a part of 16 or more characters mixing upper case, lower case and digits, as a token's parts do) or an environment variable's name (`MY_API_TOKEN`); and for `generic-key` and `service-secret`, a value of two or more parts split at `-_./:~@+` that are each a word, a number, or a letter and a number — a slug, a path, a cache key, a file name (`cache-v1-node-modules`, `~/.ssh/id_ed25519`, `tenants/t1/media`) — or code: one camel-case name (`createPrivateKey`, `privatePkcs8`), a property read through TypeScript's `!.` (`signer!.privatePkcs8`), or a function called (`urlBase64ToUint8Array(…)`).
+  A camel-case name is one in whole words — lower case, then capitalised words and numbers, a number or an acronym last (`privateKeyPEM`) — as a random value is almost never that.
+  A Basic auth header's `user:password` is weak only when both are: Freshdesk, BambooHR and Teamwork take the API key as the user, with `X` for the password.
   The summary counts these apart from the stand-ins, at the end of its line (`1 weak keyword values not reported`, above: `TOKEN = "your-token-here-…"`), and `--json` adds `"weak"` to `credentials`.
   So a password shorter than 12 characters, or one made of words, is not found; nor is a value a template fills in (`${DB_PASSWORD}`, `os.environ[…]`, `Bearer $TOKEN`, `-u "$USER:$PASS"`), which is no secret.
 - **A key a fixed-format rule finds is that rule's.**
@@ -472,7 +474,7 @@ Hits go to stdout, one per line, as `path:line: [pattern] text`; the summary lin
 A credential rule's hit names the rule, `[credential:github-token]`, and shows its matches masked in place of the line ([Credentials](#credentials)).
 The format is plain text without color, so it greps.
 
-With `--redact`, a hit prints its text's length in place of the text (`[redacted, 27 chars]`), a tell found in a file name is hidden in every path that prints, a config pattern with no `label` prints as its line in `--list-patterns` (`[pattern:9]`), and `--json` hides each allow rule's text too; a credential hit prints as it always does, masked.
+With `--redact`, a hit prints its text's length in place of the text (`[redacted, 27 chars]`), a tell a pattern found — in a file name or a line — is hidden in every path that prints and in a credential hit's text, a config pattern with no `label` prints as its line in `--list-patterns` (`[pattern:9]`), and `--json` hides each allow rule's text too; a credential hit prints as it always does, masked.
 For a CI log that should name where a leak is and never what it is.
 An error still quotes what it reports — a config line, a pattern git refused — so check a config locally before CI runs it.
 
@@ -549,6 +551,7 @@ leakcheck --baseline .leakcheck-baseline         # from then on: only what is ne
 
 - **A fingerprint is a hash** of the finding's path, pattern and text, then its ordinal among identical findings; the file holds nothing else, so committing it publishes no path, text or key.
 - **A line that moves is the same finding**; a copy of it is a new one, and so is a different key where an accepted one sat, though both print the same masked text.
+- **An unscanned finding (`--strict`) carries its content's identity**: a binary file, submodule or archive whose content changes is a new finding, though its text is the same.
 - **A history finding is the same after a rebase**: the commit is not part of the fingerprint, since history reports each finding once, at its earliest commit.
 - **The findings a baseline holds are counted** in the summary (`3 in baseline`) and in `--json` (`"baseline": 3`), as allow rules are.
 - `--write-baseline` writes every finding the run reports, before `--baseline` takes any out, and leaves the exit code as it is; the baseline is read first, so one file can be both.

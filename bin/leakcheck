@@ -121,7 +121,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.29.2"
+VERSION="0.29.3"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -802,13 +802,19 @@ b64_text() {
 # rule's value up to its first `/`, as is_placeholder does, which can only
 # report more; entropy and the digit test read it whole, since a short
 # prefix would look weak and hide a key.
-kv_weak() {
-  local LC_ALL=C v=$2 lv w min=${KV_MINH[$1]}
+kv_weak() { # id value [text before it] [raw: no Basic decoding]
+  local LC_ALL=C v=$2 lv w min=${KV_MINH[$1]} user pw
   if [[ -n "${KV_NAMESTOP[$1]+x}" && -n "${3-}" ]] && kv_namestop "$3"; then return 0; fi
-  if [[ -n "${KV_B64USER[$1]+x}" ]] && b64_text "$v" && [[ "$REPLY" == *:* ]]; then
-    v=${REPLY#*:}
-    if [[ -z "$v" ]]; then v=${REPLY%%:*}; fi
-    [[ -n "$v" ]] || return 0
+  # Basic auth's user:password, a key's place either: Freshdesk, BambooHR
+  # and Teamwork take the API key as the user and `X` as the password, and
+  # the pair judged by its password alone was set aside (/qaa). Weak when
+  # both are.
+  if [[ -z "${4-}" && -n "${KV_B64USER[$1]+x}" ]] && b64_text "$v" && [[ "$REPLY" == *:* ]]; then
+    user=${REPLY%%:*}; pw=${REPLY#*:}
+    if [[ -n "$pw" ]] && ! kv_weak "$1" "$pw" "" raw; then return 1; fi
+    [[ -n "$user" ]] || return 0
+    if kv_weak "$1" "$user" "" raw; then return 0; fi
+    return 1
   fi
   if is_placeholder "$v" "$1"; then return 0; fi
   kv_entropy "$v"
@@ -866,6 +872,9 @@ kv_namestop() {
 # lower case with digits 1.6% for two parts of 8, 3.8% for four of 4 — the
 # rule's names are weak, and its stand-ins are words (measured, v0.18.0).
 KV_WORD_RE='^([A-Za-z]|[0-9]{1,6}|[A-Za-z][0-9]{1,6}|([A-Z]?[a-z]{2,}|[A-Z]{2,})+([0-9]{1,6}([A-Z]?[a-z]{2,}|[A-Z]{2,})+)*[0-9]{0,6})$'
+# One camel-case name in whole words: lower case, capitalised words and
+# numbers, a capitalised word last but for a number or an acronym after it.
+KV_CAMEL_RE='^[a-z]{2,}([A-Z][a-z]{2,}|[0-9]{1,4})*[A-Z][a-z]{2,}([0-9]{1,4}|[A-Z]{2,5}|[A-Z][0-9]{1,2})?$'
 # kv_call <id> <hit> <match>: in a rule that reads word parts (KV_PARTS), the
 # value is a function's name — the match runs into `(` on its line, as in
 # `applicationServerKey: urlBase64ToUint8Array(vapidKey)` — so code, not a
@@ -875,7 +884,7 @@ kv_call() {
   [[ -n "${KV_PARTS[$1]+x}" && "${H_TEXT[$2]}" == *"$3("* ]]
 }
 kv_wordparts() {
-  local LC_ALL=C p n=0 hump=0 v=$1
+  local LC_ALL=C p n=0 v=$1 one=""
   local -a parts=()
   # A TypeScript non-null read (`signer!.privatePkcs8`) is a property
   # access: its parts are the names it reads (v0.25.1). `?.` needs no such
@@ -885,14 +894,15 @@ kv_wordparts() {
   for p in "${parts[@]}"; do
     [[ -n "$p" ]] || continue
     [[ "$p" =~ $KV_WORD_RE ]] || return 1
-    if [[ "$p" =~ [a-z][A-Z] ]]; then hump=1; fi
+    one=$p
     n=$(( n + 1 ))
   done
   # Two parts, or one camel-case name (`createPrivateKey`, `privatePkcs8`):
-  # code, where a random run is almost never camel case throughout, and an
-  # all-lowercase one, with no hump, stays a key (v0.25.1, from four such
-  # names the fleet sweep reported as keys in a test file).
-  (( n >= 2 || hump == 1 ))
+  # code (v0.25.1, from four such names the fleet sweep reported as keys in
+  # a test file). One name is held to whole words (KV_CAMEL_RE): any word
+  # part with a hump set aside 1.9% of random runs of 16, keys among them
+  # (`VqmCplppjs46Lmue`); whole words take 0.06% (/qaa).
+  (( n >= 2 )) || [[ "$one" =~ $KV_CAMEL_RE ]]
 }
 # kv_overlaps <id> <match> <keys, one per line> [text] [cache id]: the
 # match's value and one of the keys hold one another, so it is that key's
@@ -1018,9 +1028,15 @@ declare -A CRED_KEYSTART=([deepseek-key]='sk-' [alibaba-access-key-id]='LTAI' [h
 # cred_key <id> <match>: the match cut to start at its key -> REPLY.
 cred_key() {
   REPLY=$2
-  local ks=${CRED_KEYSTART[$1]:-}
-  # Only where the literal is: a rule's other branch (api_org_) has none.
-  if [[ -n "$ks" && "$REPLY" != "$ks"* && "$REPLY" == *"$ks"* ]]; then REPLY=$ks${REPLY#*"$ks"}; fi
+  local ks=${CRED_KEYSTART[$1]:-} pre
+  # Only past a left edge, 6 bytes at most (`\u0022`): a rule's other
+  # branch can hold the literal in its secret (facebook-token's
+  # `<app id>|<secret>`, EAA in the secret), and a cut there printed the
+  # secret's head unmasked in a name (/qaa).
+  if [[ -n "$ks" && "$REPLY" != "$ks"* && "$REPLY" == *"$ks"* ]]; then
+    pre=${REPLY%%"$ks"*}
+    if (( ${#pre} <= 6 )); then REPLY=${REPLY:${#pre}}; fi
+  fi
 }
 
 # ─── temp dir and error masking ───────────────────────────────────────
@@ -2123,6 +2139,9 @@ H_SRC=()
 # A hit on a name that is no path of the tree (an archive member's): a name
 # hit as a path's is, though its file and text differ.
 declare -A H_NAME=()
+# The path of the content an unscanned hit stands for, whose identity its
+# baseline fingerprint takes.
+declare -A H_CPATH=()
 H_COMMIT=()
 declare -A HIT_AT=()
 add_hit() { # pattern file line text source [commit]
@@ -2245,6 +2264,7 @@ AR_NTEXT=()
 AR_NSRC=()
 AR_NNAME=()
 AR_UPATH=()
+AR_ULABEL=()
 AR_UWHY=()
 AR_USRC=()
 AR_K=0
@@ -2444,7 +2464,7 @@ if [[ "$ARCHIVES" -eq 1 ]]; then
     AR_NSRC+=("$AR_CSRC"); AR_NSUBJ+=("$3"); AR_NTEXT+=("($2) $3"); AR_NNAME+=(0)
   }
   ar_unread() { # name why
-    AR_UPATH+=("$AR_LABEL!$1"); AR_UWHY+=("$2"); AR_USRC+=("$AR_CSRC")
+    AR_UPATH+=("$AR_LABEL!$1"); AR_UWHY+=("$2"); AR_USRC+=("$AR_CSRC"); AR_ULABEL+=("$AR_LABEL")
   }
   ar_zip() { # 1 if the archive is not read
     local LC_ALL=C tl e n cds cdo i k nl xl cl name
@@ -3083,11 +3103,25 @@ if [[ "$HISTORY" -eq 1 && "$HIST_COMMITS" -gt 0 ]]; then
   # again in the re-merge, hiding them: merge.default is pinned to git's own
   # (HLOG), and a repository whose info/attributes holds anything — where a
   # driver is named per path, and nothing here can blank it — gets -m.
+  # So is one in git's config that the re-merge would still run: one named
+  # `text`, the name merge.default=text looks up among the user's drivers
+  # before git's own, or, before git 2.40, where GIT_ATTR_SOURCE is unknown,
+  # any, as an in-tree .gitattributes can name it (/qaa).
   HMERGE=(-m)
   HIST_MERGE_MODE=separate
   run_git "rev-parse (info/attributes)" "$TMPD/iattr" g rev-parse --git-path info/attributes
   iattr=$(<"$TMPD/iattr")
-  if [[ ! -L "$iattr" && ! -s "$iattr" ]] && g log -0 --all --diff-merges=remerge >/dev/null 2>&1; then
+  run_git "version" "$TMPD/gver" git version
+  gv=$(<"$TMPD/gver")
+  old_attr=1
+  if [[ "$gv" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]] &&
+     (( BASH_REMATCH[1] > 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] >= 40) )); then old_attr=0; fi
+  run_git "config (merge drivers)" "$TMPD/mdrv" g config -z --name-only --get-regexp '^merge\..*\.driver$'
+  mdrv=0
+  while IFS= read -r -d '' k; do
+    if [[ "$k" == merge.text.driver || $old_attr -eq 1 ]]; then mdrv=1; fi
+  done < "$TMPD/mdrv"
+  if [[ $mdrv -eq 0 && ! -L "$iattr" && ! -s "$iattr" ]] && g log -0 --all --diff-merges=remerge >/dev/null 2>&1; then
     HMERGE=(--max-parents=2 --diff-merges=remerge)
     HIST_MERGE_MODE=remerge
   fi
@@ -3569,16 +3603,22 @@ fi
 # Under --strict, what could not be scanned is itself a finding.
 if [[ "$STRICT" -eq 1 ]]; then
   for path in "${BINARY_PATHS[@]}"; do
+    n0=${#H_FILE[@]}
     add_hit "unscanned:binary" "$path" 0 "(binary file; content not scanned)" "${BINARY["p$path"]}"
+    if (( ${#H_FILE[@]} > n0 )); then H_CPATH[$n0]=$path; fi
   done
   for path in "${GITLINKS[@]}"; do
+    n0=${#H_FILE[@]}
     add_hit "unscanned:submodule" "$path" 0 "(submodule; contents not scanned)" "index"
+    if (( ${#H_FILE[@]} > n0 )); then H_CPATH[$n0]=$path; fi
   done
   for path in "${GIT_DIRS[@]}"; do
     add_hit "unscanned:git-dir" "$path" 0 "(named .git; contents not scanned)" "worktree"
   done
   for i in "${!AR_UPATH[@]}"; do
+    n0=${#H_FILE[@]}
     add_hit "unscanned:archive" "${AR_UPATH[$i]}" 0 "(archive member not read: ${AR_UWHY[$i]})" "${AR_USRC[$i]}"
+    if (( ${#H_FILE[@]} > n0 )); then H_CPATH[$n0]=${AR_ULABEL[$i]}; fi
   done
 fi
 
@@ -3895,13 +3935,16 @@ kv_yields() {
   return "$r"
 }
 
-# --redact: a tell found in a name (a path, a ref, a tag) is the matches of
-# a pattern's name hit; each is hidden whole wherever a path prints.
+# --redact: a tell is the matches of a pattern's hit, in a name (a path, a
+# ref, a tag) or a line; each is hidden whole wherever a path prints, and in
+# a credential hit's text, which prints a keyword or a path rule's name:
+# `MYHOST.Password[redacted, …]` and `MYHOST-client.p12` printed a tell the
+# line's or name's own hit hid, when only a name's tells were gathered (/qaa).
 REDACT_TOKS=()
 if [[ "$REDACT" -eq 1 ]]; then
   declare -A REDACT_SEEN=()
   for i in "${!H_FILE[@]}"; do
-    [[ -z "${CRED_RE["l${H_PAT[$i]}"]+x}" ]] && is_name_hit "$i" || continue
+    [[ -z "${CRED_RE["l${H_PAT[$i]}"]+x}" ]] || continue
     for j in ${MT_OF[$i]}; do
       [[ -n "${MT_TXT[j]}" && -z "${REDACT_SEEN["t${MT_TXT[j]}"]+x}" ]] || continue
       REDACT_SEEN["t${MT_TXT[j]}"]=1
@@ -3992,7 +4035,8 @@ for i in "${!H_FILE[@]}"; do
   if [[ -n "${CRED_RE["l${H_PAT[$i]}"]+x}" ]]; then IS_CRED_HIT[$i]=1; fi
   if [[ "$REDACT" -eq 1 ]]; then
     redact_names "${SHOW_FILE[$i]}"; SHOW_FILE[$i]=$REPLY
-    if [[ -z "${CRED_RE["l${H_PAT[$i]}"]+x}" ]]; then SHOW[$i]="[redacted, ${#H_TEXT[$i]} chars]"; fi
+    if [[ -z "${CRED_RE["l${H_PAT[$i]}"]+x}" ]]; then SHOW[$i]="[redacted, ${#H_TEXT[$i]} chars]"
+    else redact_names "${SHOW[$i]}"; SHOW[$i]=$REPLY; fi
     # A config pattern with no label is its own label, and its regex is the
     # tell: it prints as its line in --list-patterns.
     if [[ -n "${PLAIN_PAT["l${H_PAT[$i]}"]+x}" && -n "${PAT_NUM["l${H_PAT[$i]}"]+x}" ]]; then
@@ -4031,8 +4075,37 @@ if [[ -n "$BASELINE_IN$BASELINE_OUT" ]]; then
     [[ $bl -gt 0 ]] || die "baseline $BASELINE_IN: empty, not a leakcheck baseline"
   fi
   mkdir "$TMPD/fp" || die "cannot create a temporary directory"
+  # An unscanned hit's text is the same whatever its content holds, so the
+  # content's identity, the index's and the worktree's, is in its print: a
+  # binary file baselined stayed baselined whatever it came to hold (/qaa).
+  declare -A FPX=() CP_I=() CP_W=()
+  cps=()
   for i in "${KEEP[@]}"; do
-    printf '%s\0%s\0%s' "${H_FILE[$i]}" "${H_PAT[$i]}" "${H_TEXT[$i]}" > "$TMPD/fp/$i"
+    if [[ -n "${H_CPATH[$i]+x}" ]]; then cps+=("${H_CPATH[$i]}"); fi
+  done
+  if [[ ${#cps[@]} -gt 0 ]]; then
+    run_git "ls-files (baseline)" "$TMPD/bls" g ls-files -s -z
+    while IFS= read -r -d '' row; do
+      m=${row%%$'\t'*}; o=${m#* }
+      CP_I["p${row#*$'\t'}"]=${o%% *}
+    done < "$TMPD/bls"
+    for p in "${cps[@]}"; do
+      [[ -z "${CP_W["p$p"]+x}" && -f "$p" && ! -L "$p" ]] || continue
+      run_git "hash-object (baseline)" "$TMPD/bwh" git hash-object --no-filters -- "$p"
+      CP_W["p$p"]=$(<"$TMPD/bwh")
+    done
+    for i in "${KEEP[@]}"; do
+      [[ -n "${H_CPATH[$i]+x}" ]] || continue
+      p=${H_CPATH[$i]}
+      FPX[$i]="${CP_I["p$p"]:--} ${CP_W["p$p"]:--}"
+    done
+  fi
+  for i in "${KEEP[@]}"; do
+    if [[ -n "${FPX[$i]+x}" ]]; then
+      printf '%s\0%s\0%s\0%s' "${H_FILE[$i]}" "${H_PAT[$i]}" "${H_TEXT[$i]}" "${FPX[$i]}" > "$TMPD/fp/$i"
+    else
+      printf '%s\0%s\0%s' "${H_FILE[$i]}" "${H_PAT[$i]}" "${H_TEXT[$i]}" > "$TMPD/fp/$i"
+    fi
     printf '%s\n' "$TMPD/fp/$i"
   done > "$TMPD/fp.list"
   FP_HASH=()
@@ -4182,8 +4255,10 @@ fi
     s=${s//$'\t'/"$tab"}
     s=${s//$'\n'/"$nl"}
     s=${s//$'\r'/"$cr"}
-    # XML 1.0 allows no other C0 character, even as a reference.
+    # XML 1.0 allows no other C0 character, even as a reference, nor U+FFFE
+    # and U+FFFF, well-formed UTF-8 a hit line can hold (/qaa: unparseable).
     s=$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\037')
+    s=${s//$'\xef\xbf\xbe'/}; s=${s//$'\xef\xbf\xbf'/}
     utf8_clean "$s"
   }
   # A relative URI reference for a path, for --format sarif: every byte but
