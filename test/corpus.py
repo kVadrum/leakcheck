@@ -103,7 +103,9 @@ ESCAPED = [
 ]
 ENCODED = [
     ("percent", lambda v: "https://api.service.invalid/cb?state=" + urllib.parse.quote(v, safe="")),
-    ("base64",  lambda v: "auth: " + base64.b64encode(("token=" + v).encode()).decode()),
+    # Under a name no keyword rule reads, so the column measures decoding
+    # alone (`auth:` became generic-key's keyword in v0.18.0).
+    ("base64",  lambda v: "data: " + base64.b64encode(("token=" + v).encode()).decode()),
 ]
 
 

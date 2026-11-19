@@ -152,6 +152,7 @@ SPECS = {
  "http-bearer-token": ("", ["Authori", "zation: Bearer ", ("an", 30), ("d", 1), ("a", 1)]),
  "curl-user-password": ("", ["cu", "rl -u deploy:", ("an", 14), ("d", 1), ("a", 1)]),
  "xml-key-value": ("", ['<add key="ClearText', 'Password" value="', ("an", 16), ("d", 1), ("a", 1)]),
+ "generic-key": ("", ["ke", "y = \"", ("an", 30), ("d", 1), ("a", 1)]),
 }
 
 

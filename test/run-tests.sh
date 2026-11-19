@@ -1902,7 +1902,7 @@ t_credential_every_rule_finds_its_own_format() {
 import json, re, sys
 doc = json.load(open(sys.argv[1]))
 kv = {"aws-secret-access-key", "url-password", "generic-secret", "http-basic-auth",
-      "http-bearer-token", "curl-user-password", "xml-key-value"}
+      "http-bearer-token", "curl-user-password", "xml-key-value", "generic-key"}
 def shown(cid, m):
     if cid in markers:
         return m
@@ -1927,7 +1927,9 @@ by = {}
 for h in doc["hits"]:
     by.setdefault(h["file"], []).append(h)
 nrules = len(rows) + len({cid for cid, _ in paths})
-assert doc["credentials_scanned"] is True and doc["credentials"] == {"rules": nrules, "placeholders": 0}, doc["credentials"]
+# One weak value: the XML stand-in's key name, read by generic-key as
+# `key="ClearTextPassword"` (v0.18.0).
+assert doc["credentials_scanned"] is True and doc["credentials"] == {"rules": nrules, "placeholders": 0, "weak": 1}, doc["credentials"]
 assert list(doc)[-2:] == ["credentials_scanned", "credentials"], list(doc)
 for cid, line, m in rows:
     hs = by.pop(cid + ".txt", [])
@@ -3559,12 +3561,69 @@ rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
 got = sorted((h["line"], h["pattern"], h["text"]) for h in doc["hits"])
 want = sorted((n + 1, "credential:" + cid, shown) for n, (cid, _, _, shown) in enumerate(rows))
 assert got == want, (got, want)
-assert doc["credentials"]["weak"] == 5, doc["credentials"]
+# Five weak values, and the two XML lines' key names, which generic-key
+# reads as `key="…"` (v0.18.0).
+assert doc["credentials"]["weak"] == 7, doc["credentials"]
 PY
   assert_exit 1 "$BIN"
   while IFS=$'\t' read -r _ _ v _; do
     assert_not_contains "$v" "$LC_OUT"
     assert_not_contains "$v" "$LC_ERR"
+  done < "$vt"
+}
+
+t_kv_generic_key_names() {
+  # gap 1 (v0.18.0): generic-key finds a secret under the weaker names —
+  # `key`, `auth`, `access`, `creds`, `api` — judged like generic-secret,
+  # and a value of two or more parts that are each a word, a number or a
+  # letter and a number (a slug, a path, a cache key, a file name) is weak.
+  # It yields to generic-secret (`API_KEY=` is reported once, as that rule)
+  # and to a fixed-format rule. Guard: generic-secret still reports the
+  # word-made password generic-key sets aside.
+  local vt="$PWD/.git/kv.tsv"
+  python3 -I - "$vt" <<'PY'
+import base64, random, sys
+r = random.Random(67)
+an = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz"
+def val(n):
+    return "".join(r.choice(an) for _ in range(n - 2)) + str(r.randint(2, 9)) + "q"
+rows = []
+for fmt, kw, n in (("SIGNING_KEY=%s", "KEY", 32), ('  "key": "%s",', "key", 24), ("auth = '%s'", "auth", 20),
+                   ('ACCESS="%s"', "ACCESS", 28), ("creds: %s", "creds", 18), ("api: %s", "api", 30)):
+    v = val(n)
+    rows.append(("generic-key", fmt % v, "%s[redacted, %d chars]" % (kw, n), v))
+b = base64.b64encode(bytes(r.getrandbits(8) for _ in range(32))).decode()
+rows.append(("generic-key", "    MFA_ENCRYPTION_KEY=%s \\" % b, "KEY[redacted, %d chars]" % len(b), b))
+v = val(26)
+rows.append(("generic-secret", "API_KEY=%s" % v, "API_KEY[redacted, 26 chars]", v))
+rows.append(("generic-secret", 'password = "Winter-2024-db"', "password[redacted, 14 chars]", "Winter-2024-db"))
+rows.append(("generic-key", "KEY=Kestrel7Harbor9Lantern", "KEY[redacted, 22 chars]", "Kestrel7Harbor9Lantern"))
+weak = ["key: cache-v1-node-modules-x86_64", "SSH_KEY=~/.ssh/id_ed25519", "- Authority: `02-module-architecture.md` (core)",
+        '  "identity_key": "rumba42abc-26-tasks",', "\tr2Key: 'tenants/t1/media/photo',", 'KEY = "Winter-2024-db"',
+        "SSH_AUTH_SOCK=/run/user/1000/gnupg/S.gpg-agent.ssh"]
+with open(sys.argv[1], "w") as f:
+    for row in rows:
+        f.write("\t".join(row) + "\n")
+with open(sys.argv[1] + ".weak", "w") as f:
+    f.write("\n".join(weak) + "\n")
+PY
+  { cut -f2 "$vt"; cat "$vt.weak"; } > g.txt
+  git add g.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "$vt" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
+got = sorted((h["line"], h["pattern"], h["text"]) for h in doc["hits"])
+want = sorted((n + 1, "credential:" + cid, shown) for n, (cid, _, shown, _) in enumerate(rows))
+assert got == want, (got, want)
+assert doc["credentials"]["weak"] == 7, doc["credentials"]
+PY
+  assert_exit 1 "$BIN"
+  while IFS=$'\t' read -r _ _ _ v; do
+    assert_not_contains "$v" "$LC_OUT"
   done < "$vt"
 }
 
@@ -4259,6 +4318,7 @@ lc_test "keyword rules: masked where they print"  t_kv_values_are_masked_where_t
 lc_test "keyword rules: URL sub-delims"          t_kv_url_password_takes_rfc3986_sub_delims
 lc_test "keyword rules: a dotted token is no name" t_kv_dotted_token_is_no_name
 lc_test "keyword rules: HTTP authentication"     t_kv_http_auth_rules
+lc_test "keyword rules: the weaker names"       t_kv_generic_key_names
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder
