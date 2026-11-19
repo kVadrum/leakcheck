@@ -4006,6 +4006,49 @@ t_rule_runs_only_named_rules() {
   assert_exit 2 "$BIN" --rule '/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/'
 }
 
+t_integrations_run_leakcheck() {
+  # Stage F (v0.23.0): the pre-commit manifest runs bin/leakcheck over the
+  # whole repository (no file names, every commit, whatever it touches), and
+  # the GitHub Action runs its own checkout's bin/leakcheck in the caller's
+  # workspace, the input's words as arguments and a glob character literal.
+  local m="$REPO_DIR/.pre-commit-hooks.yaml" a="$REPO_DIR/action.yml" ap="$PWD/.git/action"
+  python3 - "$m" <<'PY'
+import sys
+hook = [l.strip() for l in open(sys.argv[1]) if l.strip() and not l.lstrip().startswith("#")]
+for want in ("- id: leakcheck", "entry: bin/leakcheck", "language: script", "pass_filenames: false", "always_run: true"):
+    assert want in hook, (want, hook)
+PY
+  [[ -x "$REPO_DIR/bin/leakcheck" ]]
+  # The action's step, as GitHub runs `shell: bash`.
+  python3 - "$a" > .git/run.sh <<'PY'
+import sys
+lines = open(sys.argv[1]).read().split("\n")
+i = lines.index("      run: |")
+out = []
+for l in lines[i + 1:]:
+    if l.startswith("        ") or not l.strip():
+        out.append(l[8:])
+    else:
+        break
+print("\n".join(out).strip())
+PY
+  [[ "$(<"$a")" == *'LEAKCHECK_ARGS: ${{ inputs.args }}'* ]]
+  mkdir -p "$ap/bin"
+  ln -s "$BIN" "$ap/bin/leakcheck"
+  seed a.txt "see /home/alice/x"
+  commit init
+  GITHUB_ACTION_PATH="$ap" LEAKCHECK_ARGS="--json --strict" \
+    assert_exit 1 bash --noprofile --norc -eo pipefail .git/run.sh
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["count"] == 1, d' "$LC_OUT"
+  GITHUB_ACTION_PATH="$ap" LEAKCHECK_ARGS="*" \
+    assert_exit 2 bash --noprofile --norc -eo pipefail .git/run.sh
+  assert_contains "unexpected arg: *" "$LC_ERR"
+  seed a.txt "clean"
+  commit clean
+  GITHUB_ACTION_PATH="$ap" LEAKCHECK_ARGS="" \
+    assert_exit 0 bash --noprofile --norc -eo pipefail .git/run.sh
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -4709,6 +4752,7 @@ lc_test "label: a pattern prints its name"       t_label_pattern_prints_its_name
 lc_test "config from the environment"            t_config_from_environment
 lc_test "--redact hides every hit's text"        t_redact_hides_every_hit_text
 lc_test "--rule runs only the named rules"      t_rule_runs_only_named_rules
+lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder

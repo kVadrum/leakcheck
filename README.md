@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.22.0*
+*README v0.23.0*
 
 ## Install
 
@@ -470,6 +470,27 @@ Here is the Quick start run, formatted for reading:
 ## Use in CI
 
 Commit the single script into your repo, for example as `vendor/leakcheck` — not the whole leakcheck checkout, whose README and tests are full of deliberate example leaks that your scan would then report.
+
+Or use this repository as a GitHub Action, pinned to a commit or tag as any action; it runs its own copy of the script on your checkout, and `args` takes leakcheck's arguments:
+
+```yaml
+- uses: actions/checkout@v5
+- uses: kVadrum/leakcheck@<commit or tag>
+  with:
+    args: --redact
+```
+
+Or as a [pre-commit](https://pre-commit.com) hook, which scans the whole repository on every commit:
+
+```yaml
+repos:
+  - repo: https://github.com/kVadrum/leakcheck
+    rev: <commit or tag>
+    hooks:
+      - id: leakcheck
+```
+
+The script, the Action and the hook behave alike: any non-zero exit fails the step or the commit.
 
 A GitHub Actions step, after your checkout step:
 

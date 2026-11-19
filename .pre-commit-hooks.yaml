@@ -1,0 +1,10 @@
+# For the pre-commit framework (pre-commit.com). leakcheck scans the whole
+# repository's tracked content, index and worktree, so it takes no file
+# names and runs on every commit, whatever the commit touches.
+- id: leakcheck
+  name: leakcheck
+  description: Find host paths, internal names and credentials in what a commit publishes.
+  entry: bin/leakcheck
+  language: script
+  pass_filenames: false
+  always_run: true

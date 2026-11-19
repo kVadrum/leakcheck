@@ -112,7 +112,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.22.0"
+VERSION="0.23.0"
 
 OUTPUT_MODE="text"
 STRICT=0

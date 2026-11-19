@@ -1,0 +1,25 @@
+# A composite action: runs this checkout's bin/leakcheck in the caller's
+# workspace, after the caller's own checkout step. The step fails on any
+# non-zero exit, as leakcheck asks of every caller.
+name: leakcheck
+description: Find host paths, internal names and credentials before a repository goes public.
+inputs:
+  args:
+    description: >-
+      leakcheck's arguments, split at whitespace: --history, --redact, --json,
+      --strict, --config FILE, and so on. --history needs the full history
+      (actions/checkout with fetch-depth 0).
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: leakcheck
+      shell: bash
+      env:
+        # Through the environment, never into the script: an input pasted
+        # into `run` is code.
+        LEAKCHECK_ARGS: ${{ inputs.args }}
+      run: |
+        read -r -a args <<< "$LEAKCHECK_ARGS"
+        "$GITHUB_ACTION_PATH/bin/leakcheck" "${args[@]}"
