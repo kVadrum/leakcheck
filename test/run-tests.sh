@@ -817,7 +817,7 @@ t_help_lists_every_flag() {
   # The script header is --help: a flag missing there is undiscoverable.
   assert_exit 0 "$BIN" --help
   local f
-  for f in --strict --history --history-range --json --format --baseline --write-baseline --dir --stdin --decode --redact --rule --list-patterns --list-rules --config --root --version --help; do
+  for f in --strict --history --history-range --json --format --baseline --write-baseline --dir --stdin --decode --archives --redact --rule --list-patterns --list-rules --config --root --version --help; do
     assert_contains "$f" "$LC_OUT"
   done
 }
@@ -4394,6 +4394,156 @@ assert src == [(".leakcheckrc", "decoded-base64"), ("a.txt", "decoded-base64"), 
 ' "$LC_OUT"
 }
 
+t_archives_read_members() {
+  # Stage E (v0.28.0): --archives reads tracked zip, tar and gzip files by
+  # their first bytes, with bash and git alone: a deflated member, a stored
+  # one with a key, one past 64 KiB, one exactly 65536 bytes (the padding's
+  # edge), a pax, a ustar-prefix and a GNU long name, a link's target, a
+  # gzip's own name, member names; an encrypted member and one not read
+  # whole counted, an archive inside one a binary member, a damaged archive
+  # still a binary file; --strict reports each, --dir reads them too, a
+  # caller's GIT_OBJECT_DIRECTORY is not the scratch repository's, and an
+  # index copy differing from the worktree's is read as its own. Without
+  # the flag nothing changes.
+  local gh d
+  gh=$(cred github-token)
+  python3 - "$gh" <<'PY'
+import gzip, io, sys, tarfile, zipfile
+gh = sys.argv[1]
+def zbytes(entries):
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w") as z:
+        for name, data, method in entries:
+            zi = zipfile.ZipInfo(name)
+            zi.compress_type = method
+            z.writestr(zi, data)
+    return bytearray(b.getvalue())
+def set_flag(z, name, bit):
+    # zipfile clears flag_bits as it writes: set them in the bytes.
+    i = 0
+    while True:
+        i = z.find(b"PK\x01\x02", i)
+        n = int.from_bytes(z[i + 28:i + 30], "little")
+        if z[i + 46:i + 46 + n] == name.encode():
+            z[i + 8] |= bit
+            lho = int.from_bytes(z[i + 42:i + 46], "little")
+            z[lho + 6] |= bit
+            return
+        i += 4
+inner = zbytes([("in.txt", "see /home/alice/inner\n", zipfile.ZIP_DEFLATED)])
+big = "".join("line %d\n" % i for i in range(30000)) + "end /home/alice/big\n"
+ex = "see /home/alice/exact\n"
+ex += "a" * (65536 - len(ex) - 1) + "\n"
+assert len(ex) == 65536
+a = zbytes([
+    ("conf/app.txt", "x\nsee /home/alice/zip\n", zipfile.ZIP_DEFLATED),
+    ("stored.txt", "token = " + gh + "\n", zipfile.ZIP_STORED),
+    ("big.txt", big, zipfile.ZIP_DEFLATED),
+    ("exact.txt", ex, zipfile.ZIP_DEFLATED),
+    ("locked.txt", "see /home/alice/locked\n", zipfile.ZIP_STORED),
+    ("inner.zip", bytes(inner), zipfile.ZIP_STORED),
+    ("dir-MYHOST/", "", zipfile.ZIP_STORED),
+])
+set_flag(a, "locked.txt", 1)
+open("a.zip", "wb").write(a)
+# The stated size one more than the truth: never read whole.
+bad = zbytes([("bad.txt", "see /home/alice/bad\n" * 50, zipfile.ZIP_DEFLATED)])
+cd = bad.rfind(b"PK\x01\x02")
+u = int.from_bytes(bad[cd + 24:cd + 28], "little")
+bad[cd + 24:cd + 28] = (u + 1).to_bytes(4, "little")
+open("bad.zip", "wb").write(bytes(bad))
+open("broken.zip", "wb").write(b"PK\x03\x04" + bytes(range(256)) * 4)
+def tbytes(fmt, members):
+    b = io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w", format=fmt) as t:
+        for name, data, link in members:
+            ti = tarfile.TarInfo(name)
+            if link is not None:
+                ti.type = tarfile.SYMTYPE
+                ti.linkname = link
+                t.addfile(ti)
+            else:
+                d = data.encode()
+                ti.size = len(d)
+                t.addfile(ti, io.BytesIO(d))
+    return b.getvalue()
+tgz = tbytes(tarfile.PAX_FORMAT, [("etc/x.cfg", "key: value\ntoken = " + gh + "\n", None),
+                                 ("lnk", None, "/home/alice/link"),
+                                 ("d/" + "n" * 120 + "/deep.txt", "see /home/alice/deep\n", None)])
+open("b.tar.gz", "wb").write(gzip.compress(tgz, mtime=0))
+open("c.tar", "wb").write(tbytes(tarfile.USTAR_FORMAT, [("p" * 80 + "/" + "q" * 60 + ".txt", "see /home/alice/prefix\n", None)]))
+open("d.tar", "wb").write(tbytes(tarfile.GNU_FORMAT, [("g/" + "m" * 120 + "/x.txt", "see /home/alice/gnu\n", None)]))
+def gz(text):
+    b = io.BytesIO()
+    with gzip.GzipFile(filename="orig.txt", mode="wb", fileobj=b, mtime=0) as g:
+        g.write(text)
+    return b.getvalue()
+open("e.gz", "wb").write(gz(b"x\nsee /home/alice/gz\n"))
+open("e2.gz", "wb").write(gz(b"x\nsee /home/alice/gz2\n"))
+PY
+  git add a.zip bad.zip broken.zip b.tar.gz c.tar d.tar e.gz
+  rc_file 'pattern MYHOST'
+  commit init
+  local H='[/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/]' n m p q
+  n=$(printf 'n%.0s' {1..120}); m=$(printf 'm%.0s' {1..120})
+  p=$(printf 'p%.0s' {1..80}); q=$(printf 'q%.0s' {1..60})
+  assert_exit 0 "$BIN"
+  assert_contains "7 binary skipped" "$LC_OUT"
+  assert_exit 1 "$BIN" --archives
+  assert_contains "a.zip!conf/app.txt:2: $H see /home/alice/zip" "$LC_OUT"
+  assert_contains "a.zip!stored.txt:1: [credential:github-token] $(masked "$gh")" "$LC_OUT"
+  assert_contains "a.zip!big.txt:30001: $H end /home/alice/big" "$LC_OUT"
+  assert_contains "a.zip!exact.txt:1: $H see /home/alice/exact" "$LC_OUT"
+  assert_contains "a.zip!dir-MYHOST/:0: [MYHOST] dir-MYHOST/" "$LC_OUT"
+  assert_contains "b.tar.gz!etc/x.cfg:2: [credential:github-token] $(masked "$gh")" "$LC_OUT"
+  assert_contains "b.tar.gz!lnk:0: $H -> /home/alice/link" "$LC_OUT"
+  assert_contains "b.tar.gz!d/$n/deep.txt:1: $H see /home/alice/deep" "$LC_OUT"
+  assert_contains "c.tar!$p/$q.txt:1: $H see /home/alice/prefix" "$LC_OUT"
+  assert_contains "d.tar!g/$m/x.txt:1: $H see /home/alice/gnu" "$LC_OUT"
+  assert_contains "e.gz!orig.txt:2: $H see /home/alice/gz" "$LC_OUT"
+  assert_not_contains "locked" "$LC_OUT"
+  assert_not_contains "alice/inner" "$LC_OUT"
+  assert_not_contains "alice/bad" "$LC_OUT"
+  assert_not_contains "$gh" "$LC_OUT"
+  assert_not_contains "internal error" "$LC_ERR"
+  assert_contains "leakcheck: 11 match(es)" "$LC_ERR"
+  assert_contains "; 2 binary skipped," "$LC_ERR"
+  assert_contains "; 6 archives read (10 members, 2 not read), 1 archives not read (one level)" "$LC_ERR"
+  assert_exit 1 "$BIN" --archives --strict --json
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+u = sorted((h["pattern"], h["file"], h["text"]) for h in d["hits"] if h["pattern"].startswith("unscanned"))
+assert u == [("unscanned:archive", "a.zip!locked.txt", "(archive member not read: encrypted)"),
+             ("unscanned:archive", "bad.zip!bad.txt", "(archive member not read: not read whole)"),
+             ("unscanned:binary", "a.zip!inner.zip", "(binary file; content not scanned)"),
+             ("unscanned:binary", "broken.zip", "(binary file; content not scanned)")], u
+assert d["archives"] == {"read": 6, "members": 10, "members_not_read": 2, "not_read": 1}, d["archives"]
+' "$LC_OUT"
+  # A caller's object directory (a hook sets one) is not the scratch
+  # repository's: git would look for the member there.
+  GIT_OBJECT_DIRECTORY="$PWD/.git/objects" assert_exit 1 "$BIN" --archives
+  assert_contains "a.zip!big.txt:30001: $H end /home/alice/big" "$LC_OUT"
+  # --dir reads them too: its scratch repository is not git's here.
+  d="$PWD/.git/plain"
+  mkdir "$d"
+  cp a.zip e.gz "$d/"
+  assert_exit 1 "$BIN" --dir "$d" --archives
+  assert_contains "a.zip!conf/app.txt:2: $H see /home/alice/zip" "$LC_OUT"
+  assert_contains "e.gz!orig.txt:2: $H see /home/alice/gz" "$LC_OUT"
+  rm -rf "$d"
+  # A worktree copy differing from the index's: each read, as its own.
+  cp e2.gz e.gz
+  rm e2.gz
+  assert_exit 1 "$BIN" --archives --json
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+e = sorted((h["source"], h["text"]) for h in d["hits"] if h["file"] == "e.gz!orig.txt")
+assert e == [("index", "see /home/alice/gz"), ("worktree", "see /home/alice/gz2")], e
+' "$LC_OUT"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -5107,6 +5257,7 @@ lc_test "--baseline: errors"                    t_baseline_errors
 lc_test "--dir: every file under a directory"   t_dir_scans_every_file
 lc_test "--stdin"                               t_stdin_scans_input
 lc_test "--decode: base64, hex, percent"        t_decode_finds_encoded_values
+lc_test "--archives: zip, tar, gzip"            t_archives_read_members
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential

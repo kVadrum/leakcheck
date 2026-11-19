@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.27.0*
+*README v0.28.0*
 
 ## Install
 
@@ -239,6 +239,23 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
 - **One level, and the tracked content only**: a value encoded twice is not found, nor one in `--history`'s lines; the summary counts the values decoded.
 - It is off by default: it costs a second pass over every line that holds a candidate.
 
+## Archives
+
+`--archives` reads every tracked zip (a `.jar`, `.war`, `.apk`, `.whl` or `.nupkg` is one), tar and gzip file (a `.tar.gz` too), found by its first bytes rather than its name, and scans each file it holds as tracked content, and each name in it as a path. Here `release.zip` holds `config/settings.yaml`, and `.leakcheckrc` names `MYHOST`:
+
+```text
+$ leakcheck --archives
+release.zip!config/settings.yaml:2: [MYHOST] host: build-MYHOST.internal
+leakcheck: 1 match(es)
+leakcheck: scanned 1 tracked files (index + worktree; 0 binary skipped, 0 submodules not scanned, 1 skipped by config, 0 allowed; history not scanned; credentials scanned, 0 placeholders not reported; 1 archives read (2 members, 0 not read), 0 archives not read (one level))
+```
+
+- **A hit names the member** as `archive!member`; its line is the member's.
+- **Bash and git alone read it**, no `unzip`, `tar` or `gzip`: git inflates what is deflated.
+- **One level:** an archive inside an archive is a binary member, counted.
+- **Counted, never silent:** a member encrypted, compressed by another method than deflate, or not read whole, and an archive that cannot be read (zip64, a damaged file), are in the summary, and `--strict` reports each; an archive read is no longer a binary file not scanned.
+- Tracked content only, not `--history`, and not decoded under `--decode`.
+
 ## Scanning files outside a repository
 
 `--dir DIR` scans every file under `DIR` — a release tarball unpacked, a build output, a folder that is no repository — as if each were tracked, ignored files included, with the `.leakcheckrc` and `.leakcheckrc.local` at its top; `--stdin` scans standard input as one file, `stdin`, with the config `--config` or the environment names.
@@ -418,6 +435,7 @@ leakcheck --baseline F        report only the findings F does not hold
 leakcheck --dir DIR           scan every file under DIR, in a repository or not
 leakcheck --stdin             scan standard input, as a file named stdin
 leakcheck --decode            also read encoded values decoded (base64, hex, %XX)
+leakcheck --archives          also read what zip, tar and gzip files hold
 leakcheck --redact            print no hit's text, and no tell found in a name
 leakcheck --rule ID           run only this rule (repeatable): credential:<id> or a label
 leakcheck --list-patterns     print the effective pattern set
