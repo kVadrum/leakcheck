@@ -27,6 +27,9 @@
 #                                # --history over the commits in one git
 #                                # revision range only (origin/main..HEAD)
 #   leakcheck --json             # machine-readable output
+#   leakcheck --redact           # print no hit's text, and no tell in a path
+#   leakcheck --rule ID          # run only this rule (repeatable): a
+#                                # credential:<id> or a config label
 #   leakcheck --list-patterns    # print the effective pattern set
 #   leakcheck --list-rules       # print each credential rule's label, on/off
 #   leakcheck -c, --config FILE  # config path, relative to the cwd (after --root)
@@ -37,6 +40,8 @@
 # Config file (.leakcheckrc) is line-oriented:
 #   pattern <regex>          # add an ERE to the scan set; a leading (?i)
 #                            # makes it (or an allow rule) ignore case
+#   label   <name> <regex>   # the same, its hits and --list-patterns line
+#                            # printing the name, never the regex
 #   allow   <regex>          # allowlist hits: an ERE matching all of
 #                            # path:line:text, or path:line:<match> for
 #                            # every match of the hit's own pattern there;
@@ -51,6 +56,10 @@
 #
 # Blank lines and lines starting with '#' are ignored. Name and symlink hits
 # report line 0.
+#
+# Environment: LEAKCHECK_CONFIG names a config as --config does (--config
+# wins); LEAKCHECK_RC holds config lines, read after every config file — a
+# CI secret, so the tells stay out of the repo.
 #
 # Git history and commit metadata are scanned only with --history or
 # --history-range. Never scanned: submodule contents, encoded or compressed
@@ -103,7 +112,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.20.0"
+VERSION="0.21.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -113,6 +122,8 @@ LIST_ONLY=0
 CONFIG_FILE=""
 ROOT=""
 ARG_ERR=""
+REDACT=0
+RULE_ONLY=()
 
 # Every error leaves through fail, masked by every built-in rule once the
 # temp dir exists (mask_texts): an error quotes what it is about — a config
@@ -161,6 +172,12 @@ while [[ $# -gt 0 ]]; do
       [[ -z "$HIST_RANGE" ]] || die "--history-range given twice; pass one revision range"
       HIST_RANGE="$2"; HISTORY=1; shift 2 ;;
     --list-patterns)   LIST_ONLY=1; shift ;;
+    --redact)          REDACT=1; shift ;;
+    --rule)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "leakcheck: $1 needs a value" >&2; usage 2 >&2
+      fi
+      RULE_ONLY+=("$2"); shift 2 ;;
     --list-rules)      LIST_ONLY=2; shift ;;
     -c|--config|-C|--root)
       if [[ $# -lt 2 || -z "$2" ]]; then
@@ -1143,8 +1160,8 @@ cred_matches_all() { # out label file...
 
 # TEXT with each run of hidden bytes shown as its first four and its length,
 # a hit's mask; HIDE names an associative array keyed PREFIX<byte offset>.
-render_masked() { # text hide-array prefix -> REPLY
-  local LC_ALL=C t=$1 pre=$3 k run=-1
+render_masked() { # text hide-array prefix [shown] -> REPLY
+  local LC_ALL=C t=$1 pre=$3 shown=${4:-4} k run=-1
   local -n rm_hide=$2
   REPLY=""
   for (( k = 0; k <= ${#t}; k++ )); do
@@ -1153,7 +1170,7 @@ render_masked() { # text hide-array prefix -> REPLY
       continue
     fi
     if [[ $run -ge 0 ]]; then
-      REPLY+="${t:run:4}[redacted, $(( k - run )) chars]"; run=-1
+      REPLY+="${t:run:shown}[redacted, $(( k - run )) chars]"; run=-1
     fi
     if [[ $k -lt ${#t} ]]; then REPLY+=${t:k:1}; fi
   done
@@ -1284,6 +1301,7 @@ fi
 # proceeding on defaults alone is a confident clean pass over a repo that
 # nothing the caller asked for actually checked.
 CONFIG_ABS=""
+if [[ -z "$CONFIG_FILE" && -n "${LEAKCHECK_CONFIG-}" ]]; then CONFIG_FILE=$LEAKCHECK_CONFIG; fi
 if [[ -n "$CONFIG_FILE" ]]; then
   [[ -f "$CONFIG_FILE" ]] || die "config not found: $CONFIG_FILE"
   [[ -r "$CONFIG_FILE" ]] || die "config not readable: $CONFIG_FILE"
@@ -1328,6 +1346,8 @@ else
 fi
 
 PATTERNS=()
+declare -A LABEL_RE=()   # a config label -> its regex
+declare -A PLAIN_PAT=()  # a config pattern's text, for the label check
 ALLOWLIST=()
 ALLOW_SCOPE=()   # per allow rule: "" (no credential hit), a credential id, or *
 ALLOW_TEXT=()    # per allow rule: as written, scope included
@@ -1471,10 +1491,31 @@ parse_config() { # path name-for-messages
           RULE_CHECK+=("$keyword" "$name:$lineno" "$rest")
         fi
         case "$keyword" in
-          pattern) PATTERNS+=("$rest") ;;
+          pattern) PATTERNS+=("$rest"); PLAIN_PAT["l$rest"]=1 ;;
           allow)   ALLOWLIST+=("$rest"); ALLOW_SCOPE+=("$scope"); ALLOW_TEXT+=("$text"); ALLOW_AT+=("$name:$lineno") ;;
           skip)    SKIPS+=("$rest") ;;
         esac
+        ;;
+      label)
+        # A pattern that prints as its name: its regex is the inventory a
+        # CI log should not carry. The name is a word, so no ERE is one.
+        local lname=${rest%%[[:space:]]*} lre
+        lre=${rest#"$lname"}
+        lre="${lre#"${lre%%[![:space:]]*}"}"
+        [[ -n "$lname" ]] || die "$name:$lineno: empty label directive"
+        [[ "$lname" =~ ^[A-Za-z][A-Za-z0-9_.-]*$ ]] ||
+          die "$name:$lineno: label names a pattern by a word (a letter, then letters, digits, _ . -)"
+        [[ -n "$lre" ]] || die "$name:$lineno: label $lname needs a regex after its name"
+        [[ "$lre" != '(?i)' ]] || die "$name:$lineno: empty label directive after (?i)"
+        [[ -z "${LABEL_RE["l$lname"]+x}" ]] || die "$name:$lineno: label $lname is named twice"
+        check_escapes "$lre" "$name:$lineno: label $lname"
+        [[ "$lre" != *[[:space:]] ]] ||
+          die "$name:$lineno: label $lname ends in whitespace, which git would match literally; delete it, or write [ ] for a space you mean"
+        ! unicode_blank_edge "$lre" ||
+          die "$name:$lineno: label $lname begins or ends in an invisible Unicode space (no-break, zero-width, ideographic or a BOM), which git would match literally; delete it"
+        RULE_CHECK+=(pattern "$name:$lineno" "$lre")
+        LABEL_RE["l$lname"]=$lre
+        PATTERNS+=("$lname")
         ;;
       disable)
         # One credential rule off, by the label its hits carry. Read as words
@@ -1497,6 +1538,17 @@ parse_config() { # path name-for-messages
 }
 for i in "${!CONFIG_FILES[@]}"; do
   parse_config "${CONFIG_FILES[$i]}" "${CONFIG_NAMES[$i]}"
+done
+# The environment's config lines, after the files: CI's secret store holds
+# the tells a public repo cannot commit.
+if [[ -n "${LEAKCHECK_RC-}" ]]; then
+  printf '%s\n' "$LEAKCHECK_RC" > "$TMPD/env.rc"
+  parse_config "$TMPD/env.rc" LEAKCHECK_RC
+fi
+# A label is a pattern's name, so it may be no other pattern's text: pat_args
+# would read that pattern as the label's regex.
+for k in "${!LABEL_RE[@]}"; do
+  [[ -z "${PLAIN_PAT[$k]+x}" ]] || die "label ${k#l} is also a pattern's text; rename the label"
 done
 
 # A credential rule's label is `credential:<id>`; every other pattern is its
@@ -1552,6 +1604,33 @@ if [[ "$USE_CREDENTIALS" -eq 1 ]]; then
   PATH_PATS=("${CRED_PATH_LABELS[@]}")
 fi
 CRED_COUNT=$(( CRED_RULES + ${#PATH_PATS[@]} ))
+# --rule: only the named rules run, each a credential rule this config runs
+# or a config label; the defaults and every other pattern are off, and the
+# scope says how many ran. A name that is neither is refused, never ignored.
+if [[ ${#RULE_ONLY[@]} -gt 0 ]]; then
+  declare -A RULE_WANT=() RULE_HAVE=()
+  for p in "${PATTERNS[@]}" "${PATH_PATS[@]}"; do RULE_HAVE["l$p"]=1; done
+  for r in "${RULE_ONLY[@]}"; do
+    if [[ -z "${RULE_HAVE["l$r"]+x}" || ( -z "${CRED_RE["l$r"]+x}" && -z "${LABEL_RE["l$r"]+x}" ) ]]; then
+      die "--rule $r names no credential rule this config runs and no label"
+    fi
+    RULE_WANT["l$r"]=1
+  done
+  kept=()
+  CRED_RULES=0
+  for p in "${PATTERNS[@]}"; do
+    [[ -n "${RULE_WANT["l$p"]+x}" ]] || continue
+    kept+=("$p")
+    if [[ -n "${CRED_RE["l$p"]+x}" ]]; then CRED_RULES=$(( CRED_RULES + 1 )); fi
+  done
+  PATTERNS=("${kept[@]}")
+  kept=()
+  for p in "${PATH_PATS[@]}"; do
+    if [[ -n "${RULE_WANT["l$p"]+x}" ]]; then kept+=("$p"); fi
+  done
+  PATH_PATS=("${kept[@]}")
+  CRED_COUNT=$(( CRED_RULES + ${#PATH_PATS[@]} ))
+fi
 
 # pat_args <label>: re_args for the ERE behind a pattern label, and in
 # RE_LOC how to run it. A credential rule runs in the C locale: it is ASCII
@@ -1568,6 +1647,8 @@ pat_args() {
     re_args "${CRED_RE["l$1"]}"; RE_LOC=(in_c)
   elif [[ -n "${DEFAULT_RE["l$1"]+x}" ]]; then
     re_args "$1"; RE_LOC=(in_c)
+  elif [[ -n "${LABEL_RE["l$1"]+x}" ]]; then
+    re_args "${LABEL_RE["l$1"]}"; RE_LOC=()
   else
     re_args "$1"; RE_LOC=()
   fi
@@ -1579,6 +1660,7 @@ if [[ "$LIST_ONLY" -eq 2 ]]; then
   for (( i = 0; i < ${#ALL_CREDENTIALS[@]}; i += 2 )); do
     st=on
     if [[ "$USE_CREDENTIALS" -eq 0 || -n "${CRED_OFF["${ALL_CREDENTIALS[i]}"]+x}" ]]; then st=off; fi
+    if [[ ${#RULE_ONLY[@]} -gt 0 && -z "${RULE_WANT["lcredential:${ALL_CREDENTIALS[i]}"]+x}" ]]; then st=off; fi
     printf 'credential:%s\t%s\n' "${ALL_CREDENTIALS[i]}" "$st"
   done
   exit 0
@@ -2617,7 +2699,7 @@ for r in "${!ALLOWLIST[@]}"; do ALLOW_COUNTS[$r]=0; done
 # The matches are needed by the allow rules, and by every credential hit,
 # which prints them masked and is judged on them by the placeholder check.
 NEED_MT=0
-if [[ ${#ALLOWLIST[@]} -gt 0 ]]; then NEED_MT=1; fi
+if [[ ${#ALLOWLIST[@]} -gt 0 || "$REDACT" -eq 1 ]]; then NEED_MT=1; fi
 for i in "${!H_FILE[@]}"; do
   if [[ -n "${CRED_RE["l${H_PAT[$i]}"]+x}" ]]; then NEED_MT=1; break; fi
 done
@@ -2900,9 +2982,44 @@ kv_yields() {
   return "$r"
 }
 
+# --redact: a tell found in a name (a path, a ref, a tag) is the matches of
+# a pattern's name hit; each is hidden whole wherever a path prints.
+REDACT_TOKS=()
+if [[ "$REDACT" -eq 1 ]]; then
+  declare -A REDACT_SEEN=()
+  for i in "${!H_FILE[@]}"; do
+    [[ -z "${CRED_RE["l${H_PAT[$i]}"]+x}" ]] && is_name_hit "$i" || continue
+    for j in ${MT_OF[$i]}; do
+      [[ -n "${MT_TXT[j]}" && -z "${REDACT_SEEN["t${MT_TXT[j]}"]+x}" ]] || continue
+      REDACT_SEEN["t${MT_TXT[j]}"]=1
+      REDACT_TOKS+=("${MT_TXT[j]}")
+    done
+  done
+fi
+redact_names() {
+  REPLY=$1
+  [[ ${#REDACT_TOKS[@]} -gt 0 ]] || return 0
+  local LC_ALL=C s=$1 tok o p k
+  local -A rhide=()
+  for tok in "${REDACT_TOKS[@]}"; do
+    o=0
+    while [[ "${s:o}" == *"$tok"* ]]; do
+      p=${s:o}; p=${p%%"$tok"*}; o=$(( o + ${#p} ))
+      for (( k = o; k < o + ${#tok}; k++ )); do rhide[$k]=1; done
+      o=$(( o + 1 ))
+    done
+  done
+  [[ ${#rhide[@]} -gt 0 ]] || return 0
+  render_masked "$s" rhide "" 0
+}
+
 KEEP=()
 SHOW=()
 SHOW_FILE=()
+SHOW_PAT=()
+declare -A PAT_NUM=()
+pn=0
+for p in "${PATTERNS[@]}" "${PATH_PATS[@]}"; do pn=$(( pn + 1 )); PAT_NUM["l$p"]=$pn; done
 ALLOWED_TOTAL=0
 CRED_FOUND=0
 CRED_UNSCOPED=0
@@ -2957,6 +3074,16 @@ for i in "${!H_FILE[@]}"; do
     if [[ -n "${UNSCOPED_HINT[$i]+x}" ]]; then CRED_UNSCOPED=$((CRED_UNSCOPED + 1)); fi
   fi
   KEEP+=("$i")
+  SHOW_PAT[$i]=${H_PAT[$i]}
+  if [[ "$REDACT" -eq 1 ]]; then
+    redact_names "${SHOW_FILE[$i]}"; SHOW_FILE[$i]=$REPLY
+    if [[ -z "${CRED_RE["l${H_PAT[$i]}"]+x}" ]]; then SHOW[$i]="[redacted, ${#H_TEXT[$i]} chars]"; fi
+    # A config pattern with no label is its own label, and its regex is the
+    # tell: it prints as its line in --list-patterns.
+    if [[ -n "${PLAIN_PAT["l${H_PAT[$i]}"]+x}" && -n "${PAT_NUM["l${H_PAT[$i]}"]+x}" ]]; then
+      SHOW_PAT[$i]="pattern:${PAT_NUM["l${H_PAT[$i]}"]}"
+    fi
+  fi
 done
 HIT_COUNT=${#KEEP[@]}
 
@@ -2988,6 +3115,10 @@ else
   fi
 fi
 SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodules not scanned, $SKIPPED_COUNT skipped by config, $ALLOWED_TOTAL allowed; $HSCOPE; $CSCOPE"
+# --rule is a scope reduction, so it is counted where the scope is printed.
+if [[ ${#RULE_ONLY[@]} -gt 0 ]]; then
+  SCOPE+="; only ${#RULE_WANT[@]} rules run (--rule)"
+fi
 
 # An allow rule may name a credential outright — the README's way to excuse
 # a stand-in — and the JSON report prints every rule: each credential in one
@@ -2995,6 +3126,10 @@ SCOPE="index + worktree; $BINARY_COUNT binary skipped, ${#GITLINKS[@]} submodule
 ALLOW_SHOW=("${ALLOW_TEXT[@]}")
 if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 ]]; then
   mask_texts ALLOW_SHOW "allow rules"
+  # An allow rule names what is excused, a tell often enough.
+  if [[ "$REDACT" -eq 1 ]]; then
+    for r in "${!ALLOW_SHOW[@]}"; do ALLOW_SHOW[r]="[redacted, ${#ALLOW_TEXT[r]} chars]"; done
+  fi
 fi
 
 # ─── output ───────────────────────────────────────────────────────────
@@ -3045,7 +3180,7 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
     [[ "$first" -eq 1 ]] || printf ','
     first=0
     printf '{"file":"%s","line":%s,"pattern":"%s","text":"%s","source":"%s"' \
-      "$(json_escape "${SHOW_FILE[$i]}")" "${H_LINE[$i]}" "$(json_escape "${H_PAT[$i]}")" \
+      "$(json_escape "${SHOW_FILE[$i]}")" "${H_LINE[$i]}" "$(json_escape "${SHOW_PAT[$i]}")" \
       "$(json_escape "${SHOW[$i]}")" "${H_SRC[$i]}"
     # Only history hits carry a commit; every other hit keeps its v0.3.0 shape.
     if [[ -n "${H_COMMIT[$i]}" ]]; then printf ',"commit":"%s"' "${H_COMMIT[$i]}"; fi
@@ -3079,10 +3214,22 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
       printf ']'
     fi
     if [[ "$CRED_WEAK" -gt 0 ]]; then printf ',"weak":%d' "$CRED_WEAK"; fi
-    printf '}}\n'
+    printf '}'
   else
-    printf ',"credentials_scanned":false}\n'
+    printf ',"credentials_scanned":false'
   fi
+  # --rule: the rules that ran, after every older field (append-only).
+  if [[ ${#RULE_ONLY[@]} -gt 0 ]]; then
+    printf ',"rules_run":['
+    first=1
+    for p in "${PATTERNS[@]}" "${PATH_PATS[@]}"; do
+      [[ "$first" -eq 1 ]] || printf ','
+      first=0
+      printf '"%s"' "$(json_escape "$p")"
+    done
+    printf ']'
+  fi
+  printf '}\n'
 else
   # One hit, one line. A field holding a newline — only a path name or a
   # symlink target can — is C-quoted the way git quotes such paths; every
@@ -3108,7 +3255,7 @@ else
       # A history hit leads with its commit: <sha>:path:line: [pattern] text.
       if [[ -n "${H_COMMIT[$i]}" ]]; then printf '%s:' "${H_COMMIT[$i]}"; fi
       printf '%s:%s: [%s] %s\n' "$(line_safe "${SHOW_FILE[$i]}")" "${H_LINE[$i]}" \
-        "${H_PAT[$i]}" "$(line_safe "${SHOW[$i]}")"
+        "${SHOW_PAT[$i]}" "$(line_safe "${SHOW[$i]}")"
     done
     echo "leakcheck: $HIT_COUNT match(es)" >&2
     echo "leakcheck: scanned $TRACKED_COUNT tracked files ($SCOPE)" >&2

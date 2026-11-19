@@ -817,7 +817,7 @@ t_help_lists_every_flag() {
   # The script header is --help: a flag missing there is undiscoverable.
   assert_exit 0 "$BIN" --help
   local f
-  for f in --strict --history --history-range --json --list-patterns --list-rules --config --root --version --help; do
+  for f in --strict --history --history-range --json --redact --rule --list-patterns --list-rules --config --root --version --help; do
     assert_contains "$f" "$LC_OUT"
   done
 }
@@ -3749,6 +3749,127 @@ PY
   while IFS=$'\t' read -r _ _ _ v; do assert_not_contains "$v" "$LC_OUT"; done < "$vt"
 }
 
+t_label_pattern_prints_its_name() {
+  # Stage D (v0.21.0): `label <name> <regex>` is a pattern whose hits, JSON
+  # and --list-patterns line print the name, never the regex — the
+  # inventory a CI log should not carry. Refused: no name, a name that is no
+  # word, no regex, a name given twice, a name that is another pattern's
+  # text, an escape git reads as a letter, a regex that matches the empty
+  # string or ends in whitespace — a label's regex is checked as a pattern's.
+  seed a.txt "host is MYHOST.example here"
+  commit init
+  rc_file 'label internal-host MYHOST\.example'
+  assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [internal-host] host is MYHOST.example here" "$LC_OUT"
+  assert_exit 1 "$BIN" --json
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert [h["pattern"] for h in d["hits"]] == ["internal-host"], d["hits"]' "$LC_OUT"
+  assert_exit 0 "$BIN" --list-patterns
+  assert_contains "internal-host" "$LC_OUT"
+  assert_not_contains "MYHOST" "$LC_OUT"
+  rc_file 'label'
+  assert_exit 2 "$BIN"
+  rc_file 'label 9host MYHOST'
+  assert_exit 2 "$BIN"
+  assert_contains "label names a pattern by a word" "$LC_ERR"
+  rc_file 'label internal-host'
+  assert_exit 2 "$BIN"
+  assert_contains "needs a regex after its name" "$LC_ERR"
+  rc_file 'label h MYHOST' 'label h OTHER'
+  assert_exit 2 "$BIN"
+  assert_contains "label h is named twice" "$LC_ERR"
+  rc_file 'pattern hostx' 'label hostx MYHOST'
+  assert_exit 2 "$BIN"
+  assert_contains "label hostx is also a pattern's text" "$LC_ERR"
+  rc_file 'label h SECRET-\d+'
+  assert_exit 2 "$BIN"
+  rc_file 'label h MYHOST|'
+  assert_exit 2 "$BIN"
+  assert_contains "matches the empty string" "$LC_ERR"
+  rc_file 'label h MYHOST '
+  assert_exit 2 "$BIN"
+  assert_contains "ends in whitespace" "$LC_ERR"
+}
+
+t_config_from_environment() {
+  # Stage D (v0.21.0): LEAKCHECK_RC holds config lines, read after every
+  # config file, its errors quoted as LEAKCHECK_RC:<line>; LEAKCHECK_CONFIG
+  # names a config as --config does, and --config wins; a named config that
+  # is missing is an error, as --config's is.
+  seed a.txt "host is MYHOST.example here"
+  commit init
+  LEAKCHECK_RC='pattern MYHOST' assert_exit 1 "$BIN"
+  assert_contains "a.txt:1: [MYHOST] host is MYHOST.example here" "$LC_OUT"
+  LEAKCHECK_RC=$'no-defaults\npattern SECRET-\\d' assert_exit 2 "$BIN"
+  assert_contains "LEAKCHECK_RC:2:" "$LC_ERR"
+  printf 'pattern MYHOST\n' > .git/env.rc
+  printf 'pattern NOT-HERE\n' > .git/other.rc
+  LEAKCHECK_CONFIG="$PWD/.git/env.rc" assert_exit 1 "$BIN"
+  assert_contains "[MYHOST]" "$LC_OUT"
+  LEAKCHECK_CONFIG="$PWD/.git/env.rc" assert_exit 0 "$BIN" --config "$PWD/.git/other.rc"
+  LEAKCHECK_CONFIG="$PWD/.git/missing.rc" assert_exit 2 "$BIN"
+  assert_contains "config not found" "$LC_ERR"
+}
+
+t_redact_hides_every_hit_text() {
+  # Stage D (v0.21.0): --redact prints no hit's text — its length instead —
+  # and hides a tell found in a name wherever a path prints, an allow rule's
+  # text in the JSON, and an unlabelled config pattern's regex, which prints
+  # as its line in --list-patterns (`pattern:9`, after the eight defaults);
+  # a credential hit prints as it always does.
+  local gh
+  gh=$(cred github-token)
+  seed a.txt "host is MYHOST.example here"
+  seed "MYHOST.example/b.txt" "x"
+  seed c.txt "token: $gh"
+  seed d.txt "MYHOST.example is excused here"
+  rc_file 'pattern MYHOST' 'allow ^d\.txt:1:MYHOST'
+  commit init
+  assert_exit 1 "$BIN" --redact
+  assert_not_contains "MYHOST" "$LC_OUT"
+  assert_not_contains "MYHOST" "$LC_ERR"
+  assert_contains "a.txt:1: [pattern:9] [redacted, 27 chars]" "$LC_OUT"
+  assert_contains "[redacted, 6 chars].example/b.txt:0: [pattern:9] [redacted, 20 chars]" "$LC_OUT"
+  assert_contains "c.txt:1: [credential:github-token] $(masked "$gh")" "$LC_OUT"
+  assert_exit 1 "$BIN" --redact --json
+  assert_not_contains "MYHOST" "$LC_OUT"
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["allowed"] == [{"rule": "[redacted, 16 chars]", "count": 1}], d["allowed"]' "$LC_OUT"
+  # With no allow rule and no credential hit, --redact alone gathers the
+  # tells a name holds.
+  git rm -q c.txt d.txt
+  rc_file 'pattern MYHOST'
+  commit alone
+  assert_exit 1 "$BIN" --redact
+  assert_not_contains "MYHOST" "$LC_OUT"
+  assert_contains "[redacted, 6 chars].example/b.txt:0: [pattern:9] [redacted, 20 chars]" "$LC_OUT"
+}
+
+t_rule_runs_only_named_rules() {
+  # Stage D (v0.21.0): --rule runs only the named rules, each a credential
+  # rule this config runs or a config label; the defaults and every other
+  # pattern are off, the scope line counts the rules that ran, and the JSON
+  # lists them last. A name that is neither is refused.
+  local gh st
+  gh=$(cred github-token); st=$(cred stripe-key)
+  seed a.txt "token: $gh"
+  seed b.txt "key: $st"
+  seed c.txt "see /home/alice/notes and MYHOST"
+  rc_file 'label h MYHOST'
+  commit init
+  assert_exit 1 "$BIN" --rule credential:github-token
+  assert_contains "a.txt:1: [credential:github-token]" "$LC_OUT"
+  assert_not_contains "b.txt" "$LC_OUT"
+  assert_not_contains "c.txt" "$LC_OUT"
+  assert_contains "; only 1 rules run (--rule)" "$LC_ERR"
+  assert_exit 1 "$BIN" --rule h --rule credential:stripe-key --json
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert sorted(h["file"] for h in d["hits"]) == ["b.txt", "c.txt"] and d["rules_run"] == ["h", "credential:stripe-key"] and list(d)[-1] == "rules_run", d' "$LC_OUT"
+  assert_exit 0 "$BIN" --list-rules --rule credential:github-token
+  assert_contains "credential:github-token	on" "$LC_OUT"
+  assert_contains "credential:stripe-key	off" "$LC_OUT"
+  assert_exit 2 "$BIN" --rule credential:no-such-rule
+  assert_contains "names no credential rule this config runs and no label" "$LC_ERR"
+  assert_exit 2 "$BIN" --rule '/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/'
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -4444,6 +4565,10 @@ lc_test "keyword rules: the weaker names"       t_kv_generic_key_names
 lc_test "credentials: issuer-sourced, v0.19.0"   t_credential_issuer_sourced_v019
 lc_test "credentials: v0.19.0 near misses clean" t_credential_issuer_sourced_near_misses_are_clean
 lc_test "keyword rules: a service's name"       t_kv_service_names
+lc_test "label: a pattern prints its name"       t_label_pattern_prints_its_name
+lc_test "config from the environment"            t_config_from_environment
+lc_test "--redact hides every hit's text"        t_redact_hides_every_hit_text
+lc_test "--rule runs only the named rules"      t_rule_runs_only_named_rules
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder

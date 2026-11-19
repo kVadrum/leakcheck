@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.20.0*
+*README v0.21.0*
 
 ## Install
 
@@ -308,7 +308,11 @@ Your config is an inventory of exactly what you are trying to hide, which is why
 A *tracked* `.leakcheckrc.local` is reported as a finding of its own (`config:local-tracked`), whatever `--config` or a `skip` says, and unlike `.leakcheckrc` its content is scanned like any other file.
 `--config FILE` replaces both files with `FILE`.
 
-Both files are line-oriented and take six directives; blank lines and `#` comments are ignored:
+Two environment variables carry a config into CI, where the gitignored `.leakcheckrc.local` does not exist: `LEAKCHECK_CONFIG` names a file as `--config` does (`--config` wins), and `LEAKCHECK_RC` holds config lines, read after every config file — a CI secret, so the tells never enter the repo.
+An error in them is quoted as `LEAKCHECK_RC:<line>`.
+A `label` keeps a pattern's regex out of every hit and `--list-patterns` line; `--redact` keeps out the rest ([Output](#output)).
+
+Both files are line-oriented and take seven directives; blank lines and `#` comments are ignored:
 
 ```text
 # Add a pattern to the scan set.
@@ -316,6 +320,9 @@ pattern MYHOST
 pattern internal-tool-name
 # A leading (?i) ignores case: this one matches MyBox, MYBOX and mybox.
 pattern (?i)mybox
+# A pattern that prints as its name, never its regex: hits read
+# [build-host], and so does --list-patterns.
+label build-host MYHOST\.example
 
 # Allow hits by regex: a rule names a hit's whole "path:line:text", or
 # each match on it as "path:line:match" (see How patterns behave, below).
@@ -372,6 +379,8 @@ leakcheck --strict            also report every file whose content was not scann
 leakcheck --history           also scan every commit reachable from any ref
 leakcheck --history-range R   the same, over the commits in revision range R only
 leakcheck --json              machine-readable output
+leakcheck --redact            print no hit's text, and no tell found in a name
+leakcheck --rule ID           run only this rule (repeatable): credential:<id> or a label
 leakcheck --list-patterns     print the effective pattern set
 leakcheck --list-rules        print each credential rule's label, tab, on or off
 leakcheck -c, --config FILE   use FILE instead of .leakcheckrc / .leakcheckrc.local
@@ -399,6 +408,12 @@ Exit codes:
 Hits go to stdout, one per line, as `path:line: [pattern] text`; the summary lines go to stderr.
 A credential rule's hit names the rule, `[credential:github-token]`, and shows its matches masked in place of the line ([Credentials](#credentials)).
 The format is plain text without color, so it greps.
+
+With `--redact`, a hit prints its text's length in place of the text (`[redacted, 27 chars]`), a tell found in a file name is hidden in every path that prints, a config pattern with no `label` prints as its line in `--list-patterns` (`[pattern:9]`), and `--json` hides each allow rule's text too; a credential hit prints as it always does, masked.
+For a CI log that should name where a leak is and never what it is.
+An error still quotes what it reports — a config line, a pattern git refused — so check a config locally before CI runs it.
+
+`--rule ID` runs only the rules named — credential rules by their labels, config patterns by their `label` — and the summary counts them (`only 2 rules run (--rule)`), as `--json` lists them in `rules_run`.
 The summary's count is matches, not lines: two patterns matching one line are two hits.
 
 Some hits are not regex matches, and they use these names in the pattern slot:
@@ -473,6 +488,15 @@ To also see each hit as an annotation on the pull request, keep leakcheck's exit
 ```
 
 The step still fails on any match (`1`) and on any error (`2`, which prints no JSON).
+
+To scan for your real hostnames in CI without committing them, keep them in a secret and redact the log:
+
+```yaml
+- name: leakcheck
+  env:
+    LEAKCHECK_RC: ${{ secrets.LEAKCHECK_RC }}   # label lines: label build-host <regex>
+  run: ./vendor/leakcheck --redact
+```
 
 To scan history in CI, check out the full history — the default checkout is shallow, and leakcheck refuses it:
 
