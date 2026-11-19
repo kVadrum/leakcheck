@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.28.0*
+*README v0.29.0*
 
 ## Install
 
@@ -102,14 +102,16 @@ pattern -(home|Users)-[A-Za-z0-9_][A-Za-z0-9_.]*-
 Built-in rules also find keys and tokens in the formats their issuers fixed, by a prefix or a shape that ordinary text does not have:
 
 - private key headers: PEM, OpenSSH, PGP (PGP 2's secret key blocks too), ssh.com and PuTTY;
-- AWS access key ids and Bedrock API keys, Alibaba Cloud AccessKey ids, Google API keys (AI Studio's `AQ.` keys too) and OAuth client secrets, and Azure storage keys, Entra client secrets and Microsoft's identifiable keys (Cosmos DB, Event Hubs, Service Bus, API Management, Azure AI and the rest, by the signature each carries);
+- AWS access key ids and Bedrock API keys (long-term ones too), Alibaba Cloud AccessKey ids, Google API keys (AI Studio's `AQ.` keys too) and OAuth client secrets, and Azure storage keys, Entra client secrets and Microsoft's identifiable keys (Cosmos DB, Event Hubs, Service Bus, API Management, Azure AI and the rest, by the signature each carries);
 - GitHub, GitLab (session cookies too), npm, PyPI, NuGet, RubyGems and Clojars tokens, and JFrog Artifactory API keys and reference tokens;
 - Anthropic, OpenAI, OpenRouter, DeepSeek, Groq, Perplexity, xAI, Hugging Face and Replicate keys;
 - Slack tokens (workflow tokens too), and Slack (GovSlack too), Discord and Teams webhook URLs;
-- Stripe keys (organization keys too) and webhook signing secrets (Stripe's, and the Standard Webhooks spec's secret keys), and Square, Shopify and Facebook tokens (app access tokens, `<app id>|<app secret>`, too), Shippo, Duffel and Flutterwave keys;
+- Stripe keys (organization keys too) and webhook signing secrets (Stripe's, and the Standard Webhooks spec's secret keys), and Square (`EAAA` access tokens too), Shopify and Facebook tokens (app access tokens, `<app id>|<app secret>`, too), Shippo, Duffel and Flutterwave keys;
 - JSON Web Tokens;
 - PKCS #12 key bundles, by their file names alone (`.p12`, `.pfx`, any case): their content is binary, so a tracked name is the only tell, and the rule runs over tracked path names and nothing else;
-- keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana (legacy API keys too), Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare (API tokens and origin CA keys), CircleCI, Sourcegraph, Docker Swarm (join tokens and unlock keys), Mapbox, Authress, MaxMind (license keys), OpenShift, SettleMint, Scalingo, Harness, Adobe (OAuth client secrets), Infracost and Prefect.
+- keys and tokens for Twilio, SendGrid, Brevo, Mailchimp, DigitalOcean, HashiCorp Vault and Terraform Cloud, Doppler, Linear, Postman, Sentry, Grafana (legacy API keys too), Databricks, Atlassian, Notion, 1Password, Pulumi, PlanetScale, Fly.io, Dynatrace, Tailscale, Heroku, Supabase, New Relic, Cloudflare (API tokens and origin CA keys), CircleCI, Sourcegraph, Docker Swarm (join tokens and unlock keys), Mapbox, Authress, MaxMind (license keys), OpenShift, SettleMint, Scalingo, Harness, Adobe (OAuth client secrets), Infracost, Prefect, ReadMe, ClickHouse Cloud, Airtable, EasyPost, Frame.io, Octopus Deploy and 42's intranet API.
+
+Six of these — Airtable, EasyPost, Frame.io, Octopus Deploy, 42 and Bedrock's long-term keys — follow gitleaks' shapes, as their issuers document none ([third-party notices](THIRD_PARTY_NOTICES.md)).
 
 Keyword rules find keys with no prefix of their own too, by the name they are assigned to and how random they are: AWS secret access keys, passwords in URLs, HTTP `Authorization` headers, curl's `-u user:password`, Sidekiq Pro and Enterprise credentials, values assigned to a service's name, and values assigned to a name such as `password`, `secret`, `token` or `api_key` ([Keyword rules](#keyword-rules)).
 

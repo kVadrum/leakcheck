@@ -6,7 +6,8 @@ It includes work derived from the project below, used under that project's licen
 ## gitleaks
 
 Most of leakcheck's built-in credential rules are derived from the rules in gitleaks' default configuration (`config/gitleaks.toml`, v8.30.1): the token prefixes and shapes, re-spelled as POSIX extended regexes and in places widened or narrowed.
-`bin/leakcheck` marks the derived block with SPDX snippet tags and names, beside each derived rule, the gitleaks rule it follows; rules with no such note have no gitleaks counterpart.
+`bin/leakcheck` marks the derived blocks with SPDX snippet tags and names, beside each derived rule, the gitleaks rule it follows; rules with no such note have no gitleaks counterpart.
+The second block (`octopus-key` to `airtable-token`) holds six formats whose issuers state none, taken from gitleaks' shapes alone.
 gitleaks: <https://github.com/gitleaks/gitleaks>
 
 ```text

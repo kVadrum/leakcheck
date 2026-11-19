@@ -121,7 +121,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.28.0"
+VERSION="0.29.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -430,9 +430,12 @@ CREDENTIALS=(
   # test (v0.12.0), since `EAA` is how base64 writes 0x10 and zero bytes.
   # An app access token is the app id, `|` and the app secret ("access_token={your-app_id}|{your-app_secret}", the same page); the
   # secret's length is unstated, and 24 keeps ids joined by `|` to a name out.
-  facebook-token              'EAA[MC][A-Za-z0-9]{100,}|[0-9]{13,20}\|[A-Za-z0-9]{24,}'  # gitleaks: facebook-page-access-token
-  # source: developer.squareup.com/reference/square/oauth-api/obtain-token (sq0csp-, by example)
-  square-token                'sq0(atp|csp)-[A-Za-z0-9_-]{22,}'  # gitleaks: square-access-token
+  # A left edge on EAA, as alibaba-access-key-id's: base64 image data in two
+  # SVGs inside a zip read as tokens (v0.29.0, measured by --archives).
+  facebook-token              '(^|[^A-Za-z0-9+/]|\\[a-z]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|%[0-9A-Fa-f]{2})EAA[MC][A-Za-z0-9]{100,}|[0-9]{13,20}\|[A-Za-z0-9]{24,}'  # gitleaks: facebook-page-access-token
+  # source: developer.squareup.com/reference/square/oauth-api/obtain-token (sq0csp-, by example); developer.squareup.com/docs/oauth-api/receive-and-manage-tokens (an access token, EAAA and 60 of [A-Za-z0-9_], by example, and "don't use token length for validation": 60 or more)
+  # EAAA takes alibaba-access-key-id's left edge: base64 holds it often.
+  square-token                'sq0(atp|csp)-[A-Za-z0-9_-]{22,}|(^|[^A-Za-z0-9+/]|\\[a-z]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|%[0-9A-Fa-f]{2})EAAA[A-Za-z0-9_-]{60,}'  # gitleaks: square-access-token
   # source: pulumi.com/registry/packages/pulumiservice/api-docs/api/tokens/personaltoken/ (pul-)
   pulumi-token                'pul-[a-f0-9]{40}'  # gitleaks: pulumi-api-token
   # source: planetscale/cli, internal/config/config.go (pscale_tkn_), internal/cmd/password (pscale_pw_)
@@ -705,6 +708,32 @@ CREDENTIALS+=(
   # SVGs read as keys (the v0.19.0 sweep), so it may not follow a base64
   # character, but may follow an escape.
   alibaba-access-key-id       '(^|[^A-Za-z0-9+/]|\\[a-z]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|%[0-9A-Fa-f]{2})LTAI[A-Za-z0-9]{12,}'
+  # v0.29.0, the formats v0.19.0 left untaken. Three from their issuers:
+  # source: docs.readme.com/main/docs/readmes-mcp-server (README_API_KEY, "format: rdme_xxx..."): the prefix, no length, so 16 or more
+  readme-key                  'rdme_[A-Za-z0-9]{16,}'
+  # source: clickhouse.com/docs/resources/support-center/knowledge-base/integrations/terraform-example (a token_secret: 4b1d and 35 more, by example)
+  # A left edge, as alibaba-access-key-id's: a hex run holds 4b1d.
+  clickhouse-secret           '(^|[^A-Za-z0-9+/]|\\[a-z]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|%[0-9A-Fa-f]{2})4b1d[A-Za-z0-9]{35,}'
+# SPDX-SnippetBegin
+# SPDX-SnippetCopyrightText: 2019 Zachary Rice
+# SPDX-SnippetCopyrightText: 2026 KeMeK Network
+# SPDX-License-Identifier: MIT
+  # Six whose issuers state no format: gitleaks' shapes (v8.30.1), credited
+  # in THIRD_PARTY_NOTICES.md, a fixed length taken as a least.
+  # source: none (Octopus Deploy's docs print API-XXXX…); gitleaks: octopus-deploy-api-key
+  octopus-key                 '(^|[^A-Za-z0-9+/]|\\[a-z]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|%[0-9A-Fa-f]{2})API-[A-Z0-9]{26,}'
+  # source: none (EasyPost's docs and SDKs state no format); gitleaks: easypost-api-token, easypost-test-api-token
+  easypost-key                'EZ[AT]K[A-Za-z0-9]{54,}'
+  # source: none (Frame.io's developer docs state no format); gitleaks: frameio-api-token
+  frameio-token               'fio-u-[A-Za-z0-9_=-]{64,}'
+  # source: none (42's API guide states no format); gitleaks: intra42-client-secret
+  intra42-secret              's-s4t2(ud|af)-[0-9A-Fa-f]{64,}'
+  # source: none (AWS prints no long-term Bedrock API key); gitleaks: aws-amazon-bedrock-api-key-long-lived
+  # A left edge, as alibaba-access-key-id's: base64 holds ABSK.
+  aws-bedrock-long-term-key   '(^|[^A-Za-z0-9+/]|\\[a-z]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|%[0-9A-Fa-f]{2})ABSK[A-Za-z0-9+/]{109,}'
+  # source: none (Airtable: "do not rely on tokens having a particular length or format"); gitleaks: airtable-personnal-access-token
+  airtable-token              'pat[A-Za-z0-9]{14}\.[a-f0-9]{64}'
+# SPDX-SnippetEnd
 )
 ALL_CREDENTIALS=("${CREDENTIALS[@]}" "${PATH_CREDENTIALS[@]}")
 
@@ -984,7 +1013,8 @@ kv_show() {
 }
 
 # Rules with a left edge, and the literal each one's key begins with.
-declare -A CRED_KEYSTART=([deepseek-key]='sk-' [alibaba-access-key-id]='LTAI' [huggingface-token]='hf_')
+declare -A CRED_KEYSTART=([deepseek-key]='sk-' [alibaba-access-key-id]='LTAI' [huggingface-token]='hf_'
+  [square-token]='EAAA' [facebook-token]='EAA' [clickhouse-secret]='4b1d' [octopus-key]='API-' [aws-bedrock-long-term-key]='ABSK')
 # cred_key <id> <match>: the match cut to start at its key -> REPLY.
 cred_key() {
   REPLY=$2

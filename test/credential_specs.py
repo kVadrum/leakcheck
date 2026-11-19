@@ -170,6 +170,14 @@ SPECS = {
  "infracost-token": ("KEY=", ["ic", "o-", ("an", 32)]),
  "prefect-token": ("KEY=", ["pn", "u_", ("an", 36)]),
  "alibaba-access-key-id": ("KEY=", ["LT", "AI", ("an", 20)]),
+ "readme-key": ("KEY=", ["rd", "me_", ("lan", 70)]),
+ "clickhouse-secret": ("KEY=", ["4b", "1d", ("an", 35)]),
+ "octopus-key": ("KEY=", ["AP", "I-", ("UD", 26)]),
+ "easypost-key": ("KEY=", ["EZ", "AK", ("an", 54)]),
+ "frameio-token": ("KEY=", ["fio", "-u-", ("an-_", 64)]),
+ "intra42-secret": ("KEY=", ["s-s4", "t2ud-", ("hex", 64)]),
+ "aws-bedrock-long-term-key": ("KEY=", ["AB", "SK", ("b64", 132)]),
+ "airtable-token": ("KEY=", ["pa", "t", ("an", 14), ".", ("hex", 64)]),
 }
 
 
@@ -313,6 +321,8 @@ LATE_VARIANTS = {
  "duffel-token": [("KEY=", ["duffel", "_live_", ("an-_", 43)])],
  "flutterwave-key": [("KEY=", ["FLW", p, ("hex", 32), "-X"]) for p in ("PUBK-", "SECK_TEST-", "PUBK_TEST-")],
  "infracost-token": [("KEY=", ["ics", "_v1_", ("an-_", 48)])],
+ "square-token": [("KEY=", ["EA", "AA", ("an_", 60)])],
+ "easypost-key": [("KEY=", ["EZ", "TK", ("an", 54)])],
 }
 
 

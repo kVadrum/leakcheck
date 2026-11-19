@@ -3019,12 +3019,14 @@ t_credential_zero_bytes_are_no_aws_or_facebook_key() {
   aws=$(cred aws-access-key-id); fb=$(cred facebook-token)
   # Lines 1 and 3 hold no run of eight, so only the share catches them;
   # line 4 is random but for one run of eight, which only the run catches.
+  # Line 3's run follows a space: since v0.29.0 EAA after a base64
+  # character is no candidate at all (facebook-token's left edge).
   local q7
   q7=$(printf 'AAAAAAAQ%.0s' {1..13})
   seed z.txt "$(printf '%s\n' \
     "src: url(data:font/ttf;base64,AAEAAAAKA""CCA""AAAAAQAAAAAAAGAAAAAAAAQAAAAAAAAAAAAZ8AAA);" \
     "blob: AAAQ""ABIA""AAAAAAAUAAAAAAAAAAAAAAAAA" \
-    "pb: CAEQ""EAAM$q7" \
+    "pb: ""EAAM$q7" \
     "one run: EA""AC${fb:4:110}AAAAAAAA${fb:4:110}")"
   rc_file 'no-defaults'
   commit init
@@ -3779,7 +3781,9 @@ import random, sys
 r = random.Random(71)
 hx = lambda n: "".join(r.choice("0123456789abcdef") for _ in range(n))
 a, b, c, d = hx(7) + "c", hx(6) + "b4", hx(7) + "e", hx(6) + "f9"
-air = "pat" + "".join(r.choice("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz") for _ in range(14)) + ".a" + hx(63)
+# 13 letters: since v0.29.0 airtable-token takes the 14-letter form, and
+# this line pins kv_weak's judgement of a dotted token, not that rule.
+air = "pat" + "".join(r.choice("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz") for _ in range(13)) + ".a" + hx(63)
 rows = [
     ("sidekiq-credentials", "BUNDLE_GEMS__CONTRIB" "SYS__COM=%s:%s" % (a, b), "CONTRIBSYS[redacted, 8 chars]", b),
     ("sidekiq-credentials", "bundle config --local enterprise.contrib" "sys.com %s:%s" % (c, d), "contribsys[redacted, 8 chars]", d),
@@ -4544,6 +4548,44 @@ assert e == [("index", "see /home/alice/gz"), ("worktree", "see /home/alice/gz2"
 ' "$LC_OUT"
 }
 
+t_credential_v029_near_misses_are_clean() {
+  # The v0.29.0 rules' edges and lengths: EAAA, 4b1d and ABSK inside base64
+  # or hex, API- after a letter, and each prefix one short of its least —
+  # a guard, as v0.28.0 has none of these rules — and facebook-token's new
+  # edge: EAAM inside base64, which v0.28.0 reports.
+  python3 - <<'PY'
+import random
+r = random.Random(29)
+def run(cs, n):
+    return "".join(r.choice(cs) for _ in range(n))
+AN = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+HEX = "0123456789abcdef"
+B64 = AN + "+/"
+UD = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+lines = [
+    "blob: x" + "EA" + "AA" + run(AN + "_", 70),
+    "sha: " + run(HEX, 6) + "4b" + "1d" + run(HEX, 40),
+    "data: Q" + "AB" + "SK" + run(B64, 140),
+    "name: MY" + "AP" + "I-" + run(UD, 30),
+    "a: " + "rd" + "me_" + run(AN, 15),
+    "b: " + "4b" + "1d" + run(AN, 34),
+    "c: " + "AP" + "I-" + run(UD, 25),
+    "d: " + "EZ" + "AK" + run(AN, 53),
+    "e: " + "fio" + "-u-" + run(AN, 63),
+    "f: " + "s-s4" + "t2ud-" + run(HEX, 63),
+    "g: " + "AB" + "SK" + run(B64, 108),
+    "h: " + "pa" + "t" + run(AN, 14) + "." + run(HEX, 63),
+    "i: " + "EA" + "AA" + run(AN, 59),
+    "img: Q" + "EA" + "AM" + run(AN, 120),
+]
+open("near.txt", "w").write("\n".join(lines) + "\n")
+PY
+  git add near.txt
+  commit init
+  assert_exit 0 "$BIN"
+  assert_contains "leakcheck: clean" "$LC_OUT"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -5242,6 +5284,7 @@ lc_test "keyword rules: HTTP authentication"     t_kv_http_auth_rules
 lc_test "keyword rules: the weaker names"       t_kv_generic_key_names
 lc_test "credentials: issuer-sourced, v0.19.0"   t_credential_issuer_sourced_v019
 lc_test "credentials: v0.19.0 near misses clean" t_credential_issuer_sourced_near_misses_are_clean
+lc_test "credentials: v0.29.0 near misses clean" t_credential_v029_near_misses_are_clean
 lc_test "keyword rules: a service's name"       t_kv_service_names
 lc_test "keyword rules: code is no key"          t_kv_code_identifiers_are_weak
 lc_test "label: a pattern prints its name"       t_label_pattern_prints_its_name
