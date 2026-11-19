@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.23.0*
+*README v0.24.0*
 
 ## Install
 
@@ -382,6 +382,7 @@ leakcheck --strict            also report every file whose content was not scann
 leakcheck --history           also scan every commit reachable from any ref
 leakcheck --history-range R   the same, over the commits in revision range R only
 leakcheck --json              machine-readable output
+leakcheck --format FMT        text, json (as --json), sarif, csv or junit
 leakcheck --redact            print no hit's text, and no tell found in a name
 leakcheck --rule ID           run only this rule (repeatable): credential:<id> or a label
 leakcheck --list-patterns     print the effective pattern set
@@ -467,6 +468,17 @@ Here is the Quick start run, formatted for reading:
   The order of `hits` is not part of it.
 - On exit `2`, nothing at all is printed on stdout, so a consumer that parses empty output fails closed.
 
+### SARIF, CSV and JUnit
+
+`--format sarif`, `--format csv` and `--format junit` print the same hits on stdout in those formats, and the text output's summary on stderr; `--format json` is `--json`, and `--format text` the default.
+
+- **SARIF 2.1.0**, for GitHub code scanning and other SARIF readers: a rule for each pattern that hit, a result for each hit with its file and line (a name hit has no line), and a commit's metadata, a ref or a tag as a logical location; in history, each result's `properties` carry its `commit`.
+- **CSV**: a header, `file,line,pattern,text,source,commit`, and a row per hit, every text field quoted; a clean scan is the header alone.
+  A field a spreadsheet would read as a formula, starting with `=`, `+`, `-`, `@`, a tab or a carriage return, is led by `'`, so opening the report never runs the scanned repository's text.
+- **JUnit XML**: a failed test case per hit; a clean scan is one passing case, `scan`.
+
+Each format keeps the exit codes, `--redact` and the masking of credentials.
+
 ## Use in CI
 
 Commit the single script into your repo, for example as `vendor/leakcheck` — not the whole leakcheck checkout, whose README and tests are full of deliberate example leaks that your scan would then report.
@@ -512,6 +524,18 @@ To also see each hit as an annotation on the pull request, keep leakcheck's exit
 ```
 
 The step still fails on any match (`1`) and on any error (`2`, which prints no JSON).
+
+To see hits in GitHub code scanning, upload the SARIF, even when the scan step fails:
+
+```yaml
+- name: leakcheck
+  run: ./vendor/leakcheck --format sarif > leakcheck.sarif
+- name: upload to code scanning
+  if: always()
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: leakcheck.sarif
+```
 
 To scan for your real hostnames in CI without committing them, keep them in a secret and redact the log:
 

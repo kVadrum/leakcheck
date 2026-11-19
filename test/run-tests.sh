@@ -817,7 +817,7 @@ t_help_lists_every_flag() {
   # The script header is --help: a flag missing there is undiscoverable.
   assert_exit 0 "$BIN" --help
   local f
-  for f in --strict --history --history-range --json --redact --rule --list-patterns --list-rules --config --root --version --help; do
+  for f in --strict --history --history-range --json --format --redact --rule --list-patterns --list-rules --config --root --version --help; do
     assert_contains "$f" "$LC_OUT"
   done
 }
@@ -4049,6 +4049,126 @@ PY
     assert_exit 0 bash --noprofile --norc -eo pipefail .git/run.sh
 }
 
+t_format_sarif() {
+  # Stage F (v0.24.0): --format sarif is SARIF 2.1.0 — a rule per pattern
+  # that hit, a result per hit (as many as --json counts), a name hit with no
+  # region and its path percent-encoded, a credential masked, a commit's
+  # message a logical location carrying the commit; --redact holds.
+  local gh
+  gh=$(cred github-token)
+  seed a.txt "see /home/alice/notes"
+  seed "my notes/MYHOST.txt" "x"
+  seed c.txt "token: $gh"
+  rc_file 'pattern MYHOST'
+  commit "built on MYHOST"
+  assert_exit 1 "$BIN" --format sarif
+  cp "$LC_OUT" .git/sarif.json
+  assert_exit 1 "$BIN" --json
+  python3 - .git/sarif.json "$LC_OUT" "$gh" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1])); j = json.load(open(sys.argv[2]))
+assert s["version"] == "2.1.0" and len(s["runs"]) == 1, s
+run = s["runs"][0]
+rules = [r["id"] for r in run["tool"]["driver"]["rules"]]
+assert sorted(rules) == sorted({h["pattern"] for h in j["hits"]}), rules
+res = run["results"]
+assert len(res) == j["count"] == 3, res
+by = {r["ruleId"]: r for r in res}
+assert all(rules[r["ruleIndex"]] == r["ruleId"] for r in res), res
+name = by["MYHOST"]["locations"][0]["physicalLocation"]
+assert name == {"artifactLocation": {"uri": "my%20notes/MYHOST.txt"}}, name
+home = [r for r in res if r["ruleId"].startswith("/home/")][0]["locations"][0]["physicalLocation"]
+assert home == {"artifactLocation": {"uri": "a.txt"}, "region": {"startLine": 1}}, home
+assert sys.argv[3] not in json.dumps(s), "key printed"
+assert "[credential:github-token] ghp_[redacted, 40 chars]" in by["credential:github-token"]["message"]["text"], by
+PY
+  assert_exit 1 "$BIN" --format sarif --redact
+  assert_not_contains "MYHOST" "$LC_OUT"
+  assert_exit 1 "$BIN" --format sarif --history
+  python3 - "$LC_OUT" "$(sha_of)" <<'PY'
+import json, sys
+res = json.load(open(sys.argv[1]))["runs"][0]["results"]
+msg = [r for r in res if r["locations"][0].get("logicalLocations")]
+assert [(r["locations"], r["properties"]) for r in msg] == [([{"logicalLocations": [{"fullyQualifiedName": "(message)"}]}], {"source": "history", "commit": sys.argv[2]})], msg
+PY
+}
+
+t_format_csv() {
+  # Stage F (v0.24.0): --format csv is a header and a row per hit, RFC 4180
+  # quoted (a comma, a quote, a newline in a name survive); a field a
+  # spreadsheet would run as a formula is led by '. A clean scan is the
+  # header alone, exit 0.
+  seed a.txt '=HYPERLINK("http://MYHOST/x", "a, b")'
+  seed "$(printf 'odd\nMYHOST.txt')" "x"
+  rc_file 'pattern MYHOST'
+  commit init
+  assert_exit 1 "$BIN" --format csv
+  python3 - "$LC_OUT" <<'PY'
+import csv, sys
+rows = list(csv.reader(open(sys.argv[1], newline="")))
+assert rows[0] == ["file", "line", "pattern", "text", "source", "commit"], rows
+body = sorted(rows[1:])
+assert body == sorted([
+    ["a.txt", "1", "MYHOST", "'=HYPERLINK(\"http://MYHOST/x\", \"a, b\")", "both", ""],
+    ["odd\nMYHOST.txt", "0", "MYHOST", "odd\nMYHOST.txt", "index", ""],
+]), body
+PY
+  git rm -q a.txt "$(printf 'odd\nMYHOST.txt')"
+  commit clean
+  assert_exit 0 "$BIN" --format csv
+  [[ "$(cat "$LC_OUT")" == "file,line,pattern,text,source,commit" ]]
+  assert_contains "leakcheck: clean" "$LC_ERR"
+}
+
+t_format_junit() {
+  # Stage F (v0.24.0): --format junit is a failed test case per hit, every
+  # character XML-escaped (`<`, `&`, quotes); a clean scan is one passing
+  # case, `scan`, never an empty suite.
+  seed a.txt "<a title=\"x\">MYHOST & co's</a>"
+  rc_file 'pattern MYHOST'
+  commit init
+  assert_exit 1 "$BIN" --format junit
+  python3 - "$LC_OUT" <<'PY'
+import sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+assert root.tag == "testsuites" and root.get("failures") == "1" and root.get("tests") == "1", root.attrib
+(case,) = root.iter("testcase")
+f = case.find("failure")
+assert case.get("name") == "a.txt:1" and f.get("type") == "MYHOST", (case.attrib, f.attrib)
+assert f.text == "a.txt:1: [MYHOST] <a title=\"x\">MYHOST & co's</a>", f.text
+PY
+  seed a.txt "clean"
+  commit clean
+  assert_exit 0 "$BIN" --format junit
+  python3 - "$LC_OUT" <<'PY'
+import sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+assert root.get("failures") == "0" and [c.get("name") for c in root.iter("testcase")] == ["scan"], ET.tostring(root)
+PY
+}
+
+t_format_flag() {
+  # Stage F (v0.24.0): --format json is --json, byte for byte, and --format
+  # text the default; an unknown format, two formats, or --json with
+  # another format is exit 2.
+  seed a.txt "see /home/alice/x"
+  commit init
+  assert_exit 1 "$BIN" --json
+  cp "$LC_OUT" .git/a.json
+  assert_exit 1 "$BIN" --format json
+  cmp -s "$LC_OUT" .git/a.json
+  assert_exit 1 "$BIN"
+  cp "$LC_OUT" .git/a.txt
+  assert_exit 1 "$BIN" --format text
+  cmp -s "$LC_OUT" .git/a.txt
+  assert_exit 2 "$BIN" --format yaml
+  assert_contains "unknown format: yaml" "$LC_ERR"
+  assert_exit 2 "$BIN" --json --format csv
+  assert_contains "--json and --format csv disagree" "$LC_ERR"
+  assert_exit 2 "$BIN" --format csv --format sarif
+  assert_exit 1 "$BIN" --json --format json
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -4752,6 +4872,10 @@ lc_test "label: a pattern prints its name"       t_label_pattern_prints_its_name
 lc_test "config from the environment"            t_config_from_environment
 lc_test "--redact hides every hit's text"        t_redact_hides_every_hit_text
 lc_test "--rule runs only the named rules"      t_rule_runs_only_named_rules
+lc_test "--format sarif"                        t_format_sarif
+lc_test "--format csv"                          t_format_csv
+lc_test "--format junit"                        t_format_junit
+lc_test "--format: json, text, errors"          t_format_flag
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential

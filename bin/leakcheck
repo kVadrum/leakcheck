@@ -27,6 +27,7 @@
 #                                # --history over the commits in one git
 #                                # revision range only (origin/main..HEAD)
 #   leakcheck --json             # machine-readable output
+#   leakcheck --format FMT       # text, json (as --json), sarif, csv or junit
 #   leakcheck --redact           # print no hit's text, and no tell in a path
 #   leakcheck --rule ID          # run only this rule (repeatable): a
 #                                # credential:<id> or a config label
@@ -112,7 +113,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.23.0"
+VERSION="0.24.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -124,6 +125,8 @@ ROOT=""
 ARG_ERR=""
 REDACT=0
 RULE_ONLY=()
+FORMAT_ARG=""
+JSON_FLAG=0
 
 # Every error leaves through fail, masked by every built-in rule once the
 # temp dir exists (mask_texts): an error quotes what it is about — a config
@@ -160,7 +163,14 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --json)            OUTPUT_MODE="json"; shift ;;
+    --json)            OUTPUT_MODE="json"; JSON_FLAG=1; shift ;;
+    --format)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "leakcheck: $1 needs a value" >&2; usage 2 >&2
+      fi
+      # One format, never last-wins; checked once an error is masked.
+      [[ -z "$FORMAT_ARG" ]] || ARG_ERR="--format given twice; pass one"
+      FORMAT_ARG=$2; shift 2 ;;
     --strict)          STRICT=1; shift ;;
     --history)         HISTORY=1; shift ;;
     --history-range)
@@ -1289,6 +1299,17 @@ if [[ -n "$ARG_ERR" ]]; then FAIL_USAGE=1; die "$ARG_ERR"; fi
 case "$HIST_RANGE" in
   -*) die "--history-range takes a revision range, not an option: $HIST_RANGE" ;;
 esac
+if [[ -n "$FORMAT_ARG" ]]; then
+  case "$FORMAT_ARG" in
+    text|json|sarif|csv|junit) ;;
+    *) FAIL_USAGE=1; die "unknown format: $FORMAT_ARG (text, json, sarif, csv or junit)" ;;
+  esac
+  # --json is --format json; with any other format it is a contradiction.
+  if [[ "$JSON_FLAG" -eq 1 && "$FORMAT_ARG" != json ]]; then
+    die "--json and --format $FORMAT_ARG disagree; pass one"
+  fi
+  OUTPUT_MODE=$FORMAT_ARG
+fi
 
 if [[ -n "$ROOT" ]]; then
   cd -- "$ROOT" 2>/dev/null || die "cannot cd to $ROOT"
@@ -3180,7 +3201,6 @@ if [[ "$OUTPUT_MODE" == "json" && ${#ALLOWLIST[@]} -gt 0 ]]; then
 fi
 
 # ─── output ───────────────────────────────────────────────────────────
-if [[ "$OUTPUT_MODE" == "json" ]]; then
   # One well-formed UTF-8 sequence, as bytes (matched under LC_ALL=C).
   UTF8_SEQ=$'([\x01-\x7f]|[\xc2-\xdf][\x80-\xbf]|\xe0[\xa0-\xbf][\x80-\xbf]|[\xe1-\xec\xee\xef][\x80-\xbf][\x80-\xbf]|\xed[\x80-\x9f][\x80-\xbf]|\xf0[\x90-\xbf][\x80-\xbf][\x80-\xbf]|[\xf1-\xf3][\x80-\xbf][\x80-\xbf][\x80-\xbf]|\xf4[\x80-\x8f][\x80-\xbf][\x80-\xbf])'
   # JSON must be UTF-8, and neither a path nor a line has to be (a legacy
@@ -3216,6 +3236,67 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
     s=$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\037')
     utf8_clean "$s"
   }
+  # XML 1.0 text and attributes, for --format junit. Each replacement comes
+  # from a quoted variable: since bash 5.2 an unquoted `&` in a ${s//x/y}
+  # replacement is the matched text (`a<b` became `a<lt;b`, measured).
+  xml_escape() {
+    local s="$1" amp='&amp;' lt='&lt;' gt='&gt;' quot='&quot;' apos='&apos;' tab='&#9;' nl='&#10;' cr='&#13;'
+    s=${s//&/"$amp"}
+    s=${s//</"$lt"}
+    s=${s//>/"$gt"}
+    s=${s//\"/"$quot"}
+    s=${s//\'/"$apos"}
+    s=${s//$'\t'/"$tab"}
+    s=${s//$'\n'/"$nl"}
+    s=${s//$'\r'/"$cr"}
+    # XML 1.0 allows no other C0 character, even as a reference.
+    s=$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\037')
+    utf8_clean "$s"
+  }
+  # A relative URI reference for a path, for --format sarif: every byte but
+  # an unreserved one or `/` percent-encoded.
+  uri_path() { # path -> REPLY
+    local LC_ALL=C s=$1 c v k out=""
+    for (( k = 0; k < ${#s}; k++ )); do
+      c=${s:k:1}
+      case "$c" in
+        [A-Za-z0-9._~/-]) out+=$c ;;
+        *) printf -v v '%%%02X' "'$c"; out+=$v ;;
+      esac
+    done
+    REPLY=$out
+  }
+  # A CSV field, RFC 4180 quoted. A field a spreadsheet would read as a
+  # formula (=, +, -, @, a tab or a CR first) gets a leading ': the text of
+  # a hit is the scanned repository's, and opening the report must not run
+  # it.
+  csv_field() { # value -> REPLY
+    local s=$1 q='""'
+    case "$s" in [=+@-]*|$'\t'*|$'\r'*) s="'$s" ;; esac
+    REPLY="\"${s//\"/"$q"}\""
+  }
+  # The hit as the text output leads it, commit first in history.
+  hit_where() { # hit -> REPLY
+    REPLY="${SHOW_FILE[$1]}:${H_LINE[$1]}"
+    if [[ -n "${H_COMMIT[$1]}" ]]; then REPLY="${H_COMMIT[$1]}:$REPLY"; fi
+  }
+  # The summary the text output prints to stderr after its hits; the
+  # formats whose document is stdout print it too.
+  summary_stderr() {
+    if [[ "$HIT_COUNT" -eq 0 ]]; then
+      echo "leakcheck: clean — 0 matches across $TRACKED_COUNT tracked files ($SCOPE)" >&2
+      return 0
+    fi
+    echo "leakcheck: $HIT_COUNT match(es)" >&2
+    echo "leakcheck: scanned $TRACKED_COUNT tracked files ($SCOPE)" >&2
+    if [[ "$CRED_FOUND" -gt 0 ]]; then
+      echo "leakcheck: $CRED_FOUND credential(s) among these: revoke and reissue any that has left this machine; deleting one from the files or the history does not revoke it" >&2
+    fi
+    if [[ "$CRED_UNSCOPED" -gt 0 ]]; then
+      echo "leakcheck: $CRED_UNSCOPED of them matched an allow rule that names no credential rule, which never excuses a credential; to excuse one, write allow credential:<id> <regex>" >&2
+    fi
+  }
+if [[ "$OUTPUT_MODE" == "json" ]]; then
   # version, clean, count and hits stay first and unchanged; new fields
   # only ever append.
   printf '{"version":"%s","clean":%s,"count":%d,"hits":[' \
@@ -3277,6 +3358,80 @@ if [[ "$OUTPUT_MODE" == "json" ]]; then
     printf ']'
   fi
   printf '}\n'
+elif [[ "$OUTPUT_MODE" == "sarif" ]]; then
+  # SARIF 2.1.0, as GitHub code scanning reads it: one run, a rule for each
+  # pattern that hit, a result for each hit. A name or symlink target (line
+  # 0) has no region. A commit's metadata, a ref or a tag (`(author)`,
+  # `(ref)`, … in history) has no file, so its location is logical, named as
+  # the text output names it.
+  declare -A RULE_IX=()
+  RULE_IDS=()
+  for i in "${KEEP[@]}"; do
+    if [[ -z "${RULE_IX["l${SHOW_PAT[$i]}"]+x}" ]]; then
+      RULE_IX["l${SHOW_PAT[$i]}"]=${#RULE_IDS[@]}
+      RULE_IDS+=("${SHOW_PAT[$i]}")
+    fi
+  done
+  printf '{"version":"2.1.0","$schema":"https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"leakcheck","version":"%s","informationUri":"https://github.com/kVadrum/leakcheck","rules":[' "$VERSION"
+  for k in "${!RULE_IDS[@]}"; do
+    [[ "$k" -eq 0 ]] || printf ','
+    r=${RULE_IDS[k]}
+    if [[ "$r" == credential:* ]]; then d="A credential, by the built-in rule ${r#credential:}"; else d="A match of the pattern $r"; fi
+    printf '{"id":"%s","shortDescription":{"text":"%s"}}' "$(json_escape "$r")" "$(json_escape "$d")"
+  done
+  printf ']}},"results":['
+  first=1
+  for i in "${KEEP[@]}"; do
+    [[ "$first" -eq 1 ]] || printf ','
+    first=0
+    hit_where "$i"
+    printf '{"ruleId":"%s","ruleIndex":%d,"level":"error","message":{"text":"%s"},"locations":[' \
+      "$(json_escape "${SHOW_PAT[$i]}")" "${RULE_IX["l${SHOW_PAT[$i]}"]}" \
+      "$(json_escape "$REPLY: [${SHOW_PAT[$i]}] ${SHOW[$i]}")"
+    case "${H_SRC[$i]}:${H_FILE[$i]}" in
+      'history:(author)'|'history:(committer)'|'history:(message)'|'history:(ref)'|'history:(tag)'|'history:(tagger)'|'history:(tag message)')
+        printf '{"logicalLocations":[{"fullyQualifiedName":"%s"}]}' "$(json_escape "${SHOW_FILE[$i]}")" ;;
+      *)
+        uri_path "${SHOW_FILE[$i]}"
+        printf '{"physicalLocation":{"artifactLocation":{"uri":"%s"}' "$(json_escape "$REPLY")"
+        if [[ "${H_LINE[$i]}" -gt 0 ]]; then printf ',"region":{"startLine":%d}' "${H_LINE[$i]}"; fi
+        printf '}}' ;;
+    esac
+    printf '],"properties":{"source":"%s"' "${H_SRC[$i]}"
+    if [[ -n "${H_COMMIT[$i]}" ]]; then printf ',"commit":"%s"' "${H_COMMIT[$i]}"; fi
+    printf '}}'
+  done
+  printf ']}]}\n'
+  summary_stderr
+elif [[ "$OUTPUT_MODE" == "csv" ]]; then
+  # One row per hit, under a header; a clean scan is the header alone.
+  printf 'file,line,pattern,text,source,commit\n'
+  for i in "${KEEP[@]}"; do
+    csv_field "${SHOW_FILE[$i]}"; row="$REPLY,${H_LINE[$i]},"
+    csv_field "${SHOW_PAT[$i]}"; row+="$REPLY,"
+    csv_field "${SHOW[$i]}"; row+="$REPLY,${H_SRC[$i]},${H_COMMIT[$i]}"
+    printf '%s\n' "$row"
+  done
+  summary_stderr
+elif [[ "$OUTPUT_MODE" == "junit" ]]; then
+  # A failed test case per hit. A clean scan is one passing case, `scan`:
+  # a suite of no tests reads as one that never ran.
+  n=$HIT_COUNT f=$HIT_COUNT
+  if [[ "$HIT_COUNT" -eq 0 ]]; then n=1; fi
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+  printf '<testsuites name="leakcheck" tests="%d" failures="%d">\n' "$n" "$f"
+  printf '<testsuite name="leakcheck" tests="%d" failures="%d">\n' "$n" "$f"
+  if [[ "$HIT_COUNT" -eq 0 ]]; then
+    printf '<testcase classname="leakcheck" name="scan"/>\n'
+  fi
+  for i in "${KEEP[@]}"; do
+    hit_where "$i"
+    printf '<testcase classname="leakcheck" name="%s"><failure type="%s" message="%s">%s</failure></testcase>\n' \
+      "$(xml_escape "$REPLY")" "$(xml_escape "${SHOW_PAT[$i]}")" \
+      "$(xml_escape "[${SHOW_PAT[$i]}] ${SHOW[$i]}")" "$(xml_escape "$REPLY: [${SHOW_PAT[$i]}] ${SHOW[$i]}")"
+  done
+  printf '</testsuite>\n</testsuites>\n'
+  summary_stderr
 else
   # One hit, one line. A field holding a newline — only a path name or a
   # symlink target can — is C-quoted the way git quotes such paths; every
