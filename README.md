@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.29.1*
+*README v0.29.2*
 
 ## Install
 
@@ -238,7 +238,8 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
 
 - **A hit names the encoding** after its text, and in `--json` as its `source`: `decoded-base64`, `decoded-hex` or `decoded-percent`.
 - **A value that decodes to anything but text** — printable ASCII, tabs and line breaks — is not read: an image's base64 is binary, and a long word that happens to look like base64 almost never decodes to text.
-- **One level, and the tracked content only**: a value encoded twice is not found, nor one in `--history`'s lines; the summary counts the values decoded.
+- **A prefix that is no part of the value** is read past: `0x` before hex, a path before base64 (`/static/<value>`); a percent escape that is not text stays as written, and the others on its line are decoded.
+- **One level, and the tracked content only** — a type-changed file's too, and under `--archives` each member's: a value encoded twice is not found, nor one in `--history`'s lines; the summary counts the values decoded.
 - It is off by default: it costs a second pass over every line that holds a candidate.
 
 ## Archives
@@ -258,7 +259,7 @@ leakcheck: scanned 1 tracked files (index + worktree; 0 binary skipped, 0 submod
 - **Bash and git alone read it**, no `unzip`, `tar` or `gzip`: git inflates what is deflated.
 - **One level:** an archive inside an archive is a binary member, counted.
 - **Counted, never silent:** a member encrypted, compressed by another method than deflate, or not read whole (its data longer or shorter than its stated size among them), and an archive that cannot be read (zip64, a damaged file), are in the summary, and `--strict` reports each; an archive read is no longer a binary file not scanned.
-- Tracked content only, not `--history`, and not decoded under `--decode`.
+- Tracked content only, not `--history`; `--decode` decodes the members' lines too.
 
 ## Scanning files outside a repository
 
@@ -271,6 +272,7 @@ git diff --cached | leakcheck --stdin --config .leakcheckrc
 
 - Nothing is written into `DIR`: a private, temporary repository indexes it, and the scan reads each file as it is.
 - A repository inside `DIR` is counted with the submodules, not scanned; scan it on its own.
+- Any other path named `.git`, at any depth — a directory or a file — is counted, not scanned: git indexes none, so the summary names them (`1 paths named .git not scanned`), `--json` counts them (`"git_dirs": 1`), and `--strict` reports each.
 - `--history` needs a repository, so it is refused with either.
 
 ## Scanning history

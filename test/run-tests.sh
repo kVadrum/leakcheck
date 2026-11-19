@@ -4389,6 +4389,11 @@ t_decode_finds_encoded_values() {
   assert_not_contains "$gh" "$LC_OUT"
   assert_contains "leakcheck: 8 match(es)" "$LC_ERR"
   assert_contains "; 8 encoded values decoded (tracked content, one level)" "$LC_ERR"
+  # Standard input decodes too, and the summary names what it read.
+  printf 'cfg: %s\n' "$b64" > .git/dec.txt
+  assert_exit 1 "$BIN" --stdin --decode < .git/dec.txt
+  assert_contains "stdin:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] cfg: see /home/alice/b64 (decoded base64)" "$LC_OUT"
+  assert_contains "; 1 encoded values decoded (standard input, one level)" "$LC_ERR"
   assert_exit 1 "$BIN" --decode --json
   python3 -c '
 import json, sys
@@ -4486,6 +4491,84 @@ assert u == [("long.zip!long.txt", "(archive member not read: not read whole)")]
   assert_exit 1 "$BIN" --archives --redact
   assert_not_contains "MYHOST" "$LC_OUT"
   assert_not_contains "$gh" "$LC_OUT"
+}
+
+t_dir_counts_paths_named_git() {
+  # /qaa (v0.29.2): --dir dropped every path named .git silently — git
+  # indexes none — under a summary saying "every file". Each is counted
+  # (a backup's .git directory, a file named .git, the top's), a .git inside
+  # an embedded repository stays that repository's (a submodule), and
+  # --strict reports each.
+  local d="$PWD/.git/plain"
+  mkdir -p "$d/backup/.git" "$d/w" "$d/sub" "$d/.git"
+  printf 'url = https://x/home/alice/\n' > "$d/backup/.git/config"
+  printf 'gitdir: /home/alice/elsewhere\n' > "$d/w/.git"
+  printf 'x\n' > "$d/.git/HEAD"
+  git -C "$d/sub" init -q
+  printf 'x\n' > "$d/sub/a.txt"
+  git -C "$d/sub" -c core.hooksPath=/dev/null add a.txt
+  git -C "$d/sub" -c core.hooksPath=/dev/null -c user.email=t@t -c user.name=t commit -q -m i
+  printf 'clean\n' > "$d/top.txt"
+  assert_exit 0 "$BIN" --dir "$d"
+  assert_contains "1 submodules not scanned" "$LC_OUT"
+  assert_contains "; 3 paths named .git not scanned" "$LC_OUT"
+  assert_exit 1 "$BIN" --dir "$d" --strict --json
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+g = sorted((h["file"], h["text"]) for h in d["hits"] if h["pattern"] == "unscanned:git-dir")
+assert g == [(".git", "(named .git; contents not scanned)"), ("backup/.git", "(named .git; contents not scanned)"),
+             ("w/.git", "(named .git; contents not scanned)")], g
+assert d["git_dirs"] == 3, d
+assert list(d)[-1] == "git_dirs", list(d)
+' "$LC_OUT"
+  # A tree, not --dir: no such count.
+  seed a.txt "clean"
+  commit init
+  assert_exit 0 "$BIN"
+  assert_not_contains "named .git" "$LC_OUT"
+}
+
+t_decode_reads_past_prefixes() {
+  # /qaa (v0.29.2): --decode missed a percent line holding one escape that
+  # is not text, hex after 0x, base64 after a path, a type-changed file, an
+  # archive member, and a run the 8192 bytes of a line read at a time cut
+  # (two ways: reaching their end, and starting in their last 20 bytes).
+  local H='[/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/]' b64
+  python3 - <<'PY'
+import base64, zipfile
+b = lambda s: base64.b64encode(s.encode()).decode()
+lines = [
+    "u: ?p=%2Fhome%2Falice%2Fpct&who=Zo%C3%AB",
+    "h: 0x" + "see /home/alice/hex0x".encode().hex(),
+    "s: /static/" + b("see /home/alice/b64path"),
+    # A run from byte 8149 on: the first 8192 read reach their end in it.
+    " " * 8146 + "r: " + b("x" * 40 + " see /home/alice/winend"),
+    # A run from byte 8181 on: its first 11 bytes alone in the first 8192
+    # (not 12: base64 cut by a multiple of 4 still decodes).
+    " " * 8178 + "q: " + b("y" * 30 + " see /home/alice/wincut"),
+]
+open("a.txt", "w").write("\n".join(lines) + "\n")
+z = zipfile.ZipFile("z.zip", "w")
+z.writestr("m.txt", "v: " + b("see /home/alice/ardec") + "\n")
+z.close()
+open("tc.txt", "w").write("k: " + b("see /home/alice/tcdec") + "\n")
+PY
+  ln -s target l.txt
+  git add a.txt z.zip l.txt
+  commit init
+  rm l.txt
+  mv tc.txt l.txt
+  assert_exit 1 "$BIN" --decode --archives
+  assert_contains "a.txt:1: $H u: ?p=/home/alice/pct&who=Zo%C3%AB (decoded percent)" "$LC_OUT"
+  assert_contains "a.txt:2: $H h: 0xsee /home/alice/hex0x (decoded hex)" "$LC_OUT"
+  assert_contains "a.txt:3: $H s: /static/see /home/alice/b64path (decoded base64)" "$LC_OUT"
+  assert_contains "a.txt:4: $H" "$LC_OUT"
+  assert_contains "see /home/alice/winend (decoded base64)" "$LC_OUT"
+  assert_contains "a.txt:5: $H" "$LC_OUT"
+  assert_contains "see /home/alice/wincut (decoded base64)" "$LC_OUT"
+  assert_contains "z.zip!m.txt:1: $H v: see /home/alice/ardec (decoded base64)" "$LC_OUT"
+  assert_contains "l.txt:1: $H k: see /home/alice/tcdec (decoded base64)" "$LC_OUT"
 }
 
 t_archives_read_members() {
@@ -5392,6 +5475,8 @@ lc_test "--stdin"                               t_stdin_scans_input
 lc_test "--decode: base64, hex, percent"        t_decode_finds_encoded_values
 lc_test "--archives: zip, tar, gzip"            t_archives_read_members
 lc_test "--archives: what they publish"       t_archives_read_what_they_publish
+lc_test "--dir: paths named .git counted"     t_dir_counts_paths_named_git
+lc_test "--decode: past prefixes, in copies"  t_decode_reads_past_prefixes
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
