@@ -1902,7 +1902,8 @@ t_credential_every_rule_finds_its_own_format() {
 import json, re, sys
 doc = json.load(open(sys.argv[1]))
 kv = {"aws-secret-access-key", "url-password", "generic-secret", "http-basic-auth",
-      "http-bearer-token", "curl-user-password", "xml-key-value", "generic-key"}
+      "http-bearer-token", "curl-user-password", "xml-key-value", "generic-key",
+      "sidekiq-credentials"}
 def shown(cid, m):
     if cid in markers:
         return m
@@ -1913,6 +1914,8 @@ def shown(cid, m):
         return "%s[redacted, %d chars]" % (scheme, len(val))
     if cid == "curl-user-password":
         return "-u[redacted, %d chars]" % len(m.split(":", 1)[1])
+    if cid == "sidekiq-credentials":
+        return "%s[redacted, %d chars]" % (re.search("(?i)contribsys", m).group(0), len(m.rsplit(":", 1)[1]))
     if cid == "xml-key-value":
         k, val = re.match(r'<add key="([^"]*)" value="(.*)$', m).groups()
         return "%s[redacted, %d chars]" % (k, len(val))
@@ -3627,6 +3630,69 @@ PY
   done < "$vt"
 }
 
+t_credential_issuer_sourced_v019() {
+  # gap 4 (v0.19.0). Sidekiq's gem-server credentials in its environment
+  # variable and its bundle config (`user:password`, the password judged at
+  # 2 bits a character, the issuer's own `username:password` weak); its URL
+  # form stays url-password's alone. An Airtable token under a secret's name
+  # (`pat<id>.<64 hex>`) was a dotted name to v0.18.0, set aside whenever
+  # its id held no digit; a part of 32 or more hex digits is a token's.
+  local vt="$PWD/.git/g4.tsv"
+  python3 -I - "$vt" <<'PY'
+import random, sys
+r = random.Random(71)
+hx = lambda n: "".join(r.choice("0123456789abcdef") for _ in range(n))
+a, b, c, d = hx(7) + "c", hx(6) + "b4", hx(7) + "e", hx(6) + "f9"
+air = "pat" + "".join(r.choice("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz") for _ in range(14)) + ".a" + hx(63)
+rows = [
+    ("sidekiq-credentials", "BUNDLE_GEMS__CONTRIB" "SYS__COM=%s:%s" % (a, b), "CONTRIBSYS[redacted, 8 chars]", b),
+    ("sidekiq-credentials", "bundle config --local enterprise.contrib" "sys.com %s:%s" % (c, d), "contribsys[redacted, 8 chars]", d),
+    ("url-password", "source \"https://%s:%s@gems.contrib" "sys.com/\"" % (c, d), "https://[redacted, 8 chars]", d),
+    ("generic-secret", "AIRTABLE_TOKEN=" + air, "TOKEN[redacted, %d chars]" % len(air), air),
+]
+with open(sys.argv[1], "w") as f:
+    for row in rows:
+        f.write("\t".join(row) + "\n")
+PY
+  { cut -f2 "$vt"; echo 'bundle config gems.contrib''sys.com username:password'; } > s.txt
+  git add s.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" "$vt" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])]
+got = sorted((h["line"], h["pattern"], h["text"]) for h in doc["hits"])
+want = sorted((n + 1, "credential:" + cid, shown) for n, (cid, _, shown, _) in enumerate(rows))
+assert got == want, (got, want)
+assert doc["credentials"]["weak"] == 1, doc["credentials"]
+PY
+  while IFS=$'\t' read -r _ _ _ v; do assert_not_contains "$v" "$LC_OUT"; done < "$vt"
+}
+
+t_credential_issuer_sourced_near_misses_are_clean() {
+  # Guard (passes on v0.18.0, which has none of these rules): the v0.19.0
+  # prefixes and shapes stop short of their lengths and separators — a
+  # prefix with a short run, a digest that is no OpenShift token, `pat.`
+  # with short parts, a Flutterwave body with no `-X`, an id joined by `|`
+  # to a name, a Grafana prefix with little after it, `LTAI` inside base64,
+  # and (huggingface-token's edge, v0.19.0) `hf_` inside base64url.
+  printf '%s\n' \
+    'shippo_test_key = load()' 'sm_pat_short' 'tk-us-east-1' 'duffel_test_mode' \
+    'image: app@sha256:4f2a9c1e7b3d5f6a8c0e2b4d6f8a0c2e' 'x = sha256~short' \
+    'pat.match(text).group(1)' 'pattern.compile.matches.all' \
+    'FLWSECK-3f2a9c1e7b3d5f6a8c0e2b4d6f8a0c2e' 'p8e-short' 'ico-small' 'pnu_test' \
+    'LTAI12345678' '| 1700000000000 | release-candidate |' '20261119123456|nightly' \
+    'eyJrIjoiYWJj' 'bedrock-api-key-test' \
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkLTAIk3a4RtFQKBAAAAAElFTkSuQmCC' \
+    "u=Qx7-dQIh""f_$(printf 'Kw%.0s' {1..17})" > n.txt
+  git add n.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 0 "$BIN"
+}
+
 t_credential_left_edge_is_not_masked_in_a_name() {
   # Guard (passes on v0.11.10, which had no edge): the character before a
   # deepseek-key in a path is not part of the key, so it prints; a mask
@@ -4319,6 +4385,8 @@ lc_test "keyword rules: URL sub-delims"          t_kv_url_password_takes_rfc3986
 lc_test "keyword rules: a dotted token is no name" t_kv_dotted_token_is_no_name
 lc_test "keyword rules: HTTP authentication"     t_kv_http_auth_rules
 lc_test "keyword rules: the weaker names"       t_kv_generic_key_names
+lc_test "credentials: issuer-sourced, v0.19.0"   t_credential_issuer_sourced_v019
+lc_test "credentials: v0.19.0 near misses clean" t_credential_issuer_sourced_near_misses_are_clean
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
 lc_test "allow: unscoped rule and a stand-in"        t_allow_unscoped_and_a_placeholder

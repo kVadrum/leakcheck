@@ -153,6 +153,22 @@ SPECS = {
  "curl-user-password": ("", ["cu", "rl -u deploy:", ("an", 14), ("d", 1), ("a", 1)]),
  "xml-key-value": ("", ['<add key="ClearText', 'Password" value="', ("an", 16), ("d", 1), ("a", 1)]),
  "generic-key": ("", ["ke", "y = \"", ("an", 30), ("d", 1), ("a", 1)]),
+ "sidekiq-credentials": ("", ["bundle config --local gems.contrib", "sys.com ", ("hex", 7), "c", ":", ("hex", 6), "b", ("d", 1)]),
+ "jfrog-token": ("KEY=", ["AK", "Cp", ("an", 69)]),
+ "authress-key": ("KEY=", ["sc", "_", ("an", 12), ".", ("an", 5), ".acc", "_", ("lan", 20), ".", ("an-_", 60)]),
+ "maxmind-license-key": ("KEY=", [("an", 6), "_", ("an", 29), "_mm", "k"]),
+ "openshift-token": ("KEY=", ["sha", "256~", ("an-_", 43)]),
+ "settlemint-token": ("KEY=", ["sm", "_pat_", ("an", 32)]),
+ "shippo-token": ("KEY=", ["shippo", "_live_", ("hex", 40)]),
+ "scalingo-token": ("KEY=", ["tk-", "us-", ("an-_", 48)]),
+ "duffel-token": ("KEY=", ["duffel", "_test_", ("an-_", 43)]),
+ "flutterwave-key": ("KEY=", ["FLW", "SECK-", ("hex", 32), "-X"]),
+ "harness-token": ("KEY=", ["pa", "t.", ("an-_", 22), ".", ("an", 24), ".", ("an", 20)]),
+ "adobe-client-secret": ("KEY=", ["p8", "e-", ("an-_", 32)]),
+ "aws-bedrock-key": ("KEY=", ["bedrock", "-api-key-", ("b64", 300)]),
+ "infracost-token": ("KEY=", ["ic", "o-", ("an", 32)]),
+ "prefect-token": ("KEY=", ["pn", "u_", ("an", 36)]),
+ "alibaba-access-key-id": ("KEY=", ["LT", "AI", ("an", 20)]),
 }
 
 
@@ -284,9 +300,24 @@ SLASH = {"webhook-signing-secret": 1, "grafana-token": ["gl", "c_", ("b64", 64)]
          "1password-token": 0, "flyio-token": 2, "jwt": 0}
 
 
+# Branches and prefixes added since v0.19.0, read after ISSUER_VARIANTS so
+# the stand-ins before them keep their seeded values.
+LATE_VARIANTS = {
+ "gitlab-token": [("X;", ["_gitlab", "_session=", ("hex", 32)])],
+ "grafana-token": [("KEY=", ["eyJr", "Ijoi", ("b64", 80)])],
+ "facebook-token": [("X;", ["1", ("d", 14), "|", ("hex", 32)])],
+ "jfrog-token": [("KEY=", ["cmVm", "d", ("an", 59)])],
+ "settlemint-token": [("KEY=", ["sm", "_" + p + "_", ("an", 32)]) for p in ("aat", "sat")],
+ "shippo-token": [("KEY=", ["shippo", "_test_", ("hex", 40)])],
+ "duffel-token": [("KEY=", ["duffel", "_live_", ("an-_", 43)])],
+ "flutterwave-key": [("KEY=", ["FLW", p, ("hex", 32), "-X"]) for p in ("PUBK-", "SECK_TEST-", "PUBK_TEST-")],
+ "infracost-token": [("KEY=", ["ics", "_v1_", ("an-_", 48)])],
+}
+
+
 def variants(cid):
     """Every spec of a rule, SPECS' first."""
-    return [SPECS[cid]] + VARIANTS.get(cid, []) + ISSUER_VARIANTS.get(cid, [])
+    return [SPECS[cid]] + VARIANTS.get(cid, []) + ISSUER_VARIANTS.get(cid, []) + LATE_VARIANTS.get(cid, [])
 
 
 def suite_rows():
@@ -309,10 +340,11 @@ def slash_rows():
 def issuer_rows():
     """(rule id, line, match), one per ISSUER_VARIANTS spec, seeded."""
     r = random.Random(20261116)
-    for cid, vs in ISSUER_VARIANTS.items():
-        for before, spec in vs:
-            m = gen(spec, r)
-            yield cid, before + m, m
+    for table in (ISSUER_VARIANTS, LATE_VARIANTS):
+        for cid, vs in table.items():
+            for before, spec in vs:
+                m = gen(spec, r)
+                yield cid, before + m, m
 
 
 if __name__ == "__main__":

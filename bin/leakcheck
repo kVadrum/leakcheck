@@ -103,7 +103,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.18.0"
+VERSION="0.19.0"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -272,7 +272,8 @@ CREDENTIALS=(
   # source: docs.github.com/en/organizations/managing-programmatic-access-to-your-organization/github-credential-types
   github-fine-grained-token   'github_pat_[A-Za-z0-9_]{22,}'  # gitleaks: github-fine-grained-pat
   # source: docs.gitlab.com/security/tokens/; lengths and glrct-, gliamrt-, gliamac- from GitLab's own gitlab-org/security-products/secret-detection/secret-detection-rules
-  gitlab-token                'gl(pat|ptt|rtr?|rct|dt|soat|cbt|ft|ffct|imt|agent|oas|wt|iamrt|iamac)-[A-Za-z0-9_-]{20,}|GR1348941[A-Za-z0-9_-]{20}'  # gitleaks: gitlab-pat and the other gitlab-* token rules
+  # and the session cookie, "the old 32 random characters and digits" (gitlab-org/gitlab merge request 145178)
+  gitlab-token                'gl(pat|ptt|rtr?|rct|dt|soat|cbt|ft|ffct|imt|agent|oas|wt|iamrt|iamac)-[A-Za-z0-9_-]{20,}|GR1348941[A-Za-z0-9_-]{20}|_gitlab_session=[A-Za-z0-9]{32}'  # gitleaks: gitlab-pat and the other gitlab-* token rules
   # source: docs.slack.dev/authentication/tokens
   slack-token                 'xox[abeoprs]-[A-Za-z0-9-]{10,}|xapp-[0-9]-[A-Za-z0-9-]{10,}|xwfp-[A-Za-z0-9-]{10,}'  # gitleaks: slack-bot-token, slack-user-token, slack-app-token
   # Webhook URLs match their issuer's segments and stop: a body running
@@ -313,7 +314,12 @@ CREDENTIALS=(
   # source: none
   xai-key                     'xai-[A-Za-z0-9]{80,}'
   # source: huggingface.co/docs/hub/security-tokens (hf_; api_org_ is deprecated)
-  huggingface-token           'hf_[A-Za-z0-9]{34}|api_org_[A-Za-z0-9]{34}'  # gitleaks: huggingface-access-token, huggingface-organization-api-token
+  # A left edge for hf_ (v0.19.0): inside random base64url, `hf_` and 34
+  # alphanumerics turn up about once in 3,000 lines of 300 characters (the
+  # corpus harness's look-alikes, once reseeded). No letter or digit before
+  # it, so the 2 in 64 base64url places after `-` or `_` remain, and a key
+  # in a file name after `-` is still found.
+  huggingface-token           '(^|[^A-Za-z0-9])hf_[A-Za-z0-9]{34}|api_org_[A-Za-z0-9]{34}'  # gitleaks: huggingface-access-token, huggingface-organization-api-token
   # source: github.blog/security/announcing-npms-new-access-token-format/
   npm-token                   'npm_[A-Za-z0-9]{36,}'  # gitleaks: npm-access-token
   # source: docs.pypi.org/api/secrets/ (its own regex: pypi- and 85 or more, any Warehouse); the
@@ -353,7 +359,8 @@ CREDENTIALS=(
   # source: docs.sentry.io/security-legal-pii/security/token-formats/
   sentry-token                'sntry[sc]_([A-Za-z0-9+=_]|\\?/){50,}|sntry[uai]_[a-f0-9]{64}|sntryh_[A-Za-z0-9_-]{43}'  # gitleaks: sentry-org-token, sentry-user-token
   # source: grafana/grafana, pkg/components/satokengen/tokengen.go (glsa_); Grafana Cloud docs (glc_)
-  grafana-token               'glc_([A-Za-z0-9+]|\\?/){32,}={0,2}|glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}'  # gitleaks: grafana-cloud-api-token, grafana-service-account-token
+  # and legacy API keys: the base64 of {"k":"<32 random>","n":…,"id":…} (grafana/grafana pkg/components/apikeygen/apikeygen.go), so eyJrIjoi
+  grafana-token               'glc_([A-Za-z0-9+]|\\?/){32,}={0,2}|glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}|eyJrIjoi([A-Za-z0-9+]|\\?/){68,}={0,2}'  # gitleaks: grafana-cloud-api-token, grafana-service-account-token
   # source: Databricks' own databricks-industry-solutions/security-analysis-tool detectors and databricks-sql-nodejs (dapi, dsapi, dose, dkea)
   databricks-token            '(dapi|dsapi|dose|dkea)[a-hA-H0-9]{32}(-[0-9])?'  # gitleaks: databricks-api-token
   # source: none for the shape; support.atlassian.com: token length varies
@@ -366,7 +373,9 @@ CREDENTIALS=(
   # The fourth character stays M or C, though Meta fixes none: any other let
   # base64 image data in a real SVG read as 30 tokens, 5 past the stand-in
   # test (v0.12.0), since `EAA` is how base64 writes 0x10 and zero bytes.
-  facebook-token              'EAA[MC][A-Za-z0-9]{100,}'  # gitleaks: facebook-page-access-token
+  # An app access token is the app id, `|` and the app secret ("access_token={your-app_id}|{your-app_secret}", the same page); the
+  # secret's length is unstated, and 24 keeps ids joined by `|` to a name out.
+  facebook-token              'EAA[MC][A-Za-z0-9]{100,}|[0-9]{13,20}\|[A-Za-z0-9]{24,}'  # gitleaks: facebook-page-access-token
   # source: developer.squareup.com/reference/square/oauth-api/obtain-token (sq0csp-, by example)
   square-token                'sq0(atp|csp)-[A-Za-z0-9_-]{22,}'  # gitleaks: square-access-token
   # source: pulumi.com/registry/packages/pulumiservice/api-docs/api/tokens/personaltoken/ (pul-)
@@ -492,6 +501,13 @@ KV_CURL_PW="[^[:space:]\"'\`\$<{][^[:space:]\"'\`]{7,127}"
 # packageSourceCredentials and .NET's appSettings, with the generic words.
 KV_XML_ADD="<[Aa][Dd][Dd][[:space:]]+[Kk][Ee][Yy][[:space:]]*=[[:space:]]*[\"'][A-Za-z0-9_.:-]{0,40}($KV_SECRET_CI)[A-Za-z0-9_.:-]{0,40}[\"'][[:space:]]+[Vv][Aa][Ll][Uu][Ee][[:space:]]*=[[:space:]]*[\"']"
 KV_XML_VAL="[^\"'<>[:space:]]{8,128}"
+# Sidekiq Pro and Enterprise: `user:password` for the gem server, in its
+# environment variable or bundle config (the URL form is url-password's).
+kv_ci 'bundle_'; KV_SIDEKIQ="$REPLY"
+kv_ci '(gems|enterprise)'; KV_SIDEKIQ+="$REPLY"
+kv_ci '__contribsys__com'; KV_SIDEKIQ+="$REPLY[\"']?[[:space:]]*[=:][[:space:]]*[\"']?"
+kv_ci '(gems|enterprise)\.contribsys\.com'
+KV_SIDEKIQ="($KV_SIDEKIQ|$REPLY[\"']?[[:space:]]+[\"']?)[A-Za-z0-9._-]{1,64}:"
 KV_CREDENTIALS=(
   # source: docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html (a secret access key, wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY: 40 characters); docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html (AWS_SECRET_ACCESS_KEY)
   aws-secret-access-key   'aws[_.-]?secret[_.-]?(access[_.-]?)?key'  '([A-Za-z0-9+]|\\?/){40}'  ''  4000
@@ -512,12 +528,17 @@ KV_CREDENTIALS=(
   xml-key-value           "$KV_XML_ADD"  "$KV_XML_VAL"  ''  3000
   # source: none (the generic rule's weaker names, as every scanner's generic rule carries them; its judgement ours)
   generic-key             'key|auth|access|creds|api'  '[A-Za-z0-9_+/=~.!@#%^*-]{12,100}'  ''  3500
+  # source: github.com/sidekiq/sidekiq/wiki/Comm-Installation (Pro and Enterprise credentials "look like username:password", set as BUNDLE_GEMS__CONTRIBSYS__COM or with bundle config gems.contribsys.com)
+  # One bit a character: eight random hex digits fall under two about one
+  # time in eight (`aaabbb31`), and only a run like `aaaabbbb` is no secret.
+  sidekiq-credentials     "$KV_SIDEKIQ"  '[A-Za-z0-9]{8,64}'  ''  1000
 )
 # KV_WORDY: rules whose values a person writes, judged for words too.
 declare -A KV_RAW=([url-password]=1 [http-basic-auth]=1 [http-bearer-token]=1
-  [curl-user-password]=1 [xml-key-value]=1)
+  [curl-user-password]=1 [xml-key-value]=1 [sidekiq-credentials]=1)
 declare -A KV_WORDY=([url-password]=1 [generic-secret]=1 [http-basic-auth]=1
-  [http-bearer-token]=1 [curl-user-password]=1 [xml-key-value]=1 [generic-key]=1)
+  [http-bearer-token]=1 [curl-user-password]=1 [xml-key-value]=1 [generic-key]=1
+  [sidekiq-credentials]=1)
 # KV_PARTS: rules whose names say less (`key`, `auth`), so a value made of
 # words is no secret either: two or more parts split at `-_./:~@+`, each a
 # word, words joined in camel case, a number, or a letter and a number —
@@ -528,7 +549,8 @@ declare -A KV_PARTS=([generic-key]=1)
 declare -A KV_SHOW_RE=([http-basic-auth]='([A-Za-z]+)[[:space:]]+$'
   [http-bearer-token]='([A-Za-z]+)[[:space:]]+$'
   [curl-user-password]='(-u|-U|--user|--proxy-user)[[:space:]=]*["'"'"']?[^:]*:$'
-  [xml-key-value]='[Kk][Ee][Yy][[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']*)["'"'"'][[:space:]]+[Vv][Aa][Ll][Uu][Ee]')
+  [xml-key-value]='[Kk][Ee][Yy][[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']*)["'"'"'][[:space:]]+[Vv][Aa][Ll][Uu][Ee]'
+  [sidekiq-credentials]='([Cc][Oo][Nn][Tt][Rr][Ii][Bb][Ss][Yy][Ss])')
 # A value that is base64 of `user:password` (Basic): judged as its password,
 # or as its user where the password is empty (an API key sent as the user).
 declare -A KV_B64USER=([http-basic-auth]=1)
@@ -558,6 +580,50 @@ for (( k = 0; k < ${#KV_CREDENTIALS[@]}; k += 5 )); do
   KV_MINH[$id]=${KV_CREDENTIALS[k + 4]}
   CREDENTIALS+=("$id" "${KV_PRE[$id]}${KV_VAL[$id]}${KV_POST[$id]}")
 done
+# Fixed-format rules added after the keyword rules (v0.19.0), sourced from
+# their issuers as every row is, and none from gitleaks; listed last so the
+# suite's seeded stand-ins keep their order. Where an issuer states a prefix
+# and no length, the body takes 16 characters at least: no issued token
+# holds fewer than about 95 bits, and a shorter run after a prefix is a
+# name or a stand-in (`shippo_test_key`).
+CREDENTIALS+=(
+  # source: docs.jfrog.com/user-management/docs/identity-tokens (API keys AKCp and 69 alphanumerics; reference tokens cmVmd and 59, 64 characters in all)
+  jfrog-token                 'AKCp[A-Za-z0-9]{69}|cmVmd[A-Za-z0-9]{59}'
+  # source: authress.io/knowledge-base/docs/authorization/service-clients/secrets-scanning (the issuer's own expression for its service client keys)
+  authress-key                '(sc|ext|scauth|authress)_[A-Za-z0-9]{5,30}\.[A-Za-z0-9]{4,6}\.acc[_-][a-z0-9-]{10,32}\.([A-Za-z0-9+_=-]|\\?/){30,120}'
+  # source: dev.maxmind.com/geoip/release-notes/2023-03-16-changes-to-maxmind-license-keys/ (40 characters of [a-zA-Z0-9_] ending in _mmk; "the length ... may increase")
+  # Bounded, unlike the issuer: with no literal before it, an open run is
+  # tried from every byte to the line's end, and a 400 KB line took past 60
+  # s against 0.15 s at 100 (measured, git 2.53).
+  maxmind-license-key         '[A-Za-z0-9_]{36,100}_mmk'
+  # source: github.com/openshift/oauth-server pkg/server/crypto (SHA256Prefix "sha256~"; 256 random bits in unpadded URL-safe base64, 43 characters)
+  openshift-token             'sha256~[A-Za-z0-9_-]{43}'
+  # source: github.com/settlemint/sdk sdk/utils/src/logging/mask-tokens.ts (sm_pat_, sm_aat_ and sm_sat_, then alphanumerics)
+  settlemint-token            'sm_(pat|aat|sat)_[A-Za-z0-9]{16,}'
+  # source: docs.goshippo.com/docs/guides_general/authentication ("Live keys begin with shippo_live_", "Test keys begin with shippo_test_")
+  shippo-token                'shippo_(live|test)_[A-Za-z0-9]{16,}'
+  # source: developers.scalingo.com/tokens (tk-us- in its example)
+  scalingo-token              'tk-us-[A-Za-z0-9_-]{16,}'
+  # source: duffel.com/docs/api/overview/test-mode (test tokens "start with duffel_test_"; a live token, the page's other kind, as duffel_live_)
+  duffel-token                'duffel_(test|live)_[A-Za-z0-9_-]{16,}'
+  # source: github.com/Flutterwave SDK READMEs (FLWSECK-, FLWPUBK- and their _TEST forms, ending -X); developer.flutterwave.com ("Test keys will always have _TEST as prefix")
+  flutterwave-key             'FLW(SEC|PUB)K(_TEST)?-[A-Za-z0-9]{16,}-X'
+  # source: github.com/harness/harness-cli cmd/auth/login.go ("Token format: pat.AccountID.Random.Random")
+  harness-token               'pat\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9]{16,}\.[A-Za-z0-9]{16,}'
+  # source: experienceleague.adobe.com (App Builder server-to-server authentication: a sample OAUTHS2S_CLIENT_SECRET, p8e- and 32 more)
+  adobe-client-secret         'p8e-[A-Za-z0-9_-]{32,}'
+  # source: github.com/aws/aws-bedrock-token-generator-python (AUTH_PREFIX "bedrock-api-key-", then the base64 of a SigV4-presigned URL)
+  aws-bedrock-key             'bedrock-api-key-([A-Za-z0-9+=]|\\?/){100,}'
+  # source: github.com/infracost/ci pull 33 (v0.1 API keys ico-, CLI v2 tokens ics_v1_); "36 chars for new users" (an Infracost member, infracost/infracost issue 1975)
+  infracost-token             'ico-[A-Za-z0-9]{32,}|ics_v1_[A-Za-z0-9_-]{16,}'
+  # source: github.com/PrefectHQ/terraform-prefect-ecs-worker README (prefect_api_key = "pnu_…")
+  prefect-token               'pnu_[A-Za-z0-9]{16,}'
+  # source: alibabacloud.com/help/en/ram/developer-reference/api-ims-2019-08-15-listaccesskeys (AccessKey IDs in its examples begin LTAI, the rest masked)
+  # A left edge, as deepseek-key's: `LTAI` inside base64 image data in two
+  # SVGs read as keys (the v0.19.0 sweep), so it may not follow a base64
+  # character, but may follow an escape.
+  alibaba-access-key-id       '(^|[^A-Za-z0-9+/]|\\[a-z]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}|%[0-9A-Fa-f]{2})LTAI[A-Za-z0-9]{12,}'
+)
 ALL_CREDENTIALS=("${CREDENTIALS[@]}" "${PATH_CREDENTIALS[@]}")
 
 
@@ -654,6 +720,12 @@ kv_weak() {
     for p in "${parts[@]}"; do
       if (( ${#p} >= 16 )) && [[ "$p" == *[A-Z]* && "$p" == *[a-z]* && "$p" == *[0-9]* ]] &&
          ! [[ "$p" =~ ^[a-z]?([A-Z]?[a-z]{2,}|[A-Z]{2,}|[0-9]{1,4}|_)+$ ]]; then
+        rnd=1
+      fi
+      # 32 or more hex digits with a letter and a digit: an Airtable token's
+      # secret after `pat<id>.` (v0.19.0), a hash; never a word.
+      if (( ${#p} >= 32 )) && [[ "$p" =~ ^[0-9a-f]+$ || "$p" =~ ^[0-9A-F]+$ ]] &&
+         [[ "$p" == *[0-9]* && "$p" == *[A-Fa-f]* ]]; then
         rnd=1
       fi
     done
@@ -799,12 +871,13 @@ kv_show() {
 }
 
 # Rules with a left edge, and the literal each one's key begins with.
-declare -A CRED_KEYSTART=([deepseek-key]='sk-')
+declare -A CRED_KEYSTART=([deepseek-key]='sk-' [alibaba-access-key-id]='LTAI' [huggingface-token]='hf_')
 # cred_key <id> <match>: the match cut to start at its key -> REPLY.
 cred_key() {
   REPLY=$2
   local ks=${CRED_KEYSTART[$1]:-}
-  if [[ -n "$ks" && "$REPLY" != "$ks"* ]]; then REPLY=$ks${REPLY#*"$ks"}; fi
+  # Only where the literal is: a rule's other branch (api_org_) has none.
+  if [[ -n "$ks" && "$REPLY" != "$ks"* && "$REPLY" == *"$ks"* ]]; then REPLY=$ks${REPLY#*"$ks"}; fi
 }
 
 # ─── temp dir and error masking ───────────────────────────────────────
@@ -935,7 +1008,8 @@ declare -A CRED_ARUN=([aws-access-key-id]=2 [facebook-token]=8)
 # whose body is widened to take `/` belongs here; the webhook rules never
 # do: their `/` ends a segment, and their stand-in is the secret segment.
 declare -A CRED_SLASH=([webhook-signing-secret]=1 [grafana-token]=1 [sentry-token]=1
-  [1password-token]=1 [flyio-token]=1 [jwt]=1 [generic-secret]=1 [generic-key]=1)
+  [1password-token]=1 [flyio-token]=1 [jwt]=1 [generic-secret]=1 [generic-key]=1
+  [authress-key]=1 [aws-bedrock-key]=1)
 # is_placeholder <match> [rule id]: a stand-in's shape (ph_shape), and for
 # a rule in CRED_OPENED, in the shortest start of the match the rule still
 # matches too. v0.12.0 opened these eight fixed lengths at their end
