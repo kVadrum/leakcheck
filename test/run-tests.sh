@@ -4256,12 +4256,14 @@ t_baseline_errors() {
 t_kv_code_identifiers_are_weak() {
   # v0.25.1: a value under `key` that is code, not a literal — a camel-case
   # function or variable name (`createPrivateKey(`, `privatePkcs8`), or a
-  # TypeScript non-null read (`signer!.privatePkcs8`) — is weak, as
+  # TypeScript non-null read (`signer!.privatePkcs8`), or a function called
+  # (`urlBase64ToUint8Array(`, v0.25.2) — is weak, as
   # word parts are: the fleet sweep took four such names in a test file for
   # keys. A random value still is a key, a lowercase one with digits
   # included: its runs read as words, but it has no camel case.
   seed a.ts "    const key = createPrivateKey({ key: signer!.privatePkcs8, format: 'der', type: 'pkcs8' });
-    const priv = createPrivateKey({ key: privatePkcs8, format: 'der', type: 'pkcs8' });"
+    const priv = createPrivateKey({ key: privatePkcs8, format: 'der', type: 'pkcs8' });
+    applicationServerKey: urlBase64ToUint8Array(vapidKey)"
   seed b.txt $'key: "Zq7Lm2Xv9Rt4Wp8Ks3Nb"\nkey: qzv7kxmb3trlw9pd'
   rc_file 'no-defaults'
   commit init
@@ -4270,8 +4272,9 @@ t_kv_code_identifiers_are_weak() {
 import json, sys
 d = json.load(open(sys.argv[1]))
 assert sorted((h["file"], h["line"], h["pattern"]) for h in d["hits"]) == [("b.txt", 1, "credential:generic-key"), ("b.txt", 2, "credential:generic-key")], d["hits"]
-# Two hits weak: line 1 holds two matches (the call and the read), line 2 one.
-assert d["credentials"]["weak"] == 2, d["credentials"]
+# Three hits weak: line 1 holds two matches (the call and the read), line 2
+# one, line 3 a function's name (`To` is no word for KV_WORD_RE: v0.25.2).
+assert d["credentials"]["weak"] == 3, d["credentials"]
 PY
 }
 
