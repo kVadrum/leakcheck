@@ -4596,6 +4596,97 @@ assert d["credentials"]["weak"] == 1, d["credentials"]
 PY
 }
 
+t_kv_quoted_value_is_no_call() {
+  # Codex, the /qaa of main..dev (v0.29.4): v0.25.2's call reading took a
+  # quoted value followed by `(` for a function's name: set aside, exit 0.
+  # The unquoted call stays code (t_kv_parts_values_are_code, a guard).
+  printf '%s\n' 'key = "Zq7Lm2Xv9''Rt4Wp8Ks3Nb(foo)"' > c.py
+  git add c.py
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN"
+  assert_contains "c.py:1: [credential:generic-key] key[redacted, 20 chars]" "$LC_OUT"
+}
+
+t_credential_opened_and_slashed_rules_judge_the_key() {
+  # Codex, the /qaa of main..dev (v0.29.4): rules whose length is fixed and
+  # taken as a least, and rules taking `/`, read text glued after a key as
+  # the key's: `12345678` or `/XXXXXXXX` made it a stand-in, exit 0. And a
+  # long-term Bedrock key in JSON, its `/` written `\/`, was no match.
+  local id m
+  local -a lines=()
+  for id in adobe-client-secret infracost-token clickhouse-secret octopus-key \
+            easypost-key frameio-token intra42-secret aws-bedrock-long-term-key; do
+    # No `/` of its own, so the slash rules cannot decide it.
+    m=$(cred "$id"); m=${m#=}; m=${m//\//+}
+    lines+=("k: $m""1234""5678")
+  done
+  m=$(cred aws-bedrock-long-term-key); m=${m#=}
+  lines+=("s: ${m//\//+}/XXXX""XXXX")
+  lines+=("Authorization: Bearer Zq7Lm2Xv9""Rt4Wp8Ks3Nb7Hd/XXXX""XXXX")
+  lines+=("Authorization: Basic WGszajlmTHEy""bVpwN3dSNGFROlpyOEx""tMktx/XXXX""XXXX")
+  lines+=('j: {"k": "AB''SKZq7Lm2Xv9Rt4Wp8Ks3Nb\/'"$(printf 'Hq3Lm8Xv2Rt9Wp4Ks7Nb%.0s' 1 2 3 4 5)"'"}')
+  printf '%s\n' "${lines[@]}" > k.txt
+  git add k.txt
+  rc_file 'no-defaults'
+  commit init
+  assert_exit 1 "$BIN" --json
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+want = ["adobe-client-secret", "infracost-token", "clickhouse-secret", "octopus-key",
+        "easypost-key", "frameio-token", "intra42-secret", "aws-bedrock-long-term-key",
+        "aws-bedrock-long-term-key", "http-bearer-token", "http-basic-auth",
+        "aws-bedrock-long-term-key"]
+got = sorted((h["line"], h["pattern"]) for h in d["hits"])
+assert got == [(n + 1, "credential:" + w) for n, w in enumerate(want)], got
+assert d["credentials"].get("placeholders", 0) == 0 and d["credentials"].get("weak", 0) == 0, d["credentials"]
+PY
+}
+
+t_archives_compare_raw_bytes() {
+  # Codex, the /qaa of main..dev (v0.29.4): the worktree archive was hashed
+  # with its filters to compare with the index's, so a clean filter in
+  # .git/info/attributes made the two equal: the worktree's members alone
+  # were read, and the index's leak was missed, exit 0.
+  python3 - <<'PY'
+import zipfile
+z = zipfile.ZipFile(".git/staged.zip", "w"); z.writestr("m.txt", "see /home/alice/staged\n"); z.close()
+z = zipfile.ZipFile("a.zip", "w"); z.writestr("m.txt", "clean\n"); z.close()
+PY
+  printf 'a.zip filter=swap\n' > .git/info/attributes
+  git config filter.swap.clean 'cat .git/staged.zip'
+  git add a.zip
+  commit init
+  assert_exit 1 "$BIN" --archives
+  assert_contains "a.zip!m.txt:1: [/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/] see /home/alice/staged" "$LC_OUT"
+}
+
+t_decode_tries_every_path_part() {
+  # Codex, the /qaa of main..dev (v0.29.4): --decode tried eight path parts,
+  # and `//localhost` took three, so a value after six was never read. Hex
+  # after a path is its last part (a guard: v0.29.3 reads it too).
+  local H='[/home/[A-Za-z0-9_][A-Za-z0-9_.-]*/]'
+  python3 - <<'PY'
+import base64
+b = lambda s: base64.b64encode(s.encode()).decode()
+open("a.txt", "w").write("\n".join([
+    "u: http://localhost/a/b/c/d/e/f/" + b("see /home/alice/url6"),
+    "p: x/1/2/3/4/5/6/7/8/9/10/11/" + b("see /home/alice/deep12"),
+    "h: /a/b/" + "see /home/alice/hexpath".encode().hex(),
+    # Its base64 holds a `/` (`b2s/`): a try that is not the last part.
+    "q: /x/y/" + b("ok? see /home/alice/qmark"),
+]) + "\n")
+PY
+  git add a.txt
+  commit init
+  assert_exit 1 "$BIN" --decode
+  assert_contains "a.txt:1: $H u: http://localhost/a/b/c/d/e/f/see /home/alice/url6 (decoded base64)" "$LC_OUT"
+  assert_contains "a.txt:2: $H p: x/1/2/3/4/5/6/7/8/9/10/11/see /home/alice/deep12 (decoded base64)" "$LC_OUT"
+  assert_contains "a.txt:3: $H h: /a/b/see /home/alice/hexpath (decoded hex)" "$LC_OUT"
+  assert_contains "a.txt:4: $H q: /x/y/ok? see /home/alice/qmark (decoded base64)" "$LC_OUT"
+}
+
 t_kv_basic_auth_user_is_judged() {
   # /qaa (v0.29.3): Basic auth judged by its password alone set aside an
   # API key sent as the user with `X` for the password (Freshdesk,
@@ -5622,6 +5713,10 @@ lc_test "credentials: cut only past an edge" t_credential_cut_only_past_an_edge
 lc_test "--baseline: unscanned content" t_baseline_holds_unscanned_content
 lc_test "--format junit: XML noncharacters" t_junit_drops_xml_noncharacters
 lc_test "history: a user's text driver, -m" t_history_text_driver_sends_merges_to_m
+lc_test "credentials: a quoted value is no call" t_kv_quoted_value_is_no_call
+lc_test "credentials: opened and slashed rules" t_credential_opened_and_slashed_rules_judge_the_key
+lc_test "--archives: raw bytes compared" t_archives_compare_raw_bytes
+lc_test "--decode: every path part tried" t_decode_tries_every_path_part
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential

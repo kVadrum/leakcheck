@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.29.3*
+*README v0.29.4*
 
 ## Install
 
@@ -240,7 +240,7 @@ leakcheck: 1 credential(s) among these: revoke and reissue any that has left thi
 
 - **A hit names the encoding** after its text, and in `--json` as its `source`: `decoded-base64`, `decoded-hex` or `decoded-percent`.
 - **A value that decodes to anything but text** — printable ASCII, tabs and line breaks — is not read: an image's base64 is binary, and a long word that happens to look like base64 almost never decodes to text.
-- **A prefix that is no part of the value** is read past: `0x` before hex, a path before base64 (`/static/<value>`); a percent escape that is not text stays as written, and the others on its line are decoded.
+- **A prefix that is no part of the value** is read past: `0x` before hex, a path before base64, however deep (`/static/<value>`); a percent escape that is not text stays as written, and the others on its line are decoded.
 - **One level, and the tracked content only** — a type-changed file's too, and under `--archives` each member's: a value encoded twice is not found, nor one in `--history`'s lines; the summary counts the values decoded.
 - It is off by default: it costs a second pass over every line that holds a candidate.
 
