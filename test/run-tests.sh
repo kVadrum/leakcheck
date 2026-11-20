@@ -4734,6 +4734,79 @@ PY
   assert_not_contains "Zq7Lm2Xv9""Rt4" "$LC_ERR"
 }
 
+t_redact_list_patterns_hides_plain_patterns() {
+  # Codex, the /qaa of main..dev (v0.29.6): --redact hid a config pattern's
+  # regex in its hits, as `pattern:<n>`, and --list-patterns printed it.
+  # A label is the name a user chose to print (a guard).
+  seed a.txt "MYHOST INTERNAL-XYZ"
+  rc_file 'no-defaults' 'no-credentials' 'pattern MYHOST' 'label codename INTERNAL-XYZ'
+  commit init
+  assert_exit 0 "$BIN" --redact --list-patterns
+  assert_not_contains "MYHOST" "$LC_OUT"
+  [[ "$(cat "$LC_OUT")" == $'pattern:1\ncodename' ]] || { cat "$LC_OUT"; return 1; }
+  assert_exit 1 "$BIN" --redact
+  assert_contains "[pattern:1]" "$LC_OUT"
+}
+
+t_rule_path_rule_alone_scans() {
+  # Codex, the /qaa of main..dev (v0.29.6): the empty-scan guard counted the
+  # content rules alone, so `--rule credential:pkcs12-file` was "no
+  # patterns to scan", exit 2.
+  seed certs/client.p12 "x"
+  commit init
+  assert_exit 1 "$BIN" --rule credential:pkcs12-file
+  assert_contains "certs/client.p12:0: [credential:pkcs12-file]" "$LC_OUT"
+}
+
+t_baseline_counts_each_copy_apart() {
+  # Codex, the /qaa of main..dev (v0.29.6): a baselined line moved in the
+  # worktree alone was found twice, the index's copy and the worktree's,
+  # and counted together the second read as new until staged; under
+  # --decode too. A copy added is still new (a guard).
+  local b
+  b=$(python3 -c 'import base64; print(base64.b64encode(b"see /home/alice/moved").decode())')
+  printf '%s\n' a b "key = \"Zq7Lm2Xv9""Rt4Wp8Ks3Nb\"" "v: $b" > m.txt
+  git add m.txt
+  commit init
+  assert_exit 1 "$BIN" --decode --write-baseline .git/bl
+  printf '%s\n' "v: $b" "key = \"Zq7Lm2Xv9""Rt4Wp8Ks3Nb\"" a b > m.txt
+  assert_exit 0 "$BIN" --decode --baseline .git/bl
+  assert_contains "4 in baseline" "$LC_OUT"
+  printf '%s\n' "v: $b" "key = \"Zq7Lm2Xv9""Rt4Wp8Ks3Nb\"" a b "key = \"Zq7Lm2Xv9""Rt4Wp8Ks3Nb\"" > m.txt
+  assert_exit 1 "$BIN" --decode --baseline .git/bl
+  assert_contains "[credential:generic-key]" "$LC_OUT"
+  [[ "$(wc -l < "$LC_OUT")" -eq 1 ]] || { cat "$LC_OUT"; return 1; }
+  # A decoded copy beside a line in both copies: the line counts in both.
+  printf '%s\n' a b "key = \"Zq7Lm2Xv9""Rt4Wp8Ks3Nb\"" "v: $b" "v: $b" > m.txt
+  assert_exit 1 "$BIN" --decode --baseline .git/bl
+  assert_contains "m.txt:5: [/home/" "$LC_OUT"
+  [[ "$(wc -l < "$LC_OUT")" -eq 1 ]] || { cat "$LC_OUT"; return 1; }
+}
+
+t_baseline_holds_a_member_s_content() {
+  # Codex, the /qaa of main..dev (v0.29.6): an unscanned archive member's
+  # fingerprint looked for `outer.zip!inner.bin` on disk, found neither id,
+  # and a member whose bytes changed stayed baselined, exit 0.
+  python3 -c 'import zipfile; z = zipfile.ZipFile("o.zip", "w"); z.writestr("inner.bin", bytes(range(256))); z.close()'
+  git add o.zip
+  commit init
+  assert_exit 1 "$BIN" --archives --strict --write-baseline .git/bl
+  assert_contains "o.zip!inner.bin:0: [unscanned:binary]" "$LC_OUT"
+  assert_exit 0 "$BIN" --archives --strict --baseline .git/bl
+  python3 -c 'import zipfile; z = zipfile.ZipFile("o.zip", "w"); z.writestr("inner.bin", bytes(range(255, -1, -1))); z.close()'
+  # The worktree's member alone changed; the index's alone; both.
+  assert_exit 1 "$BIN" --archives --strict --baseline .git/bl
+  assert_contains "o.zip!inner.bin:0: [unscanned:binary]" "$LC_OUT"
+  git add o.zip
+  git show HEAD:o.zip > o.zip
+  assert_exit 1 "$BIN" --archives --strict --baseline .git/bl
+  assert_contains "o.zip!inner.bin:0: [unscanned:binary]" "$LC_OUT"
+  git checkout -- o.zip
+  commit two
+  assert_exit 1 "$BIN" --archives --strict --baseline .git/bl
+  assert_contains "o.zip!inner.bin:0: [unscanned:binary]" "$LC_OUT"
+}
+
 t_kv_basic_auth_user_is_judged() {
   # /qaa (v0.29.3): Basic auth judged by its password alone set aside an
   # API key sent as the user with `X` for the password (Freshdesk,
@@ -5765,6 +5838,10 @@ lc_test "credentials: opened and slashed rules" t_credential_opened_and_slashed_
 lc_test "--archives: raw bytes compared" t_archives_compare_raw_bytes
 lc_test "--decode: every path part tried" t_decode_tries_every_path_part
 lc_test "credentials: a long value masked whole" t_kv_long_value_is_masked_whole
+lc_test "--redact: --list-patterns" t_redact_list_patterns_hides_plain_patterns
+lc_test "--rule: a path rule alone" t_rule_path_rule_alone_scans
+lc_test "--baseline: a line moved in one copy" t_baseline_counts_each_copy_apart
+lc_test "--baseline: an archive member's content" t_baseline_holds_a_member_s_content
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential

@@ -121,7 +121,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.29.5"
+VERSION="0.29.6"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -1890,13 +1890,21 @@ if [[ "$LIST_ONLY" -eq 2 ]]; then
   exit 0
 fi
 if [[ "$LIST_ONLY" -eq 1 ]]; then
+  # Under --redact a config pattern with no label prints as its hits name
+  # it, `pattern:<its line here>`: its regex is the tell (Codex, the /qaa of
+  # main..dev: MYHOST printed).
+  pn=0
   for p in "${PATTERNS[@]}" "${PATH_PATS[@]}"; do
+    pn=$(( pn + 1 ))
+    if [[ "$REDACT" -eq 1 && -n "${PLAIN_PAT["l$p"]+x}" ]]; then printf 'pattern:%s\n' "$pn"; continue; fi
     printf '%s\n' "${CRED_RE["l$p"]:-$p}"
   done
   exit 0
 fi
 
-if [[ "${#PATTERNS[@]}" -eq 0 ]]; then
+# A path rule is a rule to scan with: `--rule credential:pkcs12-file` alone
+# was "no patterns to scan", exit 2 (Codex, the /qaa of main..dev).
+if [[ $(( ${#PATTERNS[@]} + ${#PATH_PATS[@]} )) -eq 0 ]]; then
   die "no patterns to scan (defaults disabled and config empty)"
 fi
 
@@ -2178,6 +2186,9 @@ declare -A H_NAME=()
 # The path of the content an unscanned hit stands for, whose identity its
 # baseline fingerprint takes.
 declare -A H_CPATH=()
+# A decoded hit's copy (index, worktree, both), where its source names the
+# encoding.
+declare -A H_VIEW=()
 H_COMMIT=()
 declare -A HIT_AT=()
 add_hit() { # pattern file line text source [commit]
@@ -2874,6 +2885,10 @@ dec_value() {
 D_FILE=()
 D_LINE=()
 D_KIND=()
+# D_VIEW: the copy each subject line came from — index, worktree or both —
+# which a baseline's ordinals count by (DEC_VIEW, as dec_line runs).
+D_VIEW=()
+DEC_VIEW=""
 DEC_COUNT=0
 dec_emit() { # file line kind text — each line of text, one subject line
   local -a parts=()
@@ -2881,7 +2896,7 @@ dec_emit() { # file line kind text — each line of text, one subject line
   local q
   for q in "${parts[@]}"; do
     printf '%s\n' "$q" >&5
-    D_FILE+=("$1"); D_LINE+=("$2"); D_KIND+=("$3")
+    D_FILE+=("$1"); D_LINE+=("$2"); D_KIND+=("$3"); D_VIEW+=("$DEC_VIEW")
   done
   DEC_COUNT=$((DEC_COUNT + 1))
 }
@@ -2928,9 +2943,14 @@ if [[ "$DECODE" -eq 1 ]]; then
     run_git "decode candidates ($dsrc)" "$TMPD/dcand" g grep "${da[@]}" "${GREP_FLAGS[@]}" -n -I -H --full-name \
       -E '[A-Za-z0-9+/_-]{20,}|%[0-9A-Fa-f]{2}' -- . "${skip_excludes[@]}"
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
-      [[ -z "${DEC_SEEN["$f:$l:$t"]+x}" ]] || continue
-      DEC_SEEN["$f:$l:$t"]=1
+      if [[ -n "${DEC_SEEN["$f:$l:$t"]+x}" ]]; then
+        # The line at the same place in both copies: its subjects are both's.
+        for (( q = ${DEC_SEEN["$f:$l:$t"]% *}; q < ${DEC_SEEN["$f:$l:$t"]#* }; q++ )); do D_VIEW[q]=both; done
+        continue
+      fi
+      q=${#D_FILE[@]}; DEC_VIEW=$dsrc
       dec_line "$f" "$l" "$t"
+      DEC_SEEN["$f:$l:$t"]="$q ${#D_FILE[@]}"
     done < "$TMPD/dcand"
   done
   # The type-change copies, and under --archives the members: the passes
@@ -2948,10 +2968,10 @@ if [[ "$DECODE" -eq 1 ]]; then
     while IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r t; do
       if [[ "$dsrc" == tc ]]; then
         [[ "$f" =~ ^[0-9]+$ && -n "${TC_PATHS[$f]+x}" ]] || die "internal error: type-change decode returned $f"
-        f=${TC_PATHS[$f]}
+        f=${TC_PATHS[$f]}; DEC_VIEW=worktree
       else
         [[ "$f" =~ ^[0-9]+$ && -n "${AR_PATH[$f]+x}" ]] || die "internal error: archive decode returned $f"
-        f=${AR_PATH[$f]}
+        DEC_VIEW=${AR_SRC[$f]}; f=${AR_PATH[$f]}
       fi
       [[ -z "${DEC_SEEN["$f:$l:$t"]+x}" ]] || continue
       DEC_SEEN["$f:$l:$t"]=1
@@ -2969,7 +2989,9 @@ if [[ "$DECODE" -eq 1 ]]; then
         k=$(( l - 1 ))
         [[ -n "${D_FILE[k]+x}" ]] || die "internal error: decode pass returned line $l"
         if [[ -n "$CONFIG_REL" && "${D_FILE[k]}" == "$CONFIG_REL" && -z "${CRED_RE["l$p"]+x}" ]]; then continue; fi
+        n0=${#H_FILE[@]}
         add_hit "$p" "${D_FILE[k]}" "${D_LINE[k]}" "$t" "decoded-${D_KIND[k]}"
+        if (( ${#H_FILE[@]} > n0 )); then H_VIEW[$n0]=${D_VIEW[k]}; fi
       done < "$TMPD/dhits"
     done
   fi
@@ -4153,10 +4175,10 @@ if [[ -n "$BASELINE_IN$BASELINE_OUT" ]]; then
   # An unscanned hit's text is the same whatever its content holds, so the
   # content's identity, the index's and the worktree's, is in its print: a
   # binary file baselined stayed baselined whatever it came to hold (/qaa).
-  declare -A FPX=() CP_I=() CP_W=()
+  declare -A FPX=() CP_I=() CP_W=() CPS=()
   cps=()
   for i in "${KEEP[@]}"; do
-    if [[ -n "${H_CPATH[$i]+x}" ]]; then cps+=("${H_CPATH[$i]}"); fi
+    if [[ -n "${H_CPATH[$i]+x}" ]]; then cps+=("${H_CPATH[$i]}"); CPS["p${H_CPATH[$i]}"]=1; fi
   done
   if [[ ${#cps[@]} -gt 0 ]]; then
     run_git "ls-files (baseline)" "$TMPD/bls" g ls-files -s -z
@@ -4169,6 +4191,24 @@ if [[ -n "$BASELINE_IN$BASELINE_OUT" ]]; then
       run_git "hash-object (baseline)" "$TMPD/bwh" git hash-object --no-filters -- "$p"
       CP_W["p$p"]=$(<"$TMPD/bwh")
     done
+    # An archive member's content is its copy: `outer.zip!inner.bin` is no
+    # path, so v0.29.3 found neither id, and a changed member stayed
+    # baselined, exit 0 (Codex, the /qaa of main..dev).
+    rows=()
+    for (( q = 0; q < AR_K; q++ )); do
+      if [[ -n "${CPS["p${AR_PATH[q]}"]+x}" ]]; then rows+=("$q"); printf '%s\n' "$TMPD/ar/$q"; fi
+    done > "$TMPD/bar.list"
+    if [[ ${#rows[@]} -gt 0 ]]; then
+      run_git "hash-object (baseline)" "$TMPD/bar.hash" git hash-object --no-filters --stdin-paths < "$TMPD/bar.list"
+      mapfile -t ids < "$TMPD/bar.hash"
+      [[ ${#ids[@]} -eq ${#rows[@]} ]] ||
+        die "scan error: git hash-object returned ${#ids[@]} hashes for ${#rows[@]} archive members"
+      for k in "${!rows[@]}"; do
+        q=${rows[k]}; p=${AR_PATH[q]}
+        if [[ "${AR_SRC[q]}" != worktree ]]; then CP_I["p$p"]=${ids[k]}; fi
+        if [[ "${AR_SRC[q]}" != index ]]; then CP_W["p$p"]=${ids[k]}; fi
+      done
+    fi
     for i in "${KEEP[@]}"; do
       [[ -n "${H_CPATH[$i]+x}" ]] || continue
       p=${H_CPATH[$i]}
@@ -4190,12 +4230,25 @@ if [[ -n "$BASELINE_IN$BASELINE_OUT" ]]; then
     [[ ${#FP_HASH[@]} -eq ${#KEEP[@]} ]] ||
       die "scan error: git hash-object returned ${#FP_HASH[@]} hashes for ${#KEEP[@]} findings"
   fi
+  # The ordinal counts in each copy apart: the index and the worktree are two
+  # copies of one file, so a line the worktree alone moved is one finding
+  # found twice, not a copy; counted together it took `:2`, read as new
+  # until staged (Codex, the /qaa of main..dev). A hit in both copies counts
+  # in both and takes the larger; history counts on its own.
   k=0
   for i in "${KEEP[@]}"; do
     h=${FP_HASH[k]}; k=$((k + 1))
     [[ "$h" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || die "scan error: unexpected hash from git hash-object"
-    FP_N[$h]=$(( ${FP_N[$h]:-0} + 1 ))
-    FP[$i]="$h:${FP_N[$h]}"
+    v=${H_VIEW[$i]:-${H_SRC[$i]}}
+    case "$v" in
+      index|both) FP_N["i $h"]=$(( ${FP_N["i $h"]:-0} + 1 )) ;;&
+      worktree|both) FP_N["w $h"]=$(( ${FP_N["w $h"]:-0} + 1 )) ;;&
+      index) o=${FP_N["i $h"]} ;;
+      worktree) o=${FP_N["w $h"]} ;;
+      both) o=${FP_N["i $h"]}; if (( ${FP_N["w $h"]} > o )); then o=${FP_N["w $h"]}; fi ;;
+      *) FP_N["o $v $h"]=$(( ${FP_N["o $v $h"]:-0} + 1 )); o=${FP_N["o $v $h"]} ;;
+    esac
+    FP[$i]="$h:$o"
   done
   if [[ -n "$BASELINE_OUT" ]]; then
     {

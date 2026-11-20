@@ -6,7 +6,7 @@ Secret scanners such as gitleaks, trufflehog and git-secrets look for secrets, a
 leakcheck looks for those, and, with built-in rules, for credentials in the formats their issuers fixed: cloud, AI and git-host keys and tokens, webhook URLs, private key headers ([Credentials](#credentials)).
 It is one bash script, and git is its only real dependency.
 
-*README v0.29.5*
+*README v0.29.6*
 
 ## Install
 
@@ -474,7 +474,7 @@ Hits go to stdout, one per line, as `path:line: [pattern] text`; the summary lin
 A credential rule's hit names the rule, `[credential:github-token]`, and shows its matches masked in place of the line ([Credentials](#credentials)).
 The format is plain text without color, so it greps.
 
-With `--redact`, a hit prints its text's length in place of the text (`[redacted, 27 chars]`), a tell a pattern found — in a file name or a line — is hidden in every path that prints and in a credential hit's text, a config pattern with no `label` prints as its line in `--list-patterns` (`[pattern:9]`), and `--json` hides each allow rule's text too; a credential hit prints as it always does, masked.
+With `--redact`, a hit prints its text's length in place of the text (`[redacted, 27 chars]`), a tell a pattern found — in a file name or a line — is hidden in every path that prints and in a credential hit's text, a config pattern with no `label` prints as its line in `--list-patterns` (`[pattern:9]`), as that line itself does (`pattern:9`), and `--json` hides each allow rule's text too; a credential hit prints as it always does, masked.
 For a CI log that should name where a leak is and never what it is.
 An error still quotes what it reports — a config line, a pattern git refused — so check a config locally before CI runs it.
 
@@ -550,8 +550,8 @@ leakcheck --baseline .leakcheck-baseline         # from then on: only what is ne
 ```
 
 - **A fingerprint is a hash** of the finding's path, pattern and text, then its ordinal among identical findings; the file holds nothing else, so committing it publishes no path, text or key.
-- **A line that moves is the same finding**; a copy of it is a new one, and so is a different key where an accepted one sat, though both print the same masked text.
-- **An unscanned finding (`--strict`) carries its content's identity**: a binary file, submodule or archive whose content changes is a new finding, though its text is the same.
+- **A line that moves is the same finding**, moved in the worktree alone too (the index's copy and the worktree's are counted apart); a copy of it is a new one, and so is a different key where an accepted one sat, though both print the same masked text.
+- **An unscanned finding (`--strict`) carries its content's identity**: a binary file (an archive's binary member too), submodule or archive whose content changes is a new finding, though its text is the same.
 - **A history finding is the same after a rebase**: the commit is not part of the fingerprint, since history reports each finding once, at its earliest commit.
 - **The findings a baseline holds are counted** in the summary (`3 in baseline`) and in `--json` (`"baseline": 3`), as allow rules are.
 - `--write-baseline` writes every finding the run reports, before `--baseline` takes any out, and leaves the exit code as it is; the baseline is read first, so one file can be both.
