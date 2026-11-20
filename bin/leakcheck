@@ -121,7 +121,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-VERSION="0.29.4"
+VERSION="0.29.5"
 
 OUTPUT_MODE="text"
 STRICT=0
@@ -526,8 +526,13 @@ ALL_CREDENTIALS=("${CREDENTIALS[@]}" "${PATH_CREDENTIALS[@]}")
 # kv_weak judges it, and a weak value is a stand-in, counted with the
 # placeholders. A row: id; the keyword, an ERE in lower case matched in any
 # case (with KV_RAW, the whole ERE before the value instead); the value's
-# ERE, at most 128 characters; a literal the match ends with after the
-# value; the least entropy the value needs, in millibits per character.
+# ERE, its first bound the most kv_weak reads (128 characters at most); a
+# literal the match ends with after the value; the least entropy the value
+# needs, in millibits per character. The match itself runs to the value's
+# end (KV_VAL, the ERE with that bound dropped): bounded, a longer value's
+# tail lay outside the match, printed in a name, an allow rule or an error,
+# and a URL's password over 128 characters matched nothing (Codex, the /qaa
+# of main..dev).
 # A hit prints its keyword (a raw rule: the URL's scheme) and the value's
 # length, never a byte of the value. The rows are ours, not gitleaks'.
 # kv_ci <ERE> -> REPLY: each lower-case letter as a bracket of both cases.
@@ -649,7 +654,7 @@ KV_SERVICE=service-secret
 # so `credential:github-token` in this tool's own config is no assignment —
 # then blanks and an opening quote. KV_KW keeps the keyword's ERE, for what
 # a hit prints.
-declare -A KV_PRE=() KV_VAL=() KV_POST=() KV_MINH=() KV_KW=()
+declare -A KV_PRE=() KV_VAL=() KV_JVAL=() KV_POST=() KV_MINH=() KV_KW=()
 for (( k = 0; k < ${#KV_CREDENTIALS[@]}; k += 5 )); do
   id=${KV_CREDENTIALS[k]}
   if [[ -n "${KV_RAW[$id]+x}" ]]; then
@@ -660,7 +665,12 @@ for (( k = 0; k < ${#KV_CREDENTIALS[@]}; k += 5 )); do
     KV_PRE[$id]="($REPLY)[A-Za-z0-9_.-]{0,12}([\"']?[[:space:]]*(:=|=>|=)|[\"']?[[:space:]]*:[[:space:]]|[\"']:)[[:space:]]*[\"'\`]?"
     if [[ -n "${KV_EDGE[$id]+x}" ]]; then KV_PRE[$id]="(^|[^A-Za-z0-9])${KV_PRE[$id]}"; fi
   fi
-  KV_VAL[$id]=${KV_CREDENTIALS[k + 2]}
+  KV_JVAL[$id]=${KV_CREDENTIALS[k + 2]}
+  KV_VAL[$id]=${KV_JVAL[$id]}
+  # The first `{m,n}`, as no `}` comes before it in any row: `{m,}`.
+  if [[ "${KV_JVAL[$id]}" =~ ^([^}]*\{[0-9]+),[0-9]+\}(.*)$ ]]; then
+    KV_VAL[$id]="${BASH_REMATCH[1]},}${BASH_REMATCH[2]}"
+  fi
   KV_POST[$id]=${KV_CREDENTIALS[k + 3]}
   KV_MINH[$id]=${KV_CREDENTIALS[k + 4]}
   CREDENTIALS+=("$id" "${KV_PRE[$id]}${KV_VAL[$id]}${KV_POST[$id]}")
@@ -806,6 +816,9 @@ b64_text() {
 # prefix would look weak and hide a key.
 kv_weak() { # id value [text before it] [raw: no Basic decoding]
   local LC_ALL=C v=$2 lv w min=${KV_MINH[$1]} user pw
+  # The value's start its row reads, the value a bounded match held: a
+  # judgement as before, and no bash loop over a megabyte.
+  if [[ -z "${4-}" && "$v" =~ ^(${KV_JVAL[$1]}) ]]; then v=${BASH_REMATCH[1]}; fi
   if [[ -n "${KV_NAMESTOP[$1]+x}" && -n "${3-}" ]] && kv_namestop "$3"; then return 0; fi
   # Basic auth's user:password, a key's place either: Freshdesk, BambooHR
   # and Teamwork take the API key as the user and `X` as the password, and
@@ -979,6 +992,14 @@ kv_places() {
 kv_overlaps() {
   local LC_ALL=C v t vs=0 m=$2 txt=${4-} o s e i lo hi mid hit=0 places
   if kv_value "$1" "$2"; then v=$REPLY; vs=${#BASH_REMATCH[1]}; else v=$2; fi
+  # Since the match runs to the value's end (v0.29.5) a value can hold a key
+  # and far more. At the hit the value is the start a bounded match held, so
+  # every yield is as it was; the masking, which passes no text, yields only
+  # to a key holding the whole value, so no byte of the value outside a key
+  # prints: v0.29.4 yielded to a key the value held, and printed the rest
+  # (`SECRET=ab12_<key>`, the tail of a long value).
+  if [[ -z "${4+x}" ]]; then [[ "$3" == *"$v"* ]]; return; fi
+  if [[ -n "${KV_JVAL[$1]+x}" && "$v" =~ ^(${KV_JVAL[$1]}) ]]; then v=${BASH_REMATCH[1]}; fi
   kv_lines "$3"
   [[ ${#KV_ARR[@]} -gt 0 ]] || return 1
   if [[ "$3" == *"$v"* ]]; then return 0; fi
@@ -1344,8 +1365,8 @@ mask_texts() { # array label
   printf '%s\n' "${mt_text[@]}" > "$TMPD/subj/as-written"
   printf '%s\n' "${lit[@]}" > "$TMPD/subj/literal"
   cred_matches_all "$TMPD/rmatch" "$2" as-written literal
-  # A keyword rule's match yields to a fixed-format rule's key in its value,
-  # as at the hit (kv_yields): that rule's mask prints it.
+  # A keyword rule's match yields to a fixed-format rule's key that holds its
+  # value: that rule's mask prints it (kv_overlaps).
   local -A fixed=()
   while IFS= read -r -d '' cid && IFS= read -r -d '' f && IFS= read -r -d '' l && IFS= read -r m; do
     if [[ -z "${KV_VAL[$cid]+x}" ]]; then fixed["$f:$l"]+="$m"$'\n'; fi
@@ -3950,7 +3971,11 @@ for i in "${!H_FILE[@]}"; do
   lk="${#H_FILE[$i]}:${H_FILE[$i]}${#H_LINE[$i]}:${H_LINE[$i]}${#H_COMMIT[$i]}:${H_COMMIT[$i]}:${H_TEXT[$i]}"
   for j in ${MT_OF[$i]}; do
     t=${MT_TXT[j]}
-    if [[ "$rank" -ge 1 ]] && kv_value "$cid" "$t"; then t=$REPLY; fi
+    if [[ "$rank" -ge 1 ]] && kv_value "$cid" "$t"; then
+      t=$REPLY
+      # The start a bounded match held, as kv_overlaps reads its own value.
+      if [[ "$t" =~ ^(${KV_JVAL[$cid]}) ]]; then t=${BASH_REMATCH[1]}; fi
+    fi
     CRED_ON_LINE[$lk]+="$rank$t"$'\n'
   done
 done

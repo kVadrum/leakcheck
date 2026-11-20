@@ -4687,6 +4687,53 @@ PY
   assert_contains "a.txt:4: $H q: /x/y/ok? see /home/alice/qmark (decoded base64)" "$LC_OUT"
 }
 
+t_kv_long_value_is_masked_whole() {
+  # Codex, the /qaa of main..dev (v0.29.5): a keyword rule's value was
+  # bounded (Bearer's at 126), so a longer value's tail lay outside the
+  # match and printed in a name and an allow rule; and a URL's password
+  # over 128 characters was no match at all, exit 0. The judgement still
+  # reads the start a bounded match held: a tail saying `example` past it
+  # sets nothing aside (a guard; v0.29.4 never saw the tail), and Basic's
+  # decoded password is judged whole (a guard: `Q7xLm2Kp.changeme`).
+  local t a p
+  t=$(python3 -c 'import random; r = random.Random(5); print("".join(r.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") for _ in range(160)))')
+  a=$(python3 -c 'import random; r = random.Random(6); print("".join(r.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") for _ in range(160)))')
+  p=$(python3 -c 'import random; r = random.Random(7); print("".join(r.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") for _ in range(200)))')
+  mkdir n
+  printf 'x\n' > "n/Authorization Bearer $t"
+  printf 'db: postgres://app:%s@db.example:5432/app\n' "$p" > u.txt
+  printf 'password = "%s_example_tail"\n' "${p:0:100}" >> u.txt
+  printf 'Authorization: Basic %s\n' "$(printf 'admin:Q7xLm2Kp.changeme' | base64)" >> u.txt
+  # A keyword rule yields to another's value as before, by the start a
+  # bounded match held (a guard): the generic value runs on through
+  # `key=…`, and both are reported, as in v0.29.4.
+  printf 'password=%skey=%s\n' "${p:0:110}" "${a:0:30}" >> u.txt
+  git add -A
+  rc_file 'no-defaults' "allow Authorization Bearer $a"
+  commit init
+  assert_exit 1 "$BIN" --json
+  assert_not_contains "${t:100}" "$LC_OUT"
+  assert_not_contains "${a:100}" "$LC_OUT"
+  assert_not_contains "${p:100}" "$LC_OUT"
+  python3 - "$LC_OUT" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+got = sorted((h["file"].split("/")[0], h["line"], h["pattern"], h["text"]) for h in d["hits"])
+# The allow rule's key is published in the config too, and reported.
+assert got == [(".leakcheckrc", 2, "credential:http-bearer-token", "Bearer[redacted, 160 chars]"),
+               ("n", 0, "credential:http-bearer-token", "Bearer[redacted, 160 chars]"),
+               ("u.txt", 1, "credential:url-password", "postgres://[redacted, 200 chars]"),
+               ("u.txt", 2, "credential:generic-secret", "password[redacted, 113 chars]"),
+               ("u.txt", 4, "credential:generic-key", "key[redacted, 30 chars]"),
+               ("u.txt", 4, "credential:generic-secret", "password[redacted, 144 chars]")], got
+PY
+  # Matched to its end, a value can hold a key and more: masking yields to a
+  # key only when the key holds the whole value. v0.29.4 yielded to a key
+  # the value held and printed the rest (`<key>.Zq7…`).
+  assert_exit 2 "$BIN" "--secret=$(cred github-token).Zq7Lm2Xv9""Rt4"
+  assert_not_contains "Zq7Lm2Xv9""Rt4" "$LC_ERR"
+}
+
 t_kv_basic_auth_user_is_judged() {
   # /qaa (v0.29.3): Basic auth judged by its password alone set aside an
   # API key sent as the user with `X` for the password (Freshdesk,
@@ -5717,6 +5764,7 @@ lc_test "credentials: a quoted value is no call" t_kv_quoted_value_is_no_call
 lc_test "credentials: opened and slashed rules" t_credential_opened_and_slashed_rules_judge_the_key
 lc_test "--archives: raw bytes compared" t_archives_compare_raw_bytes
 lc_test "--decode: every path part tried" t_decode_tries_every_path_part
+lc_test "credentials: a long value masked whole" t_kv_long_value_is_masked_whole
 lc_test "pre-commit hook and GitHub Action"     t_integrations_run_leakcheck
 lc_test "credentials: (?i) out of the literal form" t_credential_allow_rule_case_prefix_is_dropped_from_the_literal_form
 lc_test "allow: an unscoped rule never a credential" t_allow_unscoped_never_excuses_a_credential
